@@ -137,10 +137,13 @@ impl Statement {
         w.put_bytes(&[]); // out_blr
         w.put_i32(0); // out_message_number
         // Campo final único na v19/FB5 (confirmado por captura strace: o pacote
-        // sem parâmetros tem 9 palavras e a última é 0xffff): o tamanho máximo de
-        // blob inline. No FB5 o fbclient envia 0xffff; espelhamos isso.
+        // sem parâmetros tem 9 palavras): o tamanho máximo de blob a embutir
+        // inline na resposta do fetch. Enviamos 0 para DESATIVAR o inline — assim
+        // colunas BLOB chegam sempre como um id de 8 bytes e são lidas pelo
+        // protocolo clássico (op_open_blob2/op_get_segment). O fbclient envia
+        // 0xffff aqui; nós optamos pela simplicidade.
         if conn.protocol_version() >= 18 {
-            w.put_i32(0xffff); // inline_blob_size (FB5)
+            w.put_i32(0); // inline_blob_size (FB5): 0 = sem inline
         }
         conn.io().send(&w).await?;
         read_response(conn.io()).await?;

@@ -36,6 +36,28 @@ item 0x17; a resposta traz um bloco aninhado com os contadores `isc_info_req_*`
 (select=13, insert=14, update=15, delete=16), cada um `tag(1)+len(2 LE)+valor`.
 Um UPDATE de N linhas reporta select=N e update=N. Veja `Statement::rows_affected`.
 
+**BLOBs (leitura) — validado com proj_desc da tabela project.** Veja `blob.rs`.
+
+- **Correção de op codes:** os `*_blob2` estavam deslocados em 1 no `consts.rs`.
+  A enum é sequencial: op_ddl=55, **op_open_blob2=56**, op_create_blob2=57,
+  op_get_slice=58, op_put_slice=59, op_slice=60, **op_seek_blob=61**,
+  op_allocate_statement=62. A faixa baixa (op_get_segment=36, op_close_blob=39)
+  estava certa.
+- **`op_open_blob2` (56):** `bpb(cstring) | transaction(i32) | blob_id(quad 8B)` —
+  a BPB vem ANTES da transação (fall-through do op_open_blob no xdr). Resposta:
+  op_response com `p_resp_object` = handle do blob.
+- **`op_get_segment` (36):** `blob_handle | buffer_len(i32) | segment(cstring vazia)`.
+  Resposta: op_response onde `p_resp_object` = status (0=ok/mais, 1=isc_segment
+  parcial, 2=isc_segstr_eof) e `p_resp_data` = segmentos empacotados, cada um
+  `comprimento(2 LE) + bytes`.
+- **`op_close_blob` (39):** só o handle. Resposta op_response.
+- **Inline blobs (FB5):** com `inline_blob_size = 0xffff` no op_execute (o que o
+  fbclient envia), o servidor EMBUTE blobs pequenos na resposta do fetch e o
+  cliente nunca manda op_open_blob/op_get_segment — por isso uma captura strace
+  do fbclient não mostra ops de blob. Nós enviamos `inline_blob_size = 0` para
+  desativar o inline e ler pelo protocolo clássico (também serve para blobs
+  grandes).
+
 Três descobertas confirmadas por captura strace do fbclient/isql real:
 
 1. **`isc_info_sql` owner=18, alias=19** (NÃO alias=18/owner=19). A tag 0x12

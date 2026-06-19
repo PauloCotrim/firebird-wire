@@ -34,14 +34,20 @@ pub mod op {
 
     pub const COMMIT_RETAINING: i32 = 50;
 
-    pub const OPEN_BLOB2: i32 = 55;
-    pub const CREATE_BLOB2: i32 = 56;
+    // Op codes de blob. A faixa baixa (34-43) é a clássica; os *_blob2 ficam na
+    // faixa alta, logo antes de op_allocate_statement(62), e a enum é sequencial:
+    // op_ddl=55, op_open_blob2=56, op_create_blob2=57, op_get_slice=58,
+    // op_put_slice=59, op_slice=60, op_seek_blob=61.
+    pub const CREATE_BLOB: i32 = 34;
+    pub const OPEN_BLOB: i32 = 35;
     pub const GET_SEGMENT: i32 = 36;
     pub const PUT_SEGMENT: i32 = 37;
     pub const CANCEL_BLOB: i32 = 38;
     pub const CLOSE_BLOB: i32 = 39;
     pub const INFO_BLOB: i32 = 43;
-    pub const SEEK_BLOB: i32 = 60;
+    pub const OPEN_BLOB2: i32 = 56;
+    pub const CREATE_BLOB2: i32 = 57;
+    pub const SEEK_BLOB: i32 = 61;
 
     pub const ALLOCATE_STATEMENT: i32 = 62;
     pub const EXECUTE: i32 = 63;

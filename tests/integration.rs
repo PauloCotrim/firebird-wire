@@ -135,6 +135,35 @@ async fn update_reports_affected_rows() -> Result<()> {
 }
 
 #[tokio::test]
+async fn read_blob_content() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    // proj_desc é um BLOB sub_type 1 (texto). Pega o primeiro não-nulo.
+    let mut stmt = conn
+        .prepare(&tx, "SELECT proj_desc FROM project WHERE proj_desc IS NOT NULL")
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("ao menos uma linha");
+
+    let blob_id = match row[0] {
+        Value::Blob(id) => id,
+        ref other => panic!("esperava Value::Blob, veio {other:?}"),
+    };
+
+    let bytes = conn.read_blob(&tx, blob_id).await?;
+    let text = String::from_utf8_lossy(&bytes);
+    println!("conteúdo do blob ({} bytes): {text}", bytes.len());
+    assert!(!bytes.is_empty());
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn parameterized_query() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;
