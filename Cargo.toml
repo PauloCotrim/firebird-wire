@@ -1,0 +1,28 @@
+[package]
+name = "fdb_driver"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust async driver for Firebird 5+ (wire protocol, SRP auth, batch/array DML)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PauloCotrim/fdb_driver"
+keywords = ["firebird", "database", "driver", "async", "sql"]
+categories = ["database"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+bytes = "1"
+num-bigint = "0.4"
+num-traits = "0.2"
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+thiserror = "2"
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = []
+# Emit tracing spans/events for protocol-level debugging.
+trace = ["dep:tracing"]
