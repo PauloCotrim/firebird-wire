@@ -1,19 +1,19 @@
-//! Wire-encryption ciphers negotiated after SRP.
+//! Cifras de criptografia do wire negociadas após o SRP.
 //!
-//! Firebird keys the symmetric cipher with the SRP session key `K`. Each
-//! direction uses an independent cipher instance initialised with the same
-//! key, so the client keeps a separate read and write cipher.
+//! O Firebird chaveia a cifra simétrica com a chave de sessão SRP `K`. Cada
+//! direção usa uma instância de cifra independente inicializada com a mesma
+//! chave, então o cliente mantém uma cifra de leitura e outra de escrita separadas.
 //!
-//! `Arc4` (RC4) is implemented here and is present in the default FB5
-//! `WireCryptPlugin` list. ChaCha is not yet implemented; selecting it returns
-//! [`Error::Unsupported`] from the negotiation layer.
+//! `Arc4` (RC4) está implementado aqui e está presente na lista padrão de
+//! `WireCryptPlugin` do FB5. ChaCha ainda não está implementado; selecioná-lo retorna
+//! [`Error::Unsupported`] da camada de negociação.
 
 use crate::wire::stream::Cipher;
 
-/// The wire-crypt plugin to negotiate.
+/// O plugin de criptografia do wire a negociar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireCryptPlugin {
-    /// RC4 stream cipher (`Arc4`).
+    /// Cifra de fluxo RC4 (`Arc4`).
     Arc4,
 }
 
@@ -25,7 +25,7 @@ impl WireCryptPlugin {
     }
 }
 
-/// Classic RC4 stream cipher.
+/// Cifra de fluxo RC4 clássica.
 #[derive(Clone)]
 pub struct Rc4 {
     s: [u8; 256],
@@ -34,7 +34,7 @@ pub struct Rc4 {
 }
 
 impl Rc4 {
-    /// Key-scheduling algorithm.
+    /// Algoritmo de escalonamento de chave.
     pub fn new(key: &[u8]) -> Self {
         assert!(!key.is_empty(), "RC4 key must be non-empty");
         let mut s = [0u8; 256];
@@ -67,7 +67,7 @@ impl Cipher for Rc4 {
     }
 }
 
-/// Build the read/write cipher pair for the negotiated plugin and session key.
+/// Constrói o par de cifras de leitura/escrita para o plugin negociado e a chave de sessão.
 pub fn make_ciphers(
     plugin: WireCryptPlugin,
     key: &[u8],
@@ -81,10 +81,10 @@ pub fn make_ciphers(
 mod tests {
     use super::*;
 
-    // RFC 6229 test vector: key "Key", keystream start.
+    // Vetor de teste da RFC 6229: chave "Key", início do keystream.
     #[test]
     fn rc4_known_answer() {
-        // Plaintext "Plaintext" with key "Key" -> BBF316E8D940AF0AD3
+        // Texto plano "Plaintext" com chave "Key" -> BBF316E8D940AF0AD3
         let mut c = Rc4::new(b"Key");
         let mut data = b"Plaintext".to_vec();
         c.process(&mut data);

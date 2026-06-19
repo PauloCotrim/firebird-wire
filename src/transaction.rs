@@ -1,11 +1,12 @@
-//! Transactions: TPB construction, start, and commit/rollback (with retaining
-//! variants).
+//! Transações: construção do TPB, início e commit/rollback (com variantes
+//! retentivas).
 //!
-//! A [`Transaction`] is a lightweight handle; the actual I/O methods take the
-//! owning [`Connection`] so that only one mutable borrow is live at a time.
-//! `commit`/`rollback` consume the handle; the retaining variants keep it.
-//! Dropping a `Transaction` without finishing it leaves the server-side
-//! transaction open until the connection detaches — always finish explicitly.
+//! Uma [`Transaction`] é um handle leve; os métodos reais de I/O recebem a
+//! [`Connection`] proprietária para que apenas um empréstimo mutável esteja
+//! ativo por vez. `commit`/`rollback` consomem o handle; as variantes
+//! retentivas o mantêm. Descartar uma `Transaction` sem finalizá-la deixa a
+//! transação do lado do servidor aberta até a conexão se desconectar — sempre
+//! finalize explicitamente.
 
 use crate::connection::Connection;
 use crate::error::Result;
@@ -14,23 +15,23 @@ use crate::wire::response::read_response;
 use crate::wire::stream::op_packet;
 use crate::wire::xdr::ParameterBuffer;
 
-/// Transaction isolation level.
+/// Nível de isolamento da transação.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsolationLevel {
-    /// `SNAPSHOT` (Firebird `concurrency`) — the engine default.
+    /// `SNAPSHOT` (Firebird `concurrency`) — o padrão do engine.
     #[default]
     Snapshot,
     /// `SNAPSHOT TABLE STABILITY` (Firebird `consistency`).
     SnapshotTableStability,
-    /// `READ COMMITTED` returning the latest committed record version.
+    /// `READ COMMITTED` retornando a última versão de registro commitada.
     ReadCommittedRecordVersion,
-    /// `READ COMMITTED` without record versions (conflicts wait/fail).
+    /// `READ COMMITTED` sem versões de registro (conflitos esperam/falham).
     ReadCommittedNoRecordVersion,
-    /// `READ COMMITTED READ CONSISTENCY` (FB4+): statement-stable snapshot.
+    /// `READ COMMITTED READ CONSISTENCY` (FB4+): snapshot estável por instrução.
     ReadCommittedReadConsistency,
 }
 
-/// Read/write access mode.
+/// Modo de acesso de leitura e escrita.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccessMode {
     #[default]
@@ -38,7 +39,7 @@ pub enum AccessMode {
     ReadOnly,
 }
 
-/// Behaviour on lock conflict.
+/// Comportamento em caso de conflito de bloqueio (lock).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LockResolution {
     #[default]
@@ -46,17 +47,17 @@ pub enum LockResolution {
     NoWait,
 }
 
-/// Builder for the Transaction Parameter Buffer.
+/// Construtor (builder) para o Transaction Parameter Buffer.
 #[derive(Debug, Clone)]
 pub struct TransactionBuilder {
     pub isolation: IsolationLevel,
     pub access: AccessMode,
     pub lock_resolution: LockResolution,
-    /// Lock timeout in seconds (only meaningful with [`LockResolution::Wait`]).
+    /// Timeout de bloqueio (lock) em segundos (só faz sentido com [`LockResolution::Wait`]).
     pub lock_timeout: Option<i32>,
-    /// Disable the per-statement undo log (faster, no savepoints).
+    /// Desabilita o log de undo por instrução (mais rápido, sem savepoints).
     pub no_auto_undo: bool,
-    /// Auto-commit each DML statement on the server side.
+    /// Faz commit automático de cada instrução DML no lado do servidor.
     pub auto_commit: bool,
 }
 
@@ -99,7 +100,7 @@ impl TransactionBuilder {
         self
     }
 
-    /// Serialise to a TPB byte buffer.
+    /// Serializa para um buffer de bytes TPB.
     pub fn build(&self) -> Vec<u8> {
         let mut pb = ParameterBuffer::new(TPB_VERSION3);
 
@@ -148,7 +149,7 @@ impl TransactionBuilder {
     }
 }
 
-/// A started transaction (server handle).
+/// Uma transação iniciada (handle do servidor).
 #[derive(Debug)]
 pub struct Transaction {
     handle: i32,
@@ -160,27 +161,27 @@ impl Transaction {
         Transaction { handle, finished: false }
     }
 
-    /// The server-side transaction handle.
+    /// O handle da transação do lado do servidor.
     pub fn handle(&self) -> i32 {
         self.handle
     }
 
-    /// Commit and release the transaction.
+    /// Faz commit e libera a transação.
     pub async fn commit(mut self, conn: &mut Connection) -> Result<()> {
         self.finish(conn, op::COMMIT).await
     }
 
-    /// Roll back and release the transaction.
+    /// Faz rollback e libera a transação.
     pub async fn rollback(mut self, conn: &mut Connection) -> Result<()> {
         self.finish(conn, op::ROLLBACK).await
     }
 
-    /// Commit but keep the transaction context (and handle) active.
+    /// Faz commit mas mantém o contexto da transação (e o handle) ativo.
     pub async fn commit_retaining(&self, conn: &mut Connection) -> Result<()> {
         self.retain(conn, op::COMMIT_RETAINING).await
     }
 
-    /// Roll back but keep the transaction context (and handle) active.
+    /// Faz rollback mas mantém o contexto da transação (e o handle) ativo.
     pub async fn rollback_retaining(&self, conn: &mut Connection) -> Result<()> {
         self.retain(conn, op::ROLLBACK_RETAINING).await
     }
@@ -204,12 +205,12 @@ impl Transaction {
 }
 
 impl Connection {
-    /// Start a transaction with default parameters (snapshot, read-write, wait).
+    /// Inicia uma transação com parâmetros padrão (snapshot, leitura e escrita, wait).
     pub async fn begin(&mut self) -> Result<Transaction> {
         self.begin_with(&TransactionBuilder::default()).await
     }
 
-    /// Start a transaction with explicit parameters.
+    /// Inicia uma transação com parâmetros explícitos.
     pub async fn begin_with(&mut self, builder: &TransactionBuilder) -> Result<Transaction> {
         let tpb = builder.build();
         let mut w = op_packet(op::TRANSACTION);
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn lock_timeout_tpb() {
         let tpb = TransactionBuilder::new().lock_timeout(10).build();
-        // ... WAIT, then LOCK_TIMEOUT clumplet (tag, len=1, value=10).
+        // ... WAIT, depois o clumplet LOCK_TIMEOUT (tag, len=1, value=10).
         assert!(tpb.windows(3).any(|w| w == [tpb::LOCK_TIMEOUT, 1, 10]));
     }
 }

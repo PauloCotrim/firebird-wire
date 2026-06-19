@@ -1,25 +1,25 @@
-//! Generic response reading: `op_response` plus the trailing status vector.
+//! Leitura genérica de resposta: `op_response` mais o vetor de status final.
 
 use crate::error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 use crate::wire::consts::{arg, op};
 use crate::wire::stream::{op_name, FbStream};
 
-/// A parsed `op_response` packet (`P_RESP`).
+/// Um pacote `op_response` analisado (`P_RESP`).
 #[derive(Debug, Clone)]
 pub struct Response {
-    /// Object id / handle returned by the operation (`p_resp_object`).
+    /// Id do objeto / handle retornado pela operação (`p_resp_object`).
     pub handle: i32,
-    /// Blob id (`p_resp_blob_id`), meaningful only for blob ops.
+    /// Id do blob (`p_resp_blob_id`), significativo apenas para operações de blob.
     pub blob_id: u64,
-    /// Variable data payload (`p_resp_data`).
+    /// Carga de dados variável (`p_resp_data`).
     pub data: Vec<u8>,
-    /// The status vector; may carry warnings even on success.
+    /// O vetor de status; pode carregar avisos mesmo em caso de sucesso.
     pub status: StatusVector,
 }
 
 impl Response {
-    /// Turn an error-bearing status vector into [`Error::Database`]; otherwise
-    /// yield the response (warnings are retained in `status`).
+    /// Transforma um vetor de status que carrega erro em [`Error::Database`]; caso contrário
+    /// produz a resposta (os avisos são mantidos em `status`).
     pub fn into_result(self) -> Result<Response> {
         if self.status.is_error() {
             return Err(Error::Database(DatabaseError::new(self.status)));
@@ -28,8 +28,8 @@ impl Response {
     }
 }
 
-/// Read the next operation code, transparently skipping keep-alive `op_dummy`
-/// and `op_void` packets.
+/// Lê o próximo op code, pulando de forma transparente os pacotes keep-alive `op_dummy`
+/// e `op_void`.
 pub async fn read_op(stream: &mut FbStream) -> Result<i32> {
     loop {
         let code = stream.read_i32().await?;
@@ -40,7 +40,7 @@ pub async fn read_op(stream: &mut FbStream) -> Result<i32> {
     }
 }
 
-/// Read a status vector field by field from the async stream.
+/// Lê um vetor de status campo a campo do fluxo (stream) assíncrono.
 pub async fn read_status_vector(stream: &mut FbStream) -> Result<StatusVector> {
     let mut args = Vec::new();
     let mut sql_state = None;
@@ -73,7 +73,7 @@ pub async fn read_status_vector(stream: &mut FbStream) -> Result<StatusVector> {
     Ok(StatusVector { args, sql_state })
 }
 
-/// Read the `P_RESP` body that follows an already-consumed `op_response` code.
+/// Lê o corpo `P_RESP` que segue um op code `op_response` já consumido.
 pub async fn read_response_body(stream: &mut FbStream) -> Result<Response> {
     let handle = stream.read_i32().await?;
     let blob_id = stream.read_quad().await?;
@@ -82,8 +82,8 @@ pub async fn read_response_body(stream: &mut FbStream) -> Result<Response> {
     Ok(Response { handle, blob_id, data, status })
 }
 
-/// Read the next packet, requiring it to be an `op_response`, and convert any
-/// error status into [`Error::Database`].
+/// Lê o próximo pacote, exigindo que seja um `op_response`, e converte qualquer
+/// status de erro em [`Error::Database`].
 pub async fn read_response(stream: &mut FbStream) -> Result<Response> {
     let code = read_op(stream).await?;
     if code != op::RESPONSE {

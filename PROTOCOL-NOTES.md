@@ -1,56 +1,100 @@
-# Firebird 5 wire-protocol reverse-engineering notes
+# Notas de engenharia reversa do wire-protocol do Firebird 5
 
-Captured from the real `/opt/firebird/bin/isql` (FB 5.0.3, protocol **v19**)
-via `strace -f -x -e trace=sendto,recvfrom -s 4096`. These are the ground-truth
-byte layouts this driver targets. Test server: `127.0.0.1:3555`, `employee`,
-SYSDBA/masterkey, `WireCrypt=Disabled`.
+Capturado do `/opt/firebird/bin/isql` real (FB 5.0.3, protocolo **v19**)
+via `strace -f -x -e trace=sendto,recvfrom -s 4096`. Estes são os layouts de
+bytes verdadeiros (ground-truth) que este driver tem como alvo. Servidor de
+teste: `127.0.0.1:3555`, `employee`, SYSDBA/masterkey, `WireCrypt=Disabled`.
 
-## DONE & validated (committed)
+## FEITO e validado (commitado)
 
-- **Handshake**: op_connect → op_accept_data(94) → SRP proof in attach DPB →
-  op_response. See `connection.rs`. Auth = Srp256, proof = SHA1 for H(user),
-  plugin hash (SHA256) only for outer M. CNCT tags: specific_data=7,
+- **Handshake**: op_connect → op_accept_data(94) → prova SRP no DPB de attach →
+  op_response. Veja `connection.rs`. Auth = Srp256, prova = SHA1 para H(user),
+  hash do plugin (SHA256) apenas para o M externo. Tags CNCT: specific_data=7,
   plugin_name=8, login=9, plugin_list=10, client_crypt=11.
-- **Op codes** (corrected vs old memory, shifted +2 from op_trusted_auth):
+- **Op codes** (corrigidos vs. memória antiga, deslocados em +2 a partir de
+  op_trusted_auth):
   trusted_auth=90, cancel=91, cont_auth=92, ping=93, accept_data=94,
   crypt=96, cond_accept=98, batch_create=99..batch_cs=103, info_batch=111,
   fetch_scroll=112. response=9, attach=19, detach=21.
-- **Transactions**: op_transaction(29)/commit(30)/rollback(31) — working.
-- Status vector success = `[isc_arg_gds(1), 0, isc_arg_end(0)]`; **gds code 0
-  is success, not an error**.
+- **Transações**: op_transaction(29)/commit(30)/rollback(31) — funcionando.
+- Sucesso do vetor de status = `[isc_arg_gds(1), 0, isc_arg_end(0)]`; **o código
+  gds 0 é sucesso, não um erro**.
 
-## TODO: statements (next) — reference captures below
+## VALIDADO AO VIVO — camada de instruções (statements)
 
-### op_allocate_statement (62) + op_prepare_statement (68), batched in one send
+O código está em `statement.rs` (+ `blr.rs`, `message.rs`, `value.rs`). **Todos
+os 5 testes de `tests/integration.rs` passam contra um FB5 real** (protocolo v19,
+`employee`): connect/ping, transações, prepare+describe, execute+fetch (104
+linhas) e query parametrizada (1 linha). Rodam com `FB_PASSWORD` definido. Fluxo:
+allocate → ler handle → prepare (describe-info extraída dos dados do op_response)
+→ execute → buscar linhas em lote → free. A instrução é enviada
+**sequencialmente** (allocate, ler a resposta para o handle real, depois prepare).
+
+Três descobertas confirmadas por captura strace do fbclient/isql real:
+
+1. **`isc_info_sql` owner=18, alias=19** (NÃO alias=18/owner=19). A tag 0x12
+   carrega o owner da tabela, 0x13 carrega o alias da coluna. Corrigido em
+   `consts.rs`.
+
+2. **`op_execute` (63), layout da v19 — exatamente 9 palavras sem parâmetros:**
+   ```
+   op_execute, statement, transaction,
+   in_blr(cstring), in_message_number, in_message_count,
+   out_blr(cstring), out_message_number,
+   inline_blob_size = 0x0000ffff    ← UM campo final (FB5, proto ≥18)
+   ```
+   NÃO há campo `timeout` aqui. Enviar 10 palavras (timeout + inline separados)
+   faz o servidor **fechar a conexão**.
+
+3. **A mensagem de parâmetros vem ENTRE `in_message_count` e `out_blr`** (não no
+   fim do pacote), em formato compacto (bitmap de nulos + valores XDR):
+   ```
+   ... in_blr(len12+dados), in_message_number=0, in_message_count=1,
+   00 00 00 00   ← bitmap de nulos (nada nulo)
+   00 00 00 02   ← emp_no = 2 (SHORT como long big-endian de 4 bytes)
+   00 00 00 00   ← out_blr (len 0)
+   00 00 00 00   ← out_message_number
+   00 00 ff ff   ← inline_blob_size
+   ```
+
+4. **op_fetch em lote:** ao pedir `op_fetch` (out_message_count=N), o servidor
+   transmite vários `op_fetch_response` (status 0, count 1 + mensagem) e termina
+   com um pacote `count=0` (status 100 = fim do cursor; status 0 = limite do lote
+   atingido, há mais). É preciso drenar todos até o terminador — buscar 1 por vez
+   dessincroniza o stream.
+
+## A FAZER: statements — capturas de referência abaixo
+
+### op_allocate_statement (62) + op_prepare_statement (68), em lote num único envio
 ```
 00 00 00 3e                op_allocate_statement
 00 00 00 00                db_handle
 00 00 00 44                op_prepare_statement
 00 00 00 02                transaction handle
-ff ff ff ff                statement handle = -1 (deferred; use the allocate result)
+ff ff ff ff                statement handle = -1 (diferido; use o resultado do allocate)
 00 00 00 03                dialect = 3
-00 00 00 36 <54 bytes>     SQL text "SELECT emp_no, first_name FROM employee WHERE emp_no=2"
-00 00 00 1a <26 bytes>     info-items request, then pad, then buffer_len i32
+00 00 00 36 <54 bytes>     texto SQL "SELECT emp_no, first_name FROM employee WHERE emp_no=2"
+00 00 00 1a <26 bytes>     requisição de info-items, depois pad, depois buffer_len i32
 ```
-Info-items requested (26 bytes): `15 1b 05 07 09 0b 0c 0d 0e 10 11 12 13 08  04 07 09 0b 0c 0d 0e 10 11 12 13 08`
-= stmt_type(0x15), 0x1b(flags?), then BIND block `05 07[describe_vars] {09 0b 0c 0d 0e 10 11 12 13} 08`, then SELECT block `04 07 {…} 08`.
-buffer_len isql used ≈ 0xfb80. Allocate returns the real stmt handle (deferred ‑1 is fine with lazy send; we cap at ptype_batch_send so just send allocate, read response, get handle, then prepare with it).
+Info-items solicitados (26 bytes): `15 1b 05 07 09 0b 0c 0d 0e 10 11 12 13 08  04 07 09 0b 0c 0d 0e 10 11 12 13 08`
+= stmt_type(0x15), 0x1b(flags?), depois bloco BIND `05 07[describe_vars] {09 0b 0c 0d 0e 10 11 12 13} 08`, depois bloco SELECT `04 07 {…} 08`.
+buffer_len que o isql usou ≈ 0xfb80. O allocate retorna o handle real da instrução (o ‑1 diferido funciona com envio lazy; nós limitamos em ptype_batch_send, então é só enviar o allocate, ler a resposta, pegar o handle e então fazer o prepare com ele).
 
-### op_prepare RESPONSE (op_response data field, describe info)
-Info stream (little-endian lengths): each item = tag(1) + len(2 LE) + value.
+### RESPOSTA do op_prepare (campo data do op_response, info de descrição)
+Fluxo de info (comprimentos em little-endian): cada item = tag(1) + len(2 LE) + value.
 ```
 15 04 00  01 00 00 00      isc_info_sql_stmt_type = 1 (select)
-1b 04 00  03 00 00 00      item 0x1b = 3 (ignore)
-05                         isc_info_sql_bind  (input params block)
-  07 04 00  00 00 00 00    describe_vars = 0  (no params)
-04                         isc_info_sql_select (output block)
+1b 04 00  03 00 00 00      item 0x1b = 3 (ignorar)
+05                         isc_info_sql_bind  (bloco de parâmetros de entrada)
+  07 04 00  00 00 00 00    describe_vars = 0  (sem parâmetros)
+04                         isc_info_sql_select (bloco de saída)
   07 04 00  02 00 00 00    describe_vars = 2  (emp_no, first_name)
   09 .. (sqlda_seq) 0b ..(type) 0c..(subtype) 0d..(scale) 0e..(length)
-  10..(field) 11..(relation) 12..(alias) 13..(owner) 08 (describe_end)  per var
+  10..(field) 11..(relation) 12..(alias) 13..(owner) 08 (describe_end)  por var
 ```
-Parse: walk items; for each var collect type/subtype/scale/length/names.
+Parsing: percorra os itens; para cada var colete type/subtype/scale/length/nomes.
 
-### op_execute (63) — v19 field layout (no-param SELECT), batched with op_fetch
+### op_execute (63) — layout de campos da v19 (SELECT sem parâmetros), em lote com op_fetch
 ```
 00 00 00 3f                op_execute
 00 00 00 03                statement handle
@@ -58,13 +102,13 @@ Parse: walk items; for each var collect type/subtype/scale/length/names.
 00 00 00 00                in_blr   (cstring, len 0)
 00 00 00 00                in_message_number
 00 00 00 00                in_message_count
-00 00 00 00                out_blr  (cstring, len 0)  [execute2-style fields present in v19]
+00 00 00 00                out_blr  (cstring, len 0)  [campos estilo execute2 presentes na v19]
 00 00 00 00                out_message_number
 00 00 00 00                timeout (FB4+)
-00 00 ff ff                ??? trailing — re-verify exact field (cursor_flags / inline_blob_size). 4 zero-words + "00 00 ff ff"; count precisely with a decoder before trusting.
+00 00 ff ff                ??? final — reverificar o campo exato (cursor_flags / inline_blob_size). 4 palavras zero + "00 00 ff ff"; conte com precisão usando um decodificador antes de confiar.
 ```
-NOTE: op_execute response is op_response (success). For SELECT the rows come
-from op_fetch.
+NOTA: a resposta do op_execute é op_response (sucesso). Para SELECT as linhas vêm
+do op_fetch.
 
 ### op_fetch (65)
 ```
@@ -72,66 +116,66 @@ from op_fetch.
 00 00 00 03                statement handle
 00 00 00 13 <19B> pad      out_blr (cstring, 19 bytes)
 00 00 00 00                out_message_number
-00 00 03 e8                out_message_count = 1000 (batch size)
+00 00 03 e8                out_message_count = 1000 (tamanho do lote)
 ```
-out_blr (19 bytes) for [emp_no SMALLINT, first_name VARCHAR(15)]:
+out_blr (19 bytes) para [emp_no SMALLINT, first_name VARCHAR(15)]:
 ```
 05            blr_version5
 02            blr_begin
 04 00         blr_message, message#0
-04 00         field count = 4  (= 2 columns × {data + null-indicator})
+04 00         contagem de campos = 4  (= 2 colunas × {dado + indicador-de-nulo})
 07 00         blr_short scale 0      (emp_no)
-07 00         blr_short scale 0      (null indicator)
+07 00         blr_short scale 0      (indicador de nulo)
 26 00 00 0f 00 blr_varying2 charset 0 length 15  (first_name)  [0x26=38]
-07 00         blr_short scale 0      (null indicator)
+07 00         blr_short scale 0      (indicador de nulo)
 ff            blr_end
 4c            blr_eoc
 ```
-BLR type codes seen: blr_short=7, blr_varying2=38(0x26) [charset(2 LE)+len(2 LE)],
+Códigos de tipo BLR vistos: blr_short=7, blr_varying2=38(0x26) [charset(2 LE)+len(2 LE)],
 blr_version5=5, blr_begin=2, blr_message=4, blr_end=255, blr_eoc=76.
 
-### op_fetch_response (66) + row message  — ⚠️ NULL LAYOUT UNRESOLVED
+### op_fetch_response (66) + mensagem de linha  — ⚠️ LAYOUT DE NULOS NÃO RESOLVIDO
 ```
 00 00 00 42   op_fetch_response
-00 00 00 00   status = 0 (row present;  100 = end-of-cursor)
-00 00 00 01   count = 1 (messages in this packet; 0 = none)
-<message bytes follow, then more op_fetch_response packets until count=0>
+00 00 00 00   status = 0 (linha presente;  100 = fim do cursor)
+00 00 00 01   count = 1 (mensagens neste pacote; 0 = nenhuma)
+<os bytes da mensagem seguem, depois mais pacotes op_fetch_response até count=0>
 ```
-Row for emp_no=2, first_name="Robert" (both NOT NULL) = **20 bytes**:
+Linha para emp_no=2, first_name="Robert" (ambos NOT NULL) = **20 bytes**:
 ```
-00 00 00 00   <- leading word = 0
-00 00 00 02   <- emp_no = 2  (XDR: SMALLINT sent as 4-byte big-endian long)
-00 00 00 06   <- varchar length = 6
+00 00 00 00   <- palavra inicial = 0
+00 00 00 02   <- emp_no = 2  (XDR: SMALLINT enviado como long big-endian de 4 bytes)
+00 00 00 06   <- comprimento do varchar = 6
 52 6f 62 65 72 74   "Robert"
-00 00         <- 2 trailing bytes
+00 00         <- 2 bytes finais
 ```
-### RESOLVED — row message format
-Verified with a forced-NULL capture (`SELECT emp_no, CAST(NULL AS VARCHAR(15)) … WHERE emp_no=2`)
-→ 8-byte message `02 00 00 00  00 00 00 02`. Comparing the two rows:
+### RESOLVIDO — formato da mensagem de linha
+Verificado com uma captura de NULL forçado (`SELECT emp_no, CAST(NULL AS VARCHAR(15)) … WHERE emp_no=2`)
+→ mensagem de 8 bytes `02 00 00 00  00 00 00 02`. Comparando as duas linhas:
 
-**Row message = NULL bitmap, then XDR-encoded values of the NON-NULL columns only.**
-- NULL bitmap: `align4(ceil(ncols/8))` bytes (4 bytes for ≤32 cols),
-  **little-endian**, bit *i* set ⇒ column *i* IS NULL.
-- Then, for each column **in order, only if not null**, its XDR value:
-  - SMALLINT/INTEGER → 4-byte big-endian (sign-extended)
-  - BIGINT/INT64 → 8-byte big-endian
+**Mensagem de linha = bitmap de nulos, depois os valores codificados em XDR apenas das colunas NÃO-NULAS.**
+- Bitmap de nulos: `align4(ceil(ncols/8))` bytes (4 bytes para ≤32 colunas),
+  **little-endian**, bit *i* ligado ⇒ coluna *i* É NULL.
+- Depois, para cada coluna **em ordem, apenas se não for nula**, seu valor XDR:
+  - SMALLINT/INTEGER → big-endian de 4 bytes (com extensão de sinal)
+  - BIGINT/INT64 → big-endian de 8 bytes
   - FLOAT → 4 bytes, DOUBLE → 8 bytes
-  - VARCHAR → length(4 BE) + bytes + pad to 4
-  - CHAR(n) → n bytes + pad to 4
+  - VARCHAR → comprimento(4 BE) + bytes + pad para 4
+  - CHAR(n) → n bytes + pad para 4
   - DATE/TIME → 4 bytes; TIMESTAMP → 8 bytes (date long + time long)
   - BLOB → quad/blob-id (8 bytes)
-  - NULL columns contribute **zero** bytes to the data section.
+  - Colunas NULAS contribuem com **zero** bytes para a seção de dados.
 
-Examples:
-- `[emp_no=2, "Robert"]` → `00000000`(mask) `00000002`(emp_no) `00000006`+"Robert"+`0000` = 20 B
-- `[emp_no=2, NULL]`     → `02000000`(mask, bit1) `00000002`(emp_no) = 8 B
+Exemplos:
+- `[emp_no=2, "Robert"]` → `00000000`(máscara) `00000002`(emp_no) `00000006`+"Robert"+`0000` = 20 B
+- `[emp_no=2, NULL]`     → `02000000`(máscara, bit1) `00000002`(emp_no) = 8 B
 
-(The out_blr we SEND still declares 2 data + 2 null-short fields per the capture;
-the XDR layer packs nulls into the leading bitmap on the wire. Encode params the
-same way for INSERT: leading null bitmap + non-null XDR values.)
+(O out_blr que ENVIAMOS ainda declara 2 campos de dado + 2 null-short conforme a captura;
+a camada XDR empacota os nulos no bitmap inicial no wire. Codifique os parâmetros da
+mesma forma para INSERT: bitmap de nulos inicial + valores XDR não-nulos.)
 
-### Remaining ops to capture when needed
-- op_free_statement(67): handle + mode (close=1 / drop=2 / unprepare=4).
-- INSERT/params: in_blr + in_message (encode params, same XDR rules).
-- Batch/array DML: op_batch_create(99), op_batch_msg(100), op_batch_exec(101),
-  op_batch_cs(103), op_batch_rls(102) — capture from a client that uses IBatch.
+### Ops restantes a capturar quando necessário
+- op_free_statement(67): handle + modo (close=1 / drop=2 / unprepare=4).
+- INSERT/parâmetros: in_blr + in_message (codificar parâmetros, mesmas regras XDR).
+- DML em lote/array: op_batch_create(99), op_batch_msg(100), op_batch_exec(101),
+  op_batch_cs(103), op_batch_rls(102) — capturar de um cliente que use IBatch.

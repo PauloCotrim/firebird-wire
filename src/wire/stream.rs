@@ -1,13 +1,13 @@
-//! Framed, optionally-encrypted packet stream over a TCP connection.
+//! Fluxo (stream) de pacotes enquadrado, opcionalmente criptografado, sobre uma conexão TCP.
 //!
-//! Firebird has no overall packet-length prefix: each operation is a sequence
-//! of XDR fields whose shape depends on the op code. We therefore read fields
-//! on demand straight from the socket rather than buffering whole packets.
+//! O Firebird não tem um prefixo de comprimento geral para o pacote: cada operação é uma sequência
+//! de campos XDR cujo formato depende do op code. Por isso lemos os campos
+//! sob demanda diretamente do socket em vez de armazenar pacotes inteiros em buffer.
 //!
-//! After the wire-crypt handshake (`op_crypt`) every subsequent byte in both
-//! directions passes through a stream [`Cipher`]. Because stream ciphers are
-//! position-dependent, the cipher is applied to raw bytes exactly once, in
-//! order, as they cross the socket.
+//! Após o handshake de wire-crypt (`op_crypt`) cada byte subsequente em ambas
+//! as direções passa por uma [`Cipher`] de fluxo (stream). Como as cifras de fluxo (stream) são
+//! dependentes de posição, a cifra é aplicada aos bytes brutos exatamente uma vez, em
+//! ordem, conforme atravessam o socket.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -16,21 +16,21 @@ use crate::error::{Error, Result};
 use crate::wire::consts::{op, INFO_END};
 use crate::wire::xdr::{pad4, XdrWriter};
 
-/// A symmetric stream cipher applied to the wire after `op_crypt`.
+/// Uma cifra de fluxo (stream) simétrica aplicada ao protocolo de comunicação (wire protocol) após `op_crypt`.
 ///
-/// Implementations mutate the buffer in place. The same byte position must be
-/// processed exactly once; the stream layer guarantees this.
+/// As implementações alteram o buffer no lugar. A mesma posição de byte deve ser
+/// processada exatamente uma vez; a camada de fluxo (stream) garante isso.
 pub trait Cipher: Send {
     fn process(&mut self, data: &mut [u8]);
 }
 
-/// The framed connection to a Firebird server.
+/// A conexão enquadrada com um servidor Firebird.
 pub struct FbStream {
     sock: TcpStream,
-    /// Decrypted bytes already pulled from the socket but not yet consumed.
+    /// Bytes descriptografados já extraídos do socket mas ainda não consumidos.
     rbuf: Vec<u8>,
     rpos: usize,
-    /// Outgoing bytes accumulated before a flush.
+    /// Bytes de saida acumulados antes de um descarregamento (flush).
     wbuf: Vec<u8>,
     read_cipher: Option<Box<dyn Cipher>>,
     write_cipher: Option<Box<dyn Cipher>>,
@@ -49,8 +49,8 @@ impl FbStream {
         }
     }
 
-    /// Install the negotiated wire ciphers. Called once, right after the crypt
-    /// handshake; all traffic from this point is encrypted.
+    /// Instala as cifras de wire negociadas. Chamado uma vez, logo após o handshake
+    /// de crypt; todo o tráfego a partir deste ponto é criptografado.
     pub fn enable_encryption(&mut self, read: Box<dyn Cipher>, write: Box<dyn Cipher>) {
         self.read_cipher = Some(read);
         self.write_cipher = Some(write);
@@ -60,15 +60,15 @@ impl FbStream {
         self.read_cipher.is_some()
     }
 
-    // -- writing -----------------------------------------------------------
+    // -- escrita -----------------------------------------------------------
 
-    /// Append an XDR-built operation to the send buffer. Use [`Self::flush`]
-    /// to push it to the socket. Most callers use [`Self::send`].
+    /// Anexa uma operação construída em XDR ao buffer de envio. Use [`Self::flush`]
+    /// para empurrá-la ao socket. A maioria dos chamadores usa [`Self::send`].
     pub fn enqueue(&mut self, w: &XdrWriter) {
         self.wbuf.extend_from_slice(w.as_slice());
     }
 
-    /// Flush all buffered output, encrypting if a cipher is installed.
+    /// Descarrega (flush) toda a saida em buffer, criptografando se uma cifra estiver instalada.
     pub async fn flush(&mut self) -> Result<()> {
         if self.wbuf.is_empty() {
             return Ok(());
@@ -82,18 +82,18 @@ impl FbStream {
         Ok(())
     }
 
-    /// Enqueue and immediately flush one operation.
+    /// Enfileira e imediatamente descarrega (flush) uma operação.
     pub async fn send(&mut self, w: &XdrWriter) -> Result<()> {
         self.enqueue(w);
         self.flush().await
     }
 
-    // -- reading -----------------------------------------------------------
+    // -- leitura -----------------------------------------------------------
 
-    /// Ensure at least `n` decrypted bytes are available at the read cursor,
-    /// pulling (and decrypting) more from the socket as needed.
+    /// Garante que pelo menos `n` bytes descriptografados estejam disponíveis no cursor de leitura,
+    /// extraindo (e descriptografando) mais do socket conforme necessário.
     async fn fill(&mut self, n: usize) -> Result<()> {
-        // Compact occasionally so the buffer doesn't grow unbounded.
+        // Compacta ocasionalmente para que o buffer não cresça indefinidamente.
         if self.rpos > 0 && self.rpos == self.rbuf.len() {
             self.rbuf.clear();
             self.rpos = 0;
@@ -117,7 +117,7 @@ impl FbStream {
         Ok(())
     }
 
-    /// Consume `n` bytes from the read cursor (no XDR padding).
+    /// Consome `n` bytes do cursor de leitura (sem preenchimento (padding) XDR).
     pub async fn read_raw(&mut self, n: usize) -> Result<Vec<u8>> {
         self.fill(n).await?;
         let start = self.rpos;
@@ -145,9 +145,9 @@ impl FbStream {
         Ok(f64::from_bits(self.read_i64().await? as u64))
     }
 
-    /// Skip XDR padding so the absolute byte offset since stream start lands on
-    /// a 4-byte boundary. We track alignment via `data_len`, not `rpos`, so the
-    /// caller passes the length of the data field just read.
+    /// Pula o preenchimento (padding) XDR para que o deslocamento absoluto de bytes desde o início do
+    /// fluxo (stream) caia em um limite de 4 bytes. Rastreamos o alinhamento via `data_len`, não `rpos`,
+    /// então o chamador passa o comprimento do campo de dados recém-lido.
     pub async fn read_pad(&mut self, data_len: usize) -> Result<()> {
         let pad = pad4(data_len) - data_len;
         if pad > 0 {
@@ -156,7 +156,7 @@ impl FbStream {
         Ok(())
     }
 
-    /// Read a length-prefixed, 4-byte-aligned opaque buffer.
+    /// Lê um buffer opaco com prefixo de comprimento, alinhado em 4 bytes.
     pub async fn read_bytes(&mut self) -> Result<Vec<u8>> {
         let len = self.read_i32().await? as usize;
         let data = self.read_raw(len).await?;
@@ -164,14 +164,14 @@ impl FbStream {
         Ok(data)
     }
 
-    /// Read a Firebird quad (blob/transaction id): two XDR words, high then low.
+    /// Lê um quad do Firebird (id de blob/transação): duas palavras XDR, alta depois baixa.
     pub async fn read_quad(&mut self) -> Result<u64> {
         Ok(self.read_i64().await? as u64)
     }
 }
 
-/// Helper: build an info-request result terminator check. Returns the items up
-/// to (but excluding) the `isc_info_end` byte, validating it isn't truncated.
+/// Auxiliar: constrói uma verificação do terminador do resultado de uma info-request. Retorna os itens até
+/// (mas excluindo) o byte `isc_info_end`, validando que não está truncado.
 pub fn info_payload(buf: &[u8]) -> Result<&[u8]> {
     match buf.last() {
         Some(&INFO_END) => Ok(&buf[..buf.len() - 1]),
@@ -182,14 +182,14 @@ pub fn info_payload(buf: &[u8]) -> Result<&[u8]> {
     }
 }
 
-/// Convenience for building a single-op packet body.
+/// Conveniência para construir o corpo de um pacote de operação única.
 pub fn op_packet(opcode: i32) -> XdrWriter {
     let mut w = XdrWriter::new();
     w.put_i32(opcode);
     w
 }
 
-/// The op code names, for diagnostics.
+/// Os nomes dos op codes, para diagnóstico.
 pub fn op_name(code: i32) -> &'static str {
     match code {
         op::RESPONSE => "op_response",

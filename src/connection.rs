@@ -1,5 +1,5 @@
-//! The TCP connection: protocol negotiation, SRP authentication, optional wire
-//! encryption, and database attach/create.
+//! A conexão TCP: negociação de protocolo, autenticação SRP, criptografia de
+//! comunicação (wire) opcional, e attach/create do banco de dados.
 
 use tokio::net::TcpStream;
 
@@ -12,7 +12,7 @@ use crate::wire::response::{read_op, read_response, read_response_body};
 use crate::wire::stream::{op_name, op_packet, FbStream};
 use crate::wire::xdr::{ParameterBuffer, XdrWriter};
 
-/// Protocol versions we offer, in ascending preference (`weight`).
+/// Versões de protocolo que oferecemos, em preferência ascendente (`weight`).
 const OFFERED_PROTOCOLS: &[i32] = &[
     PROTOCOL_VERSION13,
     PROTOCOL_VERSION15,
@@ -22,7 +22,7 @@ const OFFERED_PROTOCOLS: &[i32] = &[
     PROTOCOL_VERSION19,
 ];
 
-/// An authenticated attachment to a database.
+/// Um anexo (attachment) autenticado a um banco de dados.
 pub struct Connection {
     stream: FbStream,
     db_handle: i32,
@@ -30,12 +30,12 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connect to the server and attach to an existing database.
+    /// Conecta ao servidor e anexa (attach) a um banco de dados existente.
     pub async fn connect(config: &ConnectConfig) -> Result<Connection> {
         Self::open(config, false).await
     }
 
-    /// Connect and create a new database, then attach to it.
+    /// Conecta e cria um novo banco de dados, e então anexa (attach) a ele.
     pub async fn create_database(config: &ConnectConfig) -> Result<Connection> {
         Self::open(config, true).await
     }
@@ -61,7 +61,7 @@ impl Connection {
         dbg_log(&format!("pubkey hex ({} chars)", pubkey.len()));
         dbg_log(&format!("cnct ({} bytes): {}", cnct.len(), hexdump(&cnct)));
         let mut w = op_packet(op::CONNECT);
-        w.put_i32(if create { op::CREATE } else { op::ATTACH }); // p_cnct_operation
+        w.put_i32(if create { op::CREATE } else { op::ATTACH }); // p_cnct_operation (operação)
         w.put_i32(CONNECT_VERSION3);
         w.put_i32(ARCH_GENERIC);
         w.put_str(&config.database); // p_cnct_file
@@ -70,17 +70,17 @@ impl Connection {
         for (i, &version) in OFFERED_PROTOCOLS.iter().enumerate() {
             w.put_i32(version);
             w.put_i32(ARCH_GENERIC);
-            w.put_i32(PTYPE_RPC); // min acceptable type
-            w.put_i32(PTYPE_BATCH_SEND); // max acceptable type (no lazy-send)
-            w.put_i32((i + 1) as i32); // weight
+            w.put_i32(PTYPE_RPC); // tipo mínimo aceitável
+            w.put_i32(PTYPE_BATCH_SEND); // tipo máximo aceitável (sem lazy-send)
+            w.put_i32((i + 1) as i32); // weight (peso)
         }
         stream.send(&w).await?;
         dbg_log("sent op_connect");
 
-        // --- accept / authenticate ----------------------------------------
+        // --- accept / autenticação ----------------------------------------
         let accept = read_accept(&mut stream).await?;
-        // The version arrives as a sign-extended USHORT (e.g. 0xffff8013);
-        // keep the low 15 bits to recover the base version (flag stripped).
+        // A versão chega como um USHORT com sinal estendido (ex.: 0xffff8013);
+        // mantemos os 15 bits baixos para recuperar a versão base (flag removida).
         let protocol_version = accept.version & 0x7fff;
         dbg_log(&format!(
             "accept: proto={protocol_version} plugin={:?} authenticated={} data_len={} keys_len={}",
@@ -90,20 +90,20 @@ impl Connection {
             accept.keys.len()
         ));
 
-        // Compute the SRP proof; it travels inside the attach DPB
-        // (isc_dpb_specific_auth_data), the path fbclient/isql use.
+        // Calcula a prova SRP; ela viaja dentro do DPB de attach
+        // (isc_dpb_specific_auth_data), o caminho que fbclient/isql usam.
         let auth = compute_auth(config, &mut srp, &accept)?;
         let session_key = auth.as_ref().map(|a| a.session_key.clone());
         dbg_log(&format!("auth computed; have_proof={}", auth.is_some()));
 
-        // --- wire encryption ----------------------------------------------
+        // --- criptografia de comunicação (wire) ---------------------------
         negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
         dbg_log(&format!("crypt negotiated; encrypted={}", stream.is_encrypted()));
 
         // --- attach / create ----------------------------------------------
         let dpb = build_dpb(config, create, auth.as_ref());
         let mut w = op_packet(if create { op::CREATE } else { op::ATTACH });
-        w.put_i32(0); // database object id
+        w.put_i32(0); // id do objeto de banco de dados
         w.put_str(&config.database);
         w.put_bytes(&dpb);
         stream.send(&w).await?;
@@ -112,7 +112,7 @@ impl Connection {
         Ok(Connection { stream, db_handle: resp.handle, protocol_version })
     }
 
-    /// Detach from the database and close the socket.
+    /// Desanexa (detach) do banco de dados e fecha o socket.
     pub async fn close(mut self) -> Result<()> {
         let mut w = op_packet(op::DETACH);
         w.put_i32(self.db_handle);
@@ -121,7 +121,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Round-trip a `op_ping` to check the connection is alive.
+    /// Faz um round-trip de `op_ping` para verificar se a conexão está viva.
     pub async fn ping(&mut self) -> Result<()> {
         let w = op_packet(op::PING);
         self.stream.send(&w).await?;
@@ -129,27 +129,27 @@ impl Connection {
         Ok(())
     }
 
-    /// The negotiated protocol version (base number, e.g. `18` for FB5).
+    /// A versão de protocolo negociada (número base, ex.: `18` para FB5).
     pub fn protocol_version(&self) -> i32 {
         self.protocol_version
     }
 
-    /// Whether the negotiated protocol supports the batch (array-DML) ops.
+    /// Se o protocolo negociado suporta as ops de batch (array-DML).
     pub fn supports_batch(&self) -> bool {
         self.protocol_version >= 16
     }
 
-    /// Whether the negotiated protocol supports scrollable cursors.
+    /// Se o protocolo negociado suporta cursores roláveis (scrollable).
     pub fn supports_fetch_scroll(&self) -> bool {
         self.protocol_version >= 17
     }
 
-    /// Whether the wire is encrypted.
+    /// Se a comunicação (wire) está criptografada.
     pub fn is_encrypted(&self) -> bool {
         self.stream.is_encrypted()
     }
 
-    // -- internal accessors for sibling modules ----------------------------
+    // -- acessores internos para módulos irmãos ----------------------------
 
     pub(crate) fn io(&mut self) -> &mut FbStream {
         &mut self.stream
@@ -160,16 +160,16 @@ impl Connection {
     }
 }
 
-/// What the server told us in its accept packet.
+/// O que o servidor nos informou em seu pacote de accept.
 struct Accept {
     version: i32,
-    /// Server SRP data (salt + B); empty for a plain `op_accept`.
+    /// Dados SRP do servidor (salt + B); vazio para um `op_accept` simples.
     data: Vec<u8>,
-    /// Chosen auth plugin name.
+    /// Nome do plugin de autenticação escolhido.
     plugin: String,
-    /// Whether the server considers us already authenticated.
+    /// Se o servidor nos considera já autenticados.
     authenticated: bool,
-    /// Crypt key-exchange buffer (lists available wire-crypt plugins).
+    /// Buffer de troca de chaves de cifra (lista os plugins de wire-crypt disponíveis).
     keys: Vec<u8>,
 }
 
@@ -182,9 +182,9 @@ async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
             let _ptype = stream.read_i32().await?;
             Ok(Accept { version, data: Vec::new(), plugin: String::new(), authenticated: true, keys: Vec::new() })
         }
-        // op_accept_data and op_cond_accept share an identical wire layout; the
-        // only difference is whether the client must still finish auth, which
-        // we read from the `authenticated` flag.
+        // op_accept_data e op_cond_accept compartilham um layout de comunicação
+        // (wire) idêntico; a única diferença é se o cliente ainda precisa
+        // concluir a autenticação, o que lemos da flag `authenticated`.
         c if c == op::ACCEPT_DATA || c == op::COND_ACCEPT => {
             let version = stream.read_i32().await?;
             let _arch = stream.read_i32().await?;
@@ -197,7 +197,7 @@ async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
         }
         c if c == op::REJECT => Err(Error::auth("server rejected the connection")),
         c if c == op::RESPONSE => {
-            // An error response during connect.
+            // Uma resposta de erro durante o connect.
             crate::wire::response::read_response_body(stream).await?.into_result()?;
             Err(Error::protocol("unexpected op_response during connect"))
         }
@@ -208,15 +208,15 @@ async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
     }
 }
 
-/// The SRP proof to embed in the attach DPB, plus the derived session key.
+/// A prova SRP a embutir no DPB de attach, mais a chave de sessão derivada.
 struct AuthData {
     plugin: String,
     proof_hex: String,
     session_key: Vec<u8>,
 }
 
-/// Compute the SRP proof from the server's salt/B. Returns `None` for a plain
-/// accept (no SRP data) or when the server already considers us authenticated.
+/// Calcula a prova SRP a partir do salt/B do servidor. Retorna `None` para um
+/// accept simples (sem dados SRP) ou quando o servidor já nos considera autenticados.
 fn compute_auth(
     config: &ConnectConfig,
     srp: &mut SrpClient,
@@ -244,17 +244,17 @@ fn compute_auth(
     }))
 }
 
-/// Read the response to `op_attach`/`op_create`. With auth carried in the DPB
-/// the server normally replies `op_response` directly, but it may drive one or
-/// more `op_cont_auth` rounds first; absorb them.
+/// Lê a resposta para `op_attach`/`op_create`. Com a autenticação carregada no DPB
+/// o servidor normalmente responde `op_response` diretamente, mas pode conduzir uma
+/// ou mais rodadas de `op_cont_auth` antes; absorva-as.
 async fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response::Response> {
     loop {
         let code = read_op(stream).await?;
         if code == op::RESPONSE {
             return read_response_body(stream).await?.into_result();
         } else if code == op::CONT_AUTH {
-            // data, name, list, keys — consume and continue; the server will
-            // follow with the real op_response.
+            // data, name, list, keys — consome e continua; o servidor virá
+            // em seguida com o op_response real.
             for _ in 0..4 {
                 let _ = stream.read_bytes().await?;
             }
@@ -267,7 +267,7 @@ async fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response:
     }
 }
 
-/// Negotiate wire encryption per the requested [`WireCrypt`] posture.
+/// Negocia a criptografia de comunicação (wire) conforme a postura [`WireCrypt`] requisitada.
 async fn negotiate_crypt(
     stream: &mut FbStream,
     config: &ConnectConfig,
@@ -288,22 +288,22 @@ async fn negotiate_crypt(
         }
     };
 
-    // The server advertises its wire-crypt plugins as readable names inside the
-    // key-exchange buffer. We currently implement Arc4 only.
+    // O servidor anuncia seus plugins de wire-crypt como nomes legíveis dentro do
+    // buffer de troca de chaves. Atualmente implementamos apenas Arc4.
     let arc4_available = contains_subslice(keys, b"Arc4");
     if !arc4_available {
         if config.wire_crypt == WireCrypt::Required {
             return Err(Error::auth("server does not offer the Arc4 wire-crypt plugin"));
         }
-        return Ok(()); // continue in clear text
+        return Ok(()); // continua em texto puro
     }
 
     let mut w = op_packet(op::CRYPT);
     w.put_str(WireCryptPlugin::Arc4.name()); // plugin
-    w.put_str("Symmetric"); // key type
+    w.put_str("Symmetric"); // tipo de chave
     stream.send(&w).await?;
 
-    // From here the wire is encrypted in both directions.
+    // A partir daqui a comunicação (wire) está criptografada em ambas as direções.
     let (rd, wr) = make_ciphers(WireCryptPlugin::Arc4, key);
     stream.enable_encryption(rd, wr);
 
@@ -312,7 +312,7 @@ async fn negotiate_crypt(
 }
 
 // ---------------------------------------------------------------------------
-// Parameter-buffer construction
+// Construção do buffer de parâmetros
 // ---------------------------------------------------------------------------
 
 fn wire_crypt_level(wc: WireCrypt) -> i32 {
@@ -323,8 +323,8 @@ fn wire_crypt_level(wc: WireCrypt) -> i32 {
     }
 }
 
-/// Build the `p_cnct_user_id` block: user, plugin negotiation, the SRP public
-/// key (chunked), and the desired crypt level.
+/// Constrói o bloco `p_cnct_user_id`: usuário, negociação de plugin, a chave
+/// pública SRP (em pedaços), e o nível de cifra desejado.
 fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
     let mut b = Vec::new();
     let user = config.normalized_user();
@@ -333,7 +333,7 @@ fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
     push_cnct(&mut b, cnct::PLUGIN_NAME, b"Srp256");
     push_cnct(&mut b, cnct::PLUGIN_LIST, b"Srp256,Srp");
 
-    // OS user / host, for server-side monitoring (mirrors fbclient).
+    // Usuário / host do SO, para monitoramento no lado do servidor (espelha fbclient).
     if let Some(os_user) = os_user() {
         push_cnct(&mut b, cnct::USER, os_user.as_bytes());
     }
@@ -341,8 +341,8 @@ fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
         push_cnct(&mut b, cnct::HOST, host.as_bytes());
     }
 
-    // CNCT_specific_data carries hex(A), split into <=254-byte chunks each
-    // prefixed by a sequence index byte.
+    // CNCT_specific_data carrega hex(A), dividido em pedaços de <=254 bytes cada
+    // prefixados por um byte de índice de sequência.
     let data = public_key_hex.as_bytes();
     let mut idx: u8 = 0;
     let mut off = 0;
@@ -368,7 +368,7 @@ fn push_cnct(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-/// Build the Database Parameter Buffer for attach/create.
+/// Constrói o Database Parameter Buffer (DPB) para attach/create.
 fn build_dpb(config: &ConnectConfig, create: bool, auth: Option<&AuthData>) -> Vec<u8> {
     let mut pb = ParameterBuffer::new(DPB_VERSION1);
 
@@ -383,7 +383,7 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: Option<&AuthData>) -> V
             pb.string(dpb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
         None => {
-            // No SRP session negotiated: fall back to a legacy password.
+            // Nenhuma sessão SRP negociada: recorre a uma senha legada.
             pb.string(dpb::PASSWORD, &config.password);
         }
     }
@@ -463,12 +463,12 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Build a generic info request/response op (used by transactions and
-/// statements). Returns the raw `op_info_*` packet body for `opcode`.
+/// Constrói uma op genérica de requisição/resposta de info (usada por transações e
+/// statements). Retorna o corpo bruto do pacote `op_info_*` para `opcode`.
 pub(crate) fn info_request(opcode: i32, handle: i32, items: &[u8], buffer_len: i32) -> XdrWriter {
     let mut w = op_packet(opcode);
     w.put_i32(handle);
-    w.put_i32(0); // incarnation
+    w.put_i32(0); // incarnation (encarnação)
     w.put_bytes(items);
     w.put_i32(buffer_len);
     w
@@ -481,11 +481,11 @@ mod tests {
     #[test]
     fn cnct_block_chunks_public_key() {
         let cfg = ConnectConfig::new().user("sysdba");
-        // 256-char hex -> chunk 0 (254) + chunk 1 (2).
+        // hex de 256 chars -> pedaço 0 (254) + pedaço 1 (2).
         let hex = "a".repeat(256);
         let block = build_cnct_block(&cfg, &hex);
 
-        // Find the two specific-data clumplets and check their index bytes.
+        // Encontra os dois clumplets specific-data e verifica seus bytes de índice.
         let mut i = 0;
         let mut chunks = Vec::new();
         while i < block.len() {
@@ -505,9 +505,9 @@ mod tests {
         let cfg = ConnectConfig::new().charset("UTF8").dialect(3);
         let dpb = build_dpb(&cfg, false, None);
         assert_eq!(dpb[0], DPB_VERSION1);
-        // dialect clumplet present.
+        // clumplet de dialect presente.
         assert!(dpb.windows(1).any(|w| w[0] == dpb::SQL_DIALECT));
-        // charset string present.
+        // string de charset presente.
         assert!(contains_subslice(&dpb, b"UTF8"));
     }
 

@@ -1,42 +1,42 @@
-//! Connection configuration.
+//! Configuração da conexão.
 
 use std::time::Duration;
 
-/// Desired wire-encryption posture.
+/// Postura desejada de criptografia da conexão (wire-encryption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WireCrypt {
-    /// Never encrypt. Fails against a server configured `WireCrypt = Required`.
+    /// Nunca criptografa. Falha contra um servidor configurado com `WireCrypt = Required`.
     Disabled,
-    /// Encrypt when the server offers a supported cipher; otherwise continue
-    /// in clear text.
+    /// Criptografa quando o servidor oferece uma cifra suportada; caso contrário
+    /// continua em texto claro.
     #[default]
     Enabled,
-    /// Require encryption; fail the handshake if it cannot be negotiated.
+    /// Exige criptografia; falha o handshake se ela não puder ser negociada.
     Required,
 }
 
-/// Everything needed to open a connection to a Firebird server.
+/// Tudo o que é necessário para abrir uma conexão com um servidor Firebird.
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
     pub host: String,
     pub port: u16,
-    /// Database path or alias on the server (e.g. `employee` or `/data/db.fdb`).
+    /// Caminho ou alias do banco de dados no servidor (ex.: `employee` ou `/data/db.fdb`).
     pub database: String,
     pub user: String,
     pub password: String,
     pub role: Option<String>,
-    /// Connection character set (default `UTF8`).
+    /// Charset da conexão (padrão `UTF8`).
     pub charset: String,
-    /// SQL dialect (default `3`).
+    /// Dialeto SQL (padrão `3`).
     pub dialect: i32,
     pub wire_crypt: WireCrypt,
-    /// TCP + handshake timeout.
+    /// Timeout de TCP + handshake.
     pub connect_timeout: Option<Duration>,
-    /// Page size for [`crate::Connection::create_database`].
+    /// Tamanho da página para [`crate::Connection::create_database`].
     pub page_size: Option<i32>,
-    /// Session time zone (FB4+), e.g. `America/Sao_Paulo`.
+    /// Fuso horário da sessão (FB4+), ex.: `America/Sao_Paulo`.
     pub timezone: Option<String>,
-    /// Number of parallel workers for the attachment (FB5).
+    /// Número de workers paralelos para a conexão (FB5).
     pub parallel_workers: Option<i32>,
 }
 
@@ -61,7 +61,7 @@ impl Default for ConnectConfig {
 }
 
 impl ConnectConfig {
-    /// Start from defaults (`localhost:3050`, user `SYSDBA`, UTF8, dialect 3).
+    /// Começa a partir dos padrões (`localhost:3050`, usuário `SYSDBA`, UTF8, dialeto 3).
     pub fn new() -> Self {
         Self::default()
     }
@@ -119,8 +119,8 @@ impl ConnectConfig {
         self
     }
 
-    /// The username normalized the way the Srp plugin expects it (unquoted
-    /// identifiers are folded to upper case).
+    /// O nome de usuário normalizado da forma que o plugin SRP espera
+    /// (identificadores sem aspas são convertidos para maiúsculas).
     pub(crate) fn normalized_user(&self) -> String {
         self.user.to_uppercase()
     }

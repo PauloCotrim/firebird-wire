@@ -1,14 +1,14 @@
-//! Firebird wire-protocol constants.
+//! Constantes do protocolo de comunicação (wire protocol) do Firebird.
 //!
-//! These mirror the public/impl headers shipped with Firebird
+//! Estas espelham os cabeçalhos public/impl distribuídos com o Firebird
 //! (`firebird/impl/consts_pub.h`, `iberror_c.h`, `Protocol.h`, `sqlda_pub.h`).
-//! Only the subset needed by this driver is reproduced. Values are stable
-//! across the wire and must not be changed.
+//! Apenas o subconjunto necessário para este driver é reproduzido. Os valores são estáveis
+//! ao longo do wire protocol e não devem ser alterados.
 
 #![allow(dead_code)]
 
 // ---------------------------------------------------------------------------
-// Operations (Protocol.h `P_OP`)
+// Operações (Protocol.h `P_OP`)
 // ---------------------------------------------------------------------------
 
 pub mod op {
@@ -78,7 +78,7 @@ pub mod op {
     pub const CRYPT_KEY_CALLBACK: i32 = 97;
     pub const COND_ACCEPT: i32 = 98;
 
-    // Batch (FB4+) — the headline array-DML feature.
+    // Batch (FB4+) — o recurso principal de DML em array.
     pub const BATCH_CREATE: i32 = 99;
     pub const BATCH_MSG: i32 = 100;
     pub const BATCH_EXEC: i32 = 101;
@@ -101,12 +101,12 @@ pub mod op {
 }
 
 // ---------------------------------------------------------------------------
-// Protocol versions and connection negotiation
+// Versões de protocolo e negociação de conexão
 // ---------------------------------------------------------------------------
 
-/// High bit set on every protocol version offered/accepted in modern Firebird.
+/// Bit alto setado em toda versão de protocolo oferecida/aceita no Firebird moderno.
 pub const FB_PROTOCOL_FLAG: i32 = 0x8000;
-/// Mask used to recover the base version from an accepted protocol value.
+/// Máscara usada para recuperar a versão base a partir de um valor de protocolo aceito.
 pub const FB_PROTOCOL_MASK: i32 = !FB_PROTOCOL_FLAG;
 
 pub const PROTOCOL_VERSION10: i32 = 10;
@@ -115,45 +115,45 @@ pub const PROTOCOL_VERSION12: i32 = FB_PROTOCOL_FLAG | 12;
 pub const PROTOCOL_VERSION13: i32 = FB_PROTOCOL_FLAG | 13;
 pub const PROTOCOL_VERSION14: i32 = FB_PROTOCOL_FLAG | 14;
 pub const PROTOCOL_VERSION15: i32 = FB_PROTOCOL_FLAG | 15;
-pub const PROTOCOL_VERSION16: i32 = FB_PROTOCOL_FLAG | 16; // FB4: batch, stmt timeout
+pub const PROTOCOL_VERSION16: i32 = FB_PROTOCOL_FLAG | 16; // FB4: batch, timeout de stmt
 pub const PROTOCOL_VERSION17: i32 = FB_PROTOCOL_FLAG | 17; // FB4: cancel, etc.
 pub const PROTOCOL_VERSION18: i32 = FB_PROTOCOL_FLAG | 18; // FB5: fetch scroll, info batch
 pub const PROTOCOL_VERSION19: i32 = FB_PROTOCOL_FLAG | 19; // FB5.0.x
 
-/// `p_cnct_cversion` — connect block version (CONNECT_VERSION3 carries crypt info).
+/// `p_cnct_cversion` — versão do bloco connect (CONNECT_VERSION3 carrega info de crypt).
 pub const CONNECT_VERSION3: i32 = 3;
 
-/// Architecture identifier (`arch_generic`).
+/// Identificador de arquitetura (`arch_generic`).
 pub const ARCH_GENERIC: i32 = 1;
 
-/// `ptype_*` — minimum/maximum acceptable protocol *type* per offered version.
-pub const PTYPE_PAGE: i32 = 1; // page-server (unused)
-pub const PTYPE_RPC: i32 = 2; // simple remote procedure call
-pub const PTYPE_BATCH_SEND: i32 = 3; // batch sends, no asynchrony
-pub const PTYPE_OUT_OF_BAND: i32 = 4; // batch sends w/ out-of-band notification
-pub const PTYPE_LAZY_SEND: i32 = 5; // deferred packet delivery
+/// `ptype_*` — *tipo* de protocolo mínimo/máximo aceitável por versão oferecida.
+pub const PTYPE_PAGE: i32 = 1; // page-server (não usado)
+pub const PTYPE_RPC: i32 = 2; // chamada de procedimento remoto simples
+pub const PTYPE_BATCH_SEND: i32 = 3; // envios em batch, sem assincronia
+pub const PTYPE_OUT_OF_BAND: i32 = 4; // envios em batch com notificação out-of-band
+pub const PTYPE_LAZY_SEND: i32 = 5; // entrega de pacotes adiada
 
-/// Bit OR-ed into `p_acpt_type` to indicate compression and architecture, FB-specific.
+/// Bit feito OR em `p_acpt_type` para indicar compressão e arquitetura, específico do FB.
 pub const PFLAG_COMPRESS: i32 = 0x100;
 
 // ---------------------------------------------------------------------------
-// CNCT clumplet tags (connect block, user identification)
+// Tags de clumplet CNCT (bloco connect, identificação de usuário)
 // ---------------------------------------------------------------------------
 
 pub mod cnct {
-    pub const USER: u8 = 1; // OS user name
+    pub const USER: u8 = 1; // nome de usuário do SO
     pub const PASSWD: u8 = 2;
-    pub const HOST: u8 = 4; // client host name
-    pub const GROUP: u8 = 5; // effective Unix group id
+    pub const HOST: u8 = 4; // nome do host do cliente
+    pub const GROUP: u8 = 5; // id efetivo do grupo Unix
     pub const USER_VERIFICATION: u8 = 6;
-    pub const SPECIFIC_DATA: u8 = 7; // auth plugin data, chunked
-    pub const PLUGIN_NAME: u8 = 8; // plugin that produced specific_data
-    pub const LOGIN: u8 = 9; // modern login (same as isc_dpb_user_name)
-    pub const PLUGIN_LIST: u8 = 10; // plugins available on the client
-    pub const CLIENT_CRYPT: u8 = 11; // desired wire-crypt level
+    pub const SPECIFIC_DATA: u8 = 7; // dados do plugin de autenticação, em chunks
+    pub const PLUGIN_NAME: u8 = 8; // plugin que produziu specific_data
+    pub const LOGIN: u8 = 9; // login moderno (igual a isc_dpb_user_name)
+    pub const PLUGIN_LIST: u8 = 10; // plugins disponíveis no cliente
+    pub const CLIENT_CRYPT: u8 = 11; // nível de wire-crypt desejado
 }
 
-/// Values for `cnct::CLIENT_CRYPT` (and DPB wire-crypt level).
+/// Valores para `cnct::CLIENT_CRYPT` (e nível de wire-crypt do DPB).
 pub mod wire_crypt {
     pub const DISABLED: i32 = 0;
     pub const ENABLED: i32 = 1;
@@ -161,12 +161,12 @@ pub mod wire_crypt {
 }
 
 // ---------------------------------------------------------------------------
-// DPB — Database Parameter Buffer (consts_pub.h `isc_dpb_*`)
+// DPB — Buffer de Parâmetros de Banco de Dados (consts_pub.h `isc_dpb_*`)
 // ---------------------------------------------------------------------------
 
-/// DPB version byte that prefixes the buffer.
+/// Byte de versão do DPB que prefixa o buffer.
 pub const DPB_VERSION1: u8 = 1;
-pub const DPB_VERSION2: u8 = 2; // strings as UTF-8, lengths as 4 bytes
+pub const DPB_VERSION2: u8 = 2; // strings em UTF-8, comprimentos em 4 bytes
 
 pub mod dpb {
     pub const PAGE_SIZE: u8 = 4;
@@ -179,7 +179,7 @@ pub mod dpb {
     pub const USER_NAME: u8 = 28;
     pub const PASSWORD: u8 = 29;
     pub const PASSWORD_ENC: u8 = 30;
-    pub const LC_CTYPE: u8 = 48; // connection charset
+    pub const LC_CTYPE: u8 = 48; // charset da conexão
     pub const ROLE_NAME: u8 = 60;
     pub const CONNECT_TIMEOUT: u8 = 57;
     pub const PROCESS_ID: u8 = 71;
@@ -203,7 +203,7 @@ pub mod dpb {
 }
 
 // ---------------------------------------------------------------------------
-// TPB — Transaction Parameter Buffer (`isc_tpb_*`)
+// TPB — Buffer de Parâmetros de Transação (`isc_tpb_*`)
 // ---------------------------------------------------------------------------
 
 pub const TPB_VERSION3: u8 = 3;
@@ -235,7 +235,7 @@ pub mod tpb {
 }
 
 // ---------------------------------------------------------------------------
-// SQL information items (`isc_info_sql_*`) used after prepare
+// Itens de informação SQL (`isc_info_sql_*`) usados após o prepare
 // ---------------------------------------------------------------------------
 
 pub mod isql {
@@ -253,8 +253,10 @@ pub mod isql {
     pub const NULL_IND: u8 = 15;
     pub const FIELD: u8 = 16;
     pub const RELATION: u8 = 17;
-    pub const ALIAS: u8 = 18;
-    pub const OWNER: u8 = 19;
+    // Atenção: a ordem real do Firebird é owner=18, alias=19 (confirmado por
+    // captura do describe-info: tag 0x12 carrega o owner, 0x13 carrega o alias).
+    pub const OWNER: u8 = 18;
+    pub const ALIAS: u8 = 19;
     pub const RELATION_ALIAS: u8 = 20;
     pub const STMT_TYPE: u8 = 21;
     pub const BATCH_FETCH: u8 = 22;
@@ -264,7 +266,7 @@ pub mod isql {
     pub const FLAGS: u8 = 26;
 }
 
-/// Statement types returned by `isc_info_sql_stmt_type`.
+/// Tipos de instrução (statement) retornados por `isc_info_sql_stmt_type`.
 pub mod stmt_type {
     pub const SELECT: i32 = 1;
     pub const INSERT: i32 = 2;
@@ -282,14 +284,14 @@ pub mod stmt_type {
     pub const SAVEPOINT: i32 = 14;
 }
 
-/// `op_free_statement` modes.
+/// Modos de `op_free_statement`.
 pub mod free {
     pub const CLOSE: i32 = 1;
     pub const DROP: i32 = 2;
     pub const UNPREPARE: i32 = 4;
 }
 
-/// `op_fetch_scroll` directions (FB5).
+/// Direções de `op_fetch_scroll` (FB5).
 pub mod scroll {
     pub const NEXT: i32 = 0;
     pub const PRIOR: i32 = 1;
@@ -300,7 +302,7 @@ pub mod scroll {
 }
 
 // ---------------------------------------------------------------------------
-// Generic info-buffer terminators / status
+// Terminadores / status genéricos de info-buffer
 // ---------------------------------------------------------------------------
 
 pub const INFO_END: u8 = 1;
@@ -309,12 +311,12 @@ pub const INFO_ERROR: u8 = 3;
 pub const INFO_DATA_NOT_READY: u8 = 4;
 
 // ---------------------------------------------------------------------------
-// Status vector tags (`isc_arg_*`)
+// Tags do vetor de status (`isc_arg_*`)
 // ---------------------------------------------------------------------------
 
 pub mod arg {
     pub const END: i32 = 0;
-    pub const GDS: i32 = 1; // Firebird error code
+    pub const GDS: i32 = 1; // código de erro do Firebird
     pub const STRING: i32 = 2;
     pub const CSTRING: i32 = 3;
     pub const NUMBER: i32 = 4;
@@ -325,11 +327,11 @@ pub mod arg {
     pub const DOS: i32 = 9;
     pub const MPEXL: i32 = 10;
     pub const WARNING: i32 = 18;
-    pub const SQL_STATE: i32 = 19; // SQLSTATE string (FB2.5+)
+    pub const SQL_STATE: i32 = 19; // string SQLSTATE (FB2.5+)
 }
 
 // ---------------------------------------------------------------------------
-// SQL data types (`SQL_*`, sqlda_pub.h). Low bit = nullable flag.
+// Tipos de dados SQL (`SQL_*`, sqlda_pub.h). Bit baixo = flag anulável.
 // ---------------------------------------------------------------------------
 
 pub mod sql_type {
@@ -357,12 +359,12 @@ pub mod sql_type {
     pub const BOOLEAN: i32 = 32764; // FB3+
     pub const NULL: i32 = 32766;
 
-    /// Strip the nullable low bit to get the base type.
+    /// Remove o bit baixo de anulável para obter o tipo base.
     #[inline]
     pub const fn base(t: i32) -> i32 {
         t & !1
     }
-    /// True when the type's low bit marks it nullable.
+    /// Verdadeiro quando o bit baixo do tipo o marca como anulável.
     #[inline]
     pub const fn is_nullable(t: i32) -> bool {
         t & 1 != 0
@@ -370,7 +372,40 @@ pub mod sql_type {
 }
 
 // ---------------------------------------------------------------------------
-// Blob parameter buffer (`isc_bpb_*`) and blob info
+// Códigos BLR (Binary Language Representation) para descrições de mensagens
+// ---------------------------------------------------------------------------
+
+pub mod blr {
+    pub const VERSION5: u8 = 5;
+    pub const BEGIN: u8 = 2;
+    pub const MESSAGE: u8 = 4;
+    pub const END: u8 = 255;
+    pub const EOC: u8 = 76; // fim de comando
+
+    pub const TEXT: u8 = 14; // + length(2)
+    pub const TEXT2: u8 = 15; // + charset(2) + length(2)
+    pub const SHORT: u8 = 7; // + scale(1)
+    pub const LONG: u8 = 8; // + scale(1)
+    pub const QUAD: u8 = 9; // + scale(1) — também id de blob
+    pub const FLOAT: u8 = 10;
+    pub const DOUBLE: u8 = 27;
+    pub const D_FLOAT: u8 = 11;
+    pub const TIMESTAMP: u8 = 35;
+    pub const VARYING: u8 = 37; // + length(2)
+    pub const VARYING2: u8 = 38; // + charset(2) + length(2)
+    pub const SQL_DATE: u8 = 12;
+    pub const SQL_TIME: u8 = 13;
+    pub const INT64: u8 = 16; // + scale(1)
+    pub const BOOL: u8 = 23;
+    pub const DEC64: u8 = 24;
+    pub const DEC128: u8 = 25;
+    pub const INT128: u8 = 26; // + scale(1)
+    pub const SQL_TIME_TZ: u8 = 28;
+    pub const TIMESTAMP_TZ: u8 = 29;
+}
+
+// ---------------------------------------------------------------------------
+// Buffer de parâmetros de blob (`isc_bpb_*`) e info de blob
 // ---------------------------------------------------------------------------
 
 pub const BPB_VERSION1: u8 = 1;
@@ -382,34 +417,34 @@ pub mod bpb {
     pub const STORAGE: u8 = 7;
 }
 
-/// Blob subtypes.
+/// Subtipos de blob.
 pub mod blob_type {
     pub const SEGMENTED: i32 = 0;
     pub const STREAM: i32 = 1;
 }
 
 // ---------------------------------------------------------------------------
-// Batch parameter buffer (`IBatch` tags) and info items (FB4+)
+// Buffer de parâmetros de batch (tags de `IBatch`) e itens de info (FB4+)
 // ---------------------------------------------------------------------------
 
-/// Tags for the batch creation parameter buffer (`Firebird::IBatch::TAG_*`).
+/// Tags para o buffer de parâmetros de criação de batch (`Firebird::IBatch::TAG_*`).
 pub mod batch_tag {
-    pub const MULTIERROR: u8 = 1; // continue after per-row errors
-    pub const RECORD_COUNTS: u8 = 2; // report per-message affected counts
-    pub const BUFFER_BYTES_SIZE: u8 = 3; // server-side buffer cap
+    pub const MULTIERROR: u8 = 1; // continua após erros por linha
+    pub const RECORD_COUNTS: u8 = 2; // reporta contagens afetadas por mensagem
+    pub const BUFFER_BYTES_SIZE: u8 = 3; // limite do buffer do lado do servidor
     pub const BLOB_POLICY: u8 = 4;
     pub const DETAILED_ERRORS: u8 = 5;
 }
 
-/// Values for `batch_tag::BLOB_POLICY`.
+/// Valores para `batch_tag::BLOB_POLICY`.
 pub mod blob_policy {
     pub const NONE: u8 = 0;
-    pub const ID_ENGINE: u8 = 1; // engine assigns ids
-    pub const ID_USER: u8 = 2; // caller assigns ids
+    pub const ID_ENGINE: u8 = 1; // o engine atribui ids
+    pub const ID_USER: u8 = 2; // o chamador atribui ids
     pub const STREAM: u8 = 3;
 }
 
-/// Batch info items (`IBatch` info, FB4+) returned by `op_info_batch`.
+/// Itens de info de batch (info de `IBatch`, FB4+) retornados por `op_info_batch`.
 pub mod batch_info {
     pub const VERSION: u8 = 1;
     pub const BLOB_ALIGNMENT: u8 = 2;
@@ -418,9 +453,9 @@ pub mod batch_info {
     pub const BUFFER_BYTES_SIZE: u8 = 5;
 }
 
-/// Completion-state codes from `op_batch_cs` (`IBatchCompletionState`).
+/// Códigos de estado de conclusão de `op_batch_cs` (`IBatchCompletionState`).
 pub mod batch_cs {
-    /// Per-message return code meaning "no records affected info available".
+    /// Código de retorno por mensagem que significa "nenhuma info de registros afetados disponível".
     pub const NO_MORE_ERRORS: i32 = -1;
     pub const EXECUTE_FAILED: i32 = -2;
     pub const SUCCESS_NO_INFO: i32 = -3;

@@ -1,14 +1,14 @@
-//! Live integration tests against a real Firebird 5 server.
+//! Testes de integração contra um servidor real (ao vivo) Firebird 5.
 //!
-//! These are skipped unless `FB_PASSWORD` is set in the environment, so the
-//! default `cargo test` stays green without a server. To run them:
+//! Estes são pulados a menos que `FB_PASSWORD` esteja definido no ambiente, de
+//! modo que o `cargo test` padrão continua verde sem um servidor. Para executá-los:
 //!
 //! ```sh
 //! FB_HOST=127.0.0.1 FB_PORT=3555 FB_DB=employee \
 //!   FB_USER=SYSDBA FB_PASSWORD=yourpw cargo test --test integration -- --nocapture
 //! ```
 
-use fdb_driver::{ConnectConfig, Connection, Result, WireCrypt};
+use fdb_driver::{ConnectConfig, Connection, Result, Value, WireCrypt};
 
 fn config() -> Option<ConnectConfig> {
     let password = std::env::var("FB_PASSWORD").ok()?;
@@ -19,7 +19,7 @@ fn config() -> Option<ConnectConfig> {
             .database(std::env::var("FB_DB").unwrap_or_else(|_| "employee".into()))
             .user(std::env::var("FB_USER").unwrap_or_else(|_| "SYSDBA".into()))
             .password(password)
-            // The sample server has WireCrypt=Disabled; allow either.
+            // O servidor de exemplo tem `WireCrypt=Disabled`; permite ambos.
             .wire_crypt(WireCrypt::Enabled),
     )
 }
@@ -63,6 +63,72 @@ async fn begin_commit_rollback() -> Result<()> {
     let tx = conn.begin().await?;
     tx.rollback(&mut conn).await?;
 
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prepare_describe_select() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    let stmt = conn.prepare(&tx, "SELECT emp_no, first_name FROM employee").await?;
+    println!("stmt_type={} columns={}", stmt.stmt_type(), stmt.columns().len());
+    assert!(stmt.is_select());
+    assert_eq!(stmt.columns().len(), 2);
+    assert_eq!(stmt.columns()[0].name().to_uppercase(), "EMP_NO");
+    assert_eq!(stmt.columns()[1].name().to_uppercase(), "FIRST_NAME");
+    assert!(stmt.params().is_empty());
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn execute_and_fetch_rows() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    let mut stmt = conn
+        .prepare(&tx, "SELECT emp_no, first_name FROM employee ORDER BY emp_no")
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    println!("fetched {} rows", rows.len());
+    assert!(!rows.is_empty());
+
+    // A primeira coluna é SMALLINT, a segunda é texto VARCHAR.
+    let first = &rows[0];
+    assert!(matches!(first[0], Value::Short(_)));
+    assert!(matches!(first[1], Value::Text(_) | Value::Null));
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn parameterized_query() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    let mut stmt = conn
+        .prepare(&tx, "SELECT first_name FROM employee WHERE emp_no = ?")
+        .await?;
+    assert_eq!(stmt.params().len(), 1);
+    stmt.execute(&mut conn, &tx, &[Value::Short(2)]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    println!("param query returned {} rows", rows.len());
+    assert_eq!(rows.len(), 1);
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
     conn.close().await?;
     Ok(())
 }

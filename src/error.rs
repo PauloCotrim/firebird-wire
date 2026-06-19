@@ -1,54 +1,55 @@
-//! Error types for the driver.
+//! Tipos de erro do driver.
 //!
-//! Server-side failures arrive as a Firebird *status vector*: a sequence of
-//! tagged arguments (error codes, numbers and strings). We parse it into a
-//! structured [`StatusVector`] and expose the primary GDS code and SQLSTATE
-//! so callers can match on specific conditions without string-scraping.
+//! Falhas do lado do servidor chegam como um *status vector* do Firebird: uma
+//! sequência de argumentos marcados (códigos de erro, números e strings). Nós o
+//! parseamos em um [`StatusVector`] estruturado e expomos o código GDS primário
+//! e o SQLSTATE para que os chamadores possam fazer match em condições
+//! específicas sem ter que vasculhar strings.
 
 use std::fmt;
 
 use crate::wire::consts::arg;
 use crate::wire::xdr::XdrReader;
 
-/// Convenience alias used throughout the crate.
+/// Alias de conveniência usado em toda a crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The top-level error type.
+/// O tipo de erro de nível mais alto.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Transport-level I/O failure.
+    /// Falha de I/O no nível de transporte.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The peer sent something that violates the wire protocol.
+    /// O par enviou algo que viola o protocolo de comunicação (wire protocol).
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    /// Authentication/handshake failure (SRP, wire crypt, plugin mismatch).
+    /// Falha de autenticação/handshake (SRP, wire crypt, incompatibilidade de plugin).
     #[error("authentication error: {0}")]
     Auth(String),
 
-    /// An error reported by the server with a full status vector.
+    /// Um erro reportado pelo servidor com um status vector completo.
     #[error(transparent)]
     Database(#[from] DatabaseError),
 
-    /// A value could not be converted to/from the requested Rust type.
+    /// Um valor não pôde ser convertido de/para o tipo Rust solicitado.
     #[error("conversion error: {0}")]
     Conversion(String),
 
-    /// Connection-pool failure (exhausted, closed, ...).
+    /// Falha no pool de conexões (esgotado, fechado, ...).
     #[error("pool error: {0}")]
     Pool(String),
 
-    /// An operation exceeded its deadline.
+    /// Uma operação excedeu seu prazo.
     #[error("operation timed out")]
     Timeout,
 
-    /// The connection has been closed and can no longer be used.
+    /// A conexão foi fechada e não pode mais ser usada.
     #[error("connection is closed")]
     Closed,
 
-    /// A feature is not supported by the negotiated protocol or this driver yet.
+    /// Um recurso ainda não é suportado pelo protocolo negociado ou por este driver.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }
@@ -67,7 +68,7 @@ impl Error {
         Error::Unsupported(msg.into())
     }
 
-    /// If this is a database error, the primary Firebird (GDS) error code.
+    /// Se este for um erro de banco de dados, o código de erro primário do Firebird (GDS).
     pub fn gds_code(&self) -> Option<i32> {
         match self {
             Error::Database(db) => db.gds_code(),
@@ -75,7 +76,7 @@ impl Error {
         }
     }
 
-    /// If this is a database error, its SQLSTATE (5 chars), when provided.
+    /// Se este for um erro de banco de dados, seu SQLSTATE (5 caracteres), quando fornecido.
     pub fn sql_state(&self) -> Option<&str> {
         match self {
             Error::Database(db) => db.sql_state.as_deref(),
@@ -84,22 +85,22 @@ impl Error {
     }
 }
 
-/// One element of a Firebird status vector.
+/// Um elemento de um status vector do Firebird.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusArg {
-    /// A Firebird/GDS error code (`isc_arg_gds`).
+    /// Um código de erro Firebird/GDS (`isc_arg_gds`).
     Gds(i32),
-    /// A warning code (`isc_arg_warning`).
+    /// Um código de aviso (`isc_arg_warning`).
     Warning(i32),
-    /// A numeric argument used to fill a message placeholder.
+    /// Um argumento numérico usado para preencher um placeholder da mensagem.
     Number(i32),
-    /// A string argument used to fill a message placeholder.
+    /// Um argumento de string usado para preencher um placeholder da mensagem.
     Str(String),
-    /// Text the server already interpreted for us.
+    /// Texto que o servidor já interpretou para nós.
     Interpreted(String),
 }
 
-/// A parsed status vector plus a best-effort human-readable message.
+/// Um status vector parseado mais uma mensagem legível por humanos com melhor esforço.
 #[derive(Debug, Clone)]
 pub struct StatusVector {
     pub args: Vec<StatusArg>,
@@ -107,11 +108,12 @@ pub struct StatusVector {
 }
 
 impl StatusVector {
-    /// Parse a status vector out of an XDR stream (as carried by `op_response`).
+    /// Parseia um status vector a partir de um stream XDR (como o transportado por `op_response`).
     ///
-    /// String-bearing arguments (`isc_arg_string`, `isc_arg_interpreted`,
-    /// `isc_arg_sql_state`) are transmitted as length-prefixed, 4-byte-aligned
-    /// buffers. Numeric arguments are single XDR words.
+    /// Argumentos que carregam strings (`isc_arg_string`, `isc_arg_interpreted`,
+    /// `isc_arg_sql_state`) são transmitidos como buffers prefixados por
+    /// comprimento e alinhados em 4 bytes. Argumentos numéricos são palavras XDR
+    /// únicas.
     pub fn read(r: &mut XdrReader) -> Result<Self> {
         let mut args = Vec::new();
         let mut sql_state = None;
@@ -135,8 +137,8 @@ impl StatusVector {
                     sql_state = Some(String::from_utf8_lossy(r.get_bytes()?).into_owned());
                 }
                 other => {
-                    // Unknown tags carry a single numeric word in the legacy
-                    // encoding; consume it so we stay in sync.
+                    // Tags desconhecidas carregam uma única palavra numérica na
+                    // codificação legada; consumimos para nos mantermos em sincronia.
                     let _ = r.get_i32()?;
                     args.push(StatusArg::Number(other));
                 }
@@ -146,7 +148,7 @@ impl StatusVector {
         Ok(StatusVector { args, sql_state })
     }
 
-    /// True when the vector carries no error codes.
+    /// Verdadeiro quando o vetor não carrega nenhum código de erro.
     pub fn is_empty(&self) -> bool {
         !self
             .args
@@ -154,13 +156,13 @@ impl StatusVector {
             .any(|a| matches!(a, StatusArg::Gds(_) | StatusArg::Warning(_)))
     }
 
-    /// True when the vector represents a real failure. A `isc_arg_gds` with
-    /// code `0` is Firebird's "success" sentinel and is *not* an error.
+    /// Verdadeiro quando o vetor representa uma falha real. Um `isc_arg_gds` com
+    /// código `0` é o sentinela de "success" do Firebird e *não* é um erro.
     pub fn is_error(&self) -> bool {
         self.args.iter().any(|a| matches!(a, StatusArg::Gds(c) if *c != 0))
     }
 
-    /// The first non-zero GDS error code, if any.
+    /// O primeiro código de erro GDS diferente de zero, se houver.
     pub fn gds_code(&self) -> Option<i32> {
         self.args.iter().find_map(|a| match a {
             StatusArg::Gds(c) if *c != 0 => Some(*c),
@@ -168,9 +170,9 @@ impl StatusVector {
         })
     }
 
-    /// Build a best-effort message. We do not bundle the `firebird.msg`
-    /// catalogue, so we join any server-interpreted text and string arguments,
-    /// falling back to the raw GDS code.
+    /// Constrói uma mensagem com melhor esforço. Nós não incluímos o catálogo
+    /// `firebird.msg`, então juntamos qualquer texto interpretado pelo servidor e
+    /// argumentos de string, recorrendo ao código GDS bruto.
     fn message(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         for a in &self.args {
@@ -198,7 +200,7 @@ impl fmt::Display for StatusVector {
     }
 }
 
-/// A server error: the status vector and its rendered message.
+/// Um erro do servidor: o status vector e sua mensagem renderizada.
 #[derive(Debug, Clone)]
 pub struct DatabaseError {
     pub status: StatusVector,

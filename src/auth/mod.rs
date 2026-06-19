@@ -1,5 +1,5 @@
-//! Authentication and wire encryption: the SRP client and stream ciphers used
-//! during the connection handshake.
+//! Autenticação e criptografia do wire: o cliente SRP e as cifras de fluxo usadas
+//! durante o handshake de conexão.
 
 pub mod srp;
 pub mod wirecrypt;
