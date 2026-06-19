@@ -30,6 +30,6 @@ pub mod wire;
 pub use config::{ConnectConfig, WireCrypt};
 pub use connection::Connection;
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};
-pub use statement::Statement;
+pub use statement::{RowsAffected, Statement};
 pub use transaction::{AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder};
 pub use value::{ColumnMeta, Value};

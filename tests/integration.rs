@@ -113,6 +113,28 @@ async fn execute_and_fetch_rows() -> Result<()> {
 }
 
 #[tokio::test]
+async fn update_reports_affected_rows() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    // Atribuição no-op, revertida pelo rollback ao final — não altera dados.
+    let mut stmt = conn
+        .prepare(&tx, "UPDATE employee SET first_name = first_name WHERE emp_no < 10")
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let affected = stmt.rows_affected(&mut conn).await?;
+    println!("linhas afetadas: {affected:?}");
+    assert!(affected.updated >= 1);
+    assert_eq!(affected.total_modified(), affected.updated);
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.rollback(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn parameterized_query() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

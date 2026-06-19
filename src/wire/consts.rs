@@ -266,6 +266,15 @@ pub mod isql {
     pub const FLAGS: u8 = 26;
 }
 
+/// Contadores de registros retornados dentro de `isc_info_sql_records`
+/// (`isc_info_req_*`): o número de linhas que cada tipo de operação afetou.
+pub mod info_req {
+    pub const SELECT_COUNT: u8 = 13;
+    pub const INSERT_COUNT: u8 = 14;
+    pub const UPDATE_COUNT: u8 = 15;
+    pub const DELETE_COUNT: u8 = 16;
+}
+
 /// Tipos de instrução (statement) retornados por `isc_info_sql_stmt_type`.
 pub mod stmt_type {
     pub const SELECT: i32 = 1;

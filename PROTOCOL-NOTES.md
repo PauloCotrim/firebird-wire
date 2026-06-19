@@ -23,12 +23,18 @@ teste: `127.0.0.1:3555`, `employee`, SYSDBA/masterkey, `WireCrypt=Disabled`.
 ## VALIDADO AO VIVO — camada de instruções (statements)
 
 O código está em `statement.rs` (+ `blr.rs`, `message.rs`, `value.rs`). **Todos
-os 5 testes de `tests/integration.rs` passam contra um FB5 real** (protocolo v19,
+os 6 testes de `tests/integration.rs` passam contra um FB5 real** (protocolo v19,
 `employee`): connect/ping, transações, prepare+describe, execute+fetch (104
-linhas) e query parametrizada (1 linha). Rodam com `FB_PASSWORD` definido. Fluxo:
-allocate → ler handle → prepare (describe-info extraída dos dados do op_response)
-→ execute → buscar linhas em lote → free. A instrução é enviada
-**sequencialmente** (allocate, ler a resposta para o handle real, depois prepare).
+linhas), query parametrizada (1 linha) e contagem de linhas afetadas (UPDATE de 5
+linhas). Rodam com `FB_PASSWORD` definido. Fluxo: allocate → ler handle → prepare
+(describe-info extraída dos dados do op_response) → execute → buscar linhas em
+lote → free. A instrução é enviada **sequencialmente** (allocate, ler a resposta
+para o handle real, depois prepare).
+
+**Linhas afetadas — `op_info_sql` (70) + `isc_info_sql_records` (0x17).** Envia o
+item 0x17; a resposta traz um bloco aninhado com os contadores `isc_info_req_*`
+(select=13, insert=14, update=15, delete=16), cada um `tag(1)+len(2 LE)+valor`.
+Um UPDATE de N linhas reporta select=N e update=N. Veja `Statement::rows_affected`.
 
 Três descobertas confirmadas por captura strace do fbclient/isql real:
 

@@ -42,6 +42,28 @@ const INFO_BUFFER_LEN: i32 = 0xfb80;
 /// buffer e os entregamos um a um.
 const FETCH_BATCH: i32 = 200;
 
+/// Tamanho do buffer de resposta para a requisição `isc_info_sql_records`.
+/// Os quatro contadores cabem com folga.
+const RECORDS_BUFFER_LEN: i32 = 64;
+
+/// Número de linhas que a última execução afetou, separado por tipo de operação.
+/// Retornado por [`Statement::rows_affected`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowsAffected {
+    pub selected: u64,
+    pub inserted: u64,
+    pub updated: u64,
+    pub deleted: u64,
+}
+
+impl RowsAffected {
+    /// Total de linhas modificadas (inseridas + atualizadas + excluídas) — o
+    /// número que normalmente interessa após um INSERT/UPDATE/DELETE.
+    pub fn total_modified(&self) -> u64 {
+        self.inserted + self.updated + self.deleted
+    }
+}
+
 /// Uma instrução preparada vinculada ao handle de banco de dados de uma [`Connection`].
 #[derive(Debug)]
 pub struct Statement {
@@ -194,6 +216,21 @@ impl Statement {
             rows.push(row);
         }
         Ok(rows)
+    }
+
+    /// Quantas linhas a última execução afetou, via `op_info_sql` com
+    /// `isc_info_sql_records`. Útil após um INSERT/UPDATE/DELETE — use
+    /// [`RowsAffected::total_modified`] para o total.
+    pub async fn rows_affected(&self, conn: &mut Connection) -> Result<RowsAffected> {
+        let w = crate::connection::info_request(
+            op::INFO_SQL,
+            self.handle,
+            &[isql::RECORDS],
+            RECORDS_BUFFER_LEN,
+        );
+        conn.io().send(&w).await?;
+        let resp = read_response(conn.io()).await?;
+        Ok(parse_records(&resp.data))
     }
 
     /// Fecha o cursor aberto (`op_free_statement` com `DSQL_close`) sem liberar a
@@ -371,6 +408,60 @@ fn set_name(cur: &mut Option<ColumnMeta>, val: &[u8], assign: impl Fn(&mut Colum
     }
 }
 
+/// Percorre a resposta de `op_info_sql`, extraindo o bloco aninhado
+/// `isc_info_sql_records`. Cada item de nível superior é `tag(1) + len(2 LE) +
+/// value`; o valor de `RECORDS` contém os contadores `isc_info_req_*`.
+fn parse_records(data: &[u8]) -> RowsAffected {
+    let mut out = RowsAffected::default();
+    for (tag, val) in InfoItems::new(data) {
+        if tag == isql::RECORDS {
+            for (sub, v) in InfoItems::new(val) {
+                let n = read_le_int(v) as u64;
+                match sub {
+                    info_req::SELECT_COUNT => out.selected = n,
+                    info_req::INSERT_COUNT => out.inserted = n,
+                    info_req::UPDATE_COUNT => out.updated = n,
+                    info_req::DELETE_COUNT => out.deleted = n,
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Iterador sobre itens de um fluxo de info no formato `tag(1) + len(2 LE) +
+/// value(len)`, parando em `isc_info_end` ou no fim/dado truncado.
+struct InfoItems<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> InfoItems<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        InfoItems { data, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for InfoItems<'a> {
+    type Item = (u8, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let tag = *self.data.get(self.pos)?;
+        if tag == INFO_END {
+            return None;
+        }
+        self.pos += 1;
+        let lo = *self.data.get(self.pos)? as usize;
+        let hi = *self.data.get(self.pos + 1)? as usize;
+        let len = lo | (hi << 8);
+        self.pos += 2;
+        let val = self.data.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        Some((tag, val))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +529,34 @@ mod tests {
     fn truncated_info_is_an_error() {
         let data = [INFO_TRUNCATED];
         assert!(parse_prepare_response(&data).is_err());
+    }
+
+    #[test]
+    fn parses_record_counts() {
+        // Espelha a resposta real de op_info_sql para um UPDATE de 5 linhas:
+        // bloco RECORDS aninhado com os quatro contadores isc_info_req_*.
+        fn sub(tag: u8, n: i32) -> Vec<u8> {
+            let mut v = vec![tag, 4, 0]; // len = 4 (LE)
+            v.extend_from_slice(&n.to_le_bytes());
+            v
+        }
+        let mut nested = Vec::new();
+        nested.extend(sub(info_req::SELECT_COUNT, 5));
+        nested.extend(sub(info_req::INSERT_COUNT, 0));
+        nested.extend(sub(info_req::UPDATE_COUNT, 5));
+        nested.extend(sub(info_req::DELETE_COUNT, 0));
+
+        let mut data = vec![isql::RECORDS];
+        data.extend_from_slice(&(nested.len() as u16).to_le_bytes());
+        data.extend_from_slice(&nested);
+        data.push(INFO_END);
+
+        let r = parse_records(&data);
+        assert_eq!(r.selected, 5);
+        assert_eq!(r.updated, 5);
+        assert_eq!(r.inserted, 0);
+        assert_eq!(r.deleted, 0);
+        assert_eq!(r.total_modified(), 5);
     }
 
     #[test]

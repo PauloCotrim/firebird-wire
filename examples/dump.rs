@@ -8,17 +8,6 @@
 
 use fdb_driver::{ConnectConfig, Connection, Result, WireCrypt};
 
-fn hexdump(b: &[u8]) {
-    for (i, chunk) in b.chunks(16).enumerate() {
-        let hex: Vec<String> = chunk.iter().map(|x| format!("{x:02x}")).collect();
-        let ascii: String = chunk
-            .iter()
-            .map(|&x| if (0x20..0x7f).contains(&x) { x as char } else { '.' })
-            .collect();
-        println!("{:04x}  {:<48}  {}", i * 16, hex.join(" "), ascii);
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = ConnectConfig::new()
