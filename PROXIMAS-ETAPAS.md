@@ -14,7 +14,9 @@ sugerida de valor. Detalhes de protocolo já descobertos ficam em
 - Leitura de BLOBs (`Connection::read_blob`, tipo `Blob`).
 - **Escrita de BLOBs** (`Connection::write_blob`, `Connection::create_blob`,
   tipo `BlobWriter` — `op_create_blob2` / `op_put_segment` / `op_close_blob` /
-  `op_cancel_blob`). Dois testes de integração: roundtrip e multipart. 9/9 passam.
+  `op_cancel_blob`). Dois testes de integração: roundtrip e multipart.
+- **Pool de conexões** (`Pool`, `PoolConfig`, `PooledConnection` — `pool.rs`).
+  Semáforo limita `max_size`, devolução automática no `Drop`. 11/11 testes passam.
 
 **Como rodar os testes ao vivo** (servidor em `127.0.0.1:3555`, base `employee`,
 SYSDBA / `masterkey`):
@@ -50,14 +52,10 @@ info_batch=111).
 
 `Connection::write_blob` / `create_blob` / `BlobWriter` (ver `blob.rs`).
 
-## 3. Pool de conexões
+## 3. ~~Pool de conexões~~ ✓ FEITO
 
-Citado nos destaques do `lib.rs`, sem implementação.
-
-- Estrutura `Pool` com `tokio::sync` (semaphore + fila), `get()` devolve um guard
-  que retorna a conexão ao pool no `Drop`.
-- Reciclar com `op_ping` antes de entregar; descartar conexões mortas.
-- Configurar tamanho min/máx e timeout de aquisição.
+`Pool::new(config, PoolConfig)` + `Pool::get() -> PooledConnection` (devolve no Drop).
+Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
 
 ## 4. Acabamentos menores
 

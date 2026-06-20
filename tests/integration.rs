@@ -8,7 +8,7 @@
 //!   FB_USER=SYSDBA FB_PASSWORD=yourpw cargo test --test integration -- --nocapture
 //! ```
 
-use fdb_driver::{ConnectConfig, Connection, Result, Value, WireCrypt};
+use fdb_driver::{ConnectConfig, Connection, Pool, PoolConfig, Result, Value, WireCrypt};
 
 fn config() -> Option<ConnectConfig> {
     let password = std::env::var("FB_PASSWORD").ok()?;
@@ -223,5 +223,55 @@ async fn write_blob_multipart() -> Result<()> {
 
     tx.rollback(&mut conn).await?;
     conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pool_basic() -> Result<()> {
+    let cfg = require_server!();
+    let pool = Pool::new(cfg, PoolConfig { max_size: 3, ..Default::default() });
+
+    // Pega duas conexoes simultaneamente.
+    let mut c1 = pool.get().await?;
+    let mut c2 = pool.get().await?;
+    c1.ping().await?;
+    c2.ping().await?;
+    println!("duas conexoes do pool ok");
+
+    // Devolve c1 e reutiliza na proxima chamada.
+    drop(c1);
+    let mut c3 = pool.get().await?;
+    c3.ping().await?;
+    println!("reutilizacao do pool ok");
+
+    drop(c2);
+    drop(c3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pool_max_size_respected() -> Result<()> {
+    use std::time::Duration;
+
+    let cfg = require_server!();
+    let pool = Pool::new(
+        cfg,
+        PoolConfig {
+            max_size: 2,
+            acquisition_timeout: Some(Duration::from_millis(200)),
+        },
+    );
+
+    // Satura o pool.
+    let c1 = pool.get().await?;
+    let c2 = pool.get().await?;
+
+    // Uma terceira tentativa deve expirar (timeout de 200 ms).
+    let resultado = pool.get().await;
+    assert!(resultado.is_err(), "esperava timeout, obteve conexao");
+    println!("limite do pool respeitado: {:?}", resultado.err().unwrap());
+
+    drop(c1);
+    drop(c2);
     Ok(())
 }
