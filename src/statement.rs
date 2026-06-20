@@ -77,6 +77,9 @@ pub struct Statement {
     buffered: std::collections::VecDeque<Vec<Value>>,
     /// Verdadeiro quando o servidor sinalizou fim de cursor (status 100).
     exhausted: bool,
+    /// Abrir o cursor como rolável (`op_execute` com `cursor_flags = 1`).
+    /// Definido por [`Statement::set_scrollable`] antes do `execute`.
+    scrollable: bool,
     dropped: bool,
 }
 
@@ -94,6 +97,19 @@ impl Statement {
     /// Verdadeiro para instruções que produzem um cursor de linhas.
     pub fn is_select(&self) -> bool {
         self.stmt_type == stmt_type::SELECT || self.stmt_type == stmt_type::SELECT_FOR_UPD
+    }
+
+    /// Pede que o próximo [`Self::execute`] abra um cursor **rolável**, habilitando
+    /// [`Self::fetch_scroll`] e seus atalhos (`fetch_prior`, `fetch_absolute`, …).
+    /// Deve ser chamado antes do `execute`; o servidor precisa suportar cursores
+    /// roláveis (FB5+ / protocolo ≥ 17 — ver [`Connection::supports_fetch_scroll`]).
+    pub fn set_scrollable(&mut self, yes: bool) {
+        self.scrollable = yes;
+    }
+
+    /// Se este statement foi marcado para abrir um cursor rolável.
+    pub fn is_scrollable(&self) -> bool {
+        self.scrollable
     }
 
     /// Metadados das colunas de saída (vazio para instruções que não são SELECT).
@@ -135,7 +151,11 @@ impl Statement {
         // O op_execute da v19 carrega campos de saída no estilo execute2 mesmo
         // quando as linhas são buscadas separadamente; nós os enviamos vazios.
         w.put_bytes(&[]); // out_blr
-        w.put_i32(0); // out_message_number
+        // Logo após out_blr vem `cursor_flags` (confirmado por captura strace:
+        // do fbclient: a única palavra que muda entre um openCursor normal e um
+        // rolável é esta — 0 = normal, 1 = CURSOR_TYPE_SCROLLABLE). O op_execute
+        // (ao contrário do op_execute2) não carrega out_message_number aqui.
+        w.put_i32(if self.scrollable { cursor_type::SCROLLABLE } else { 0 });
         // Campo final único na v19/FB5 (confirmado por captura strace: o pacote
         // sem parâmetros tem 9 palavras): o tamanho máximo de blob a embutir
         // inline na resposta do fetch. Enviamos 0 para DESATIVAR o inline — assim
@@ -221,6 +241,105 @@ impl Statement {
         Ok(rows)
     }
 
+    /// Reposiciona o cursor (rolável) e retorna a única linha naquela posição, ou
+    /// `None` se ela cai fora do conjunto de resultados. Envia `op_fetch_scroll`
+    /// (FB5); o cursor precisa ter sido aberto com [`Self::set_scrollable`].
+    ///
+    /// `direction` é uma das constantes [`scroll`]; `offset` é a posição absoluta
+    /// (1-based) para [`scroll::ABSOLUTE`], o deslocamento com sinal para
+    /// [`scroll::RELATIVE`], e ignorado (use 0) nas demais direções.
+    pub async fn fetch_scroll(
+        &mut self,
+        conn: &mut Connection,
+        direction: i32,
+        offset: i32,
+    ) -> Result<Option<Vec<Value>>> {
+        if !self.cursor_open {
+            return Ok(None);
+        }
+        // Um salto invalida qualquer linha pré-buscada pelo fetch sequencial.
+        self.buffered.clear();
+
+        let out_blr = message_blr(&self.columns);
+        let mut w = op_packet(op::FETCH_SCROLL);
+        w.put_i32(self.handle);
+        w.put_bytes(&out_blr);
+        w.put_i32(0); // message number
+        w.put_i32(1); // fetch count: uma linha por salto (como faz o fbclient)
+        w.put_i32(direction);
+        w.put_i32(offset);
+        conn.io().send(&w).await?;
+
+        // Drena os op_fetch_response até o terminador (count 0), guardando a (única)
+        // linha. status 100 ⇒ posição fora do cursor (nenhuma linha naquele ponto).
+        let mut row = None;
+        loop {
+            let code = read_op(conn.io()).await?;
+            if code != op::FETCH_RESPONSE {
+                if code == op::RESPONSE {
+                    read_response_body(conn.io()).await?.into_result()?;
+                }
+                return Err(Error::protocol(format!(
+                    "expected op_fetch_response, got {} ({code})",
+                    op_name(code)
+                )));
+            }
+            let status = conn.io().read_i32().await?;
+            let count = conn.io().read_i32().await?;
+            if count == 0 {
+                break;
+            }
+            let r = decode_row(conn.io(), &self.columns).await?;
+            if row.is_none() {
+                row = Some(r);
+            }
+            if status == 100 {
+                break;
+            }
+        }
+        // O cursor continua aberto e reposicionável após qualquer salto.
+        self.exhausted = false;
+        Ok(row)
+    }
+
+    /// Próxima linha (rolável). Equivale a [`Self::fetch`] num cursor rolável.
+    pub async fn fetch_next(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::NEXT, 0).await
+    }
+
+    /// Linha anterior.
+    pub async fn fetch_prior(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::PRIOR, 0).await
+    }
+
+    /// Primeira linha do conjunto de resultados.
+    pub async fn fetch_first(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::FIRST, 0).await
+    }
+
+    /// Última linha do conjunto de resultados.
+    pub async fn fetch_last(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::LAST, 0).await
+    }
+
+    /// Linha na posição absoluta `pos` (1-based; negativa conta a partir do fim).
+    pub async fn fetch_absolute(
+        &mut self,
+        conn: &mut Connection,
+        pos: i32,
+    ) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::ABSOLUTE, pos).await
+    }
+
+    /// Linha `offset` posições à frente (positivo) ou atrás (negativo) da atual.
+    pub async fn fetch_relative(
+        &mut self,
+        conn: &mut Connection,
+        offset: i32,
+    ) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::RELATIVE, offset).await
+    }
+
     /// Quantas linhas a última execução afetou, via `op_info_sql` com
     /// `isc_info_sql_records`. Útil após um INSERT/UPDATE/DELETE — use
     /// [`RowsAffected::total_modified`] para o total.
@@ -295,6 +414,7 @@ impl Connection {
             cursor_open: false,
             buffered: std::collections::VecDeque::new(),
             exhausted: false,
+            scrollable: false,
             dropped: false,
         })
     }

@@ -392,6 +392,65 @@ async fn batch_per_row_errors() -> Result<()> {
 }
 
 #[tokio::test]
+async fn scrollable_cursor() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    assert!(conn.supports_fetch_scroll(), "servidor deveria suportar fetch scroll");
+    let tx = conn.begin().await?;
+
+    const SQL: &str = "SELECT emp_no FROM employee ORDER BY emp_no";
+
+    // Referência: lista ordenada completa via fetch sequencial.
+    let mut seq = conn.prepare(&tx, SQL).await?;
+    seq.execute(&mut conn, &tx, &[]).await?;
+    let all: Vec<i16> = seq
+        .fetch_all(&mut conn)
+        .await?
+        .iter()
+        .map(|r| match r[0] {
+            Value::Short(v) => v,
+            ref other => panic!("emp_no inesperado: {other:?}"),
+        })
+        .collect();
+    seq.drop_statement(&mut conn).await?;
+    assert!(all.len() >= 3, "precisa de ao menos 3 funcionários");
+
+    let emp = |row: Option<Vec<Value>>| -> Option<i16> {
+        row.map(|r| match r[0] {
+            Value::Short(v) => v,
+            ref o => panic!("emp_no inesperado: {o:?}"),
+        })
+    };
+
+    // Cursor rolável sobre a mesma consulta.
+    let mut s = conn.prepare(&tx, SQL).await?;
+    s.set_scrollable(true);
+    s.execute(&mut conn, &tx, &[]).await?;
+
+    let last = all.len() - 1;
+    assert_eq!(emp(s.fetch_first(&mut conn).await?), Some(all[0]));
+    assert_eq!(emp(s.fetch_absolute(&mut conn, 2).await?), Some(all[1]));
+    assert_eq!(emp(s.fetch_prior(&mut conn).await?), Some(all[0]));
+    assert_eq!(emp(s.fetch_next(&mut conn).await?), Some(all[1]));
+    // Relativo a partir de uma posição conhecida (linha 2): +1 → linha 3.
+    assert_eq!(emp(s.fetch_relative(&mut conn, 1).await?), Some(all[2]));
+    assert_eq!(emp(s.fetch_last(&mut conn).await?), Some(all[last]));
+    // Penúltima via prior a partir da última.
+    assert_eq!(emp(s.fetch_prior(&mut conn).await?), Some(all[last - 1]));
+    // Passar do fim retorna None.
+    assert_eq!(emp(s.fetch_last(&mut conn).await?), Some(all[last]));
+    assert_eq!(emp(s.fetch_next(&mut conn).await?), None);
+    // Posição absoluta fora do conjunto → None.
+    assert_eq!(emp(s.fetch_absolute(&mut conn, all.len() as i32 + 100).await?), None);
+    println!("scroll ok: {} linhas, primeira={}, última={}", all.len(), all[0], all[all.len() - 1]);
+
+    s.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn date_time_civil_conversion() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

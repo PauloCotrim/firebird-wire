@@ -306,6 +306,12 @@ pub mod free {
     pub const UNPREPARE: i32 = 4;
 }
 
+/// Flags de cursor enviados em `op_execute` (campo `cursor_flags`).
+pub mod cursor_type {
+    /// Abre um cursor rolável (equivale a `IStatement::CURSOR_TYPE_SCROLLABLE`).
+    pub const SCROLLABLE: i32 = 0x1;
+}
+
 /// Direções de `op_fetch_scroll` (FB5).
 pub mod scroll {
     pub const NEXT: i32 = 0;

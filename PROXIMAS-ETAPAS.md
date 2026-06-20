@@ -59,8 +59,11 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
 
 ## 4. Acabamentos menores
 
-- **Cursores roláveis** (`op_fetch_scroll`, 112): já há `supports_fetch_scroll()`;
-  falta o método (direção + posição — ver `scroll::*` em `consts.rs`).
+- ~~**Cursores roláveis**~~ ✓ FEITO — `Statement::set_scrollable(true)` antes do
+  `execute` abre o cursor rolável (`op_execute` com `cursor_flags=1`); depois
+  `fetch_scroll(dir, offset)` e os atalhos `fetch_next/prior/first/last/absolute/
+  relative` (`op_fetch_scroll` 112). Layout em `PROTOCOL-NOTES.md`. 1 teste ao
+  vivo (`scrollable_cursor`).
 - ~~**`exec_immediate`**~~ ✓ FEITO — `Connection::exec_immediate(Option<&tx>, sql)`
   usa `op_exec_immediate` (64). Layout real: `tx_handle | db_handle | dialect | sql | items | buf_len`.
   Cria tx implícita e faz commit quando `tx=None`. 12/12 testes passam.

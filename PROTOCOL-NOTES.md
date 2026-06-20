@@ -272,7 +272,39 @@ cada op deferido com um `op_response` (3 respostas de 32 bytes coalescidas numa
 recv de 96 bytes). Como nosso driver é síncrono (lê a resposta de cada op na
 hora), NÃO precisamos de batch_sync. Ver `batch.rs`.
 
+## Cursores roláveis (`op_fetch_scroll`, FB5)
+
+Decodificado de um cliente C++ (`/tmp/fbscroll/scroll.cpp`) usando a OO API:
+`openCursor(..., IStatement::CURSOR_TYPE_SCROLLABLE)` seguido de
+`fetchAbsolute/Prior/Last/First/Relative/Next`, sob `strace -e sendto`.
+
+**Abrir cursor rolável — `op_execute` (63):** o pacote é **idêntico** ao de um
+cursor normal; a ÚNICA palavra que muda é `cursor_flags`, logo após `out_blr`:
+```
+op_execute | stmt | tx | in_blr(cstring) | in_msg_number | in_msg_count |
+            out_blr(cstring) | cursor_flags | inline_blob_size(proto>=18)
+```
+`cursor_flags = 1` (CURSOR_TYPE_SCROLLABLE) abre rolável; `0` = normal. O
+op_execute (≠ op_execute2) NÃO carrega `out_message_number` nessa posição — o que
+o driver antes rotulava assim era de fato `cursor_flags` (e enviava 0, por sorte
+correto para não-rolável). fbclient também envia `inline_blob_size = 0xffff`; nós
+mandamos 0 (sem inline de blob).
+
+**`op_fetch_scroll` (112):**
+```
+op | stmt | out_blr(cstring) | message_number | fetch_count | direction | offset
+```
+- `direction`: NEXT=0, PRIOR=1, FIRST=2, LAST=3, ABSOLUTE=4, RELATIVE=5
+  (conferem com `scroll::*` em consts.rs).
+- `offset`: posição absoluta (1-based) para ABSOLUTE; deslocamento com sinal para
+  RELATIVE; 0 nas demais.
+- `fetch_count`: o fbclient manda 1 nos saltos (ABSOLUTE/RELATIVE/FIRST/LAST) e
+  faz prefetch (1000) só em PRIOR/NEXT sequenciais. Nosso driver manda sempre 1.
+
+Resposta: `op_fetch_response (66)` igual ao fetch normal — `status | count` por
+linha, terminador com `count=0`; `status=100` ⇒ posição fora do cursor (sem
+linha). Ver `Statement::fetch_scroll` em `statement.rs`.
+
 ### Ops restantes a capturar quando necessário
 - BLOBs em batch: op_batch_regblob(104), op_batch_blob_stream(105),
   op_batch_set_bpb(106) — capturar das Partes 2–4 de `11.batch.cpp`.
-- Cursores roláveis: op_fetch_scroll(112).
