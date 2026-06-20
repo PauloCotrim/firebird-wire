@@ -144,6 +144,45 @@ impl Connection {
         self.protocol_version >= 17
     }
 
+    /// Executa um comando SQL sem prepare prévio (`op_exec_immediate`). Use para DDL
+    /// (CREATE/ALTER/DROP TABLE, índices, procedures…) ou DML sem retorno de linhas.
+    ///
+    /// Passe `None` para deixar o driver criar e fazer commit de uma transação
+    /// implícita (necessário para DDL autocommit). Passe `Some(&tx)` para executar
+    /// dentro de uma transação existente.
+    pub async fn exec_immediate(&mut self, tx: Option<&crate::transaction::Transaction>, sql: &str) -> Result<()> {
+        match tx {
+            Some(t) => self.exec_immediate_inner(t.handle(), sql).await,
+            None => {
+                // DDL exige contexto de transação no wire; cria e faz commit implicitamente.
+                let implicit_tx = self.begin().await?;
+                let tx_handle = implicit_tx.handle();
+                match self.exec_immediate_inner(tx_handle, sql).await {
+                    Ok(()) => implicit_tx.commit(self).await,
+                    Err(e) => {
+                        let _ = implicit_tx.rollback(self).await;
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    // Envia op_exec_immediate com os campos na ordem correta confirmada via strace:
+    // tx_handle (campo 1) | db_handle (campo 2) | dialect | sql | items | buf_len.
+    async fn exec_immediate_inner(&mut self, tx_handle: i32, sql: &str) -> Result<()> {
+        let mut w = op_packet(op::EXEC_IMMEDIATE);
+        w.put_i32(tx_handle);      // campo 1: transação
+        w.put_i32(self.db_handle); // campo 2: banco de dados
+        w.put_i32(3);              // dialeto SQL (3 = padrão)
+        w.put_str(sql);
+        w.put_bytes(&[]); // itens de info vazios
+        w.put_i32(0);     // buffer_length = 0
+        self.stream.send(&w).await?;
+        read_response(&mut self.stream).await?;
+        Ok(())
+    }
+
     /// Se a comunicação (wire) está criptografada.
     pub fn is_encrypted(&self) -> bool {
         self.stream.is_encrypted()

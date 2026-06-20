@@ -211,6 +211,22 @@ Exemplos:
 a camada XDR empacota os nulos no bitmap inicial no wire. Codifique os parâmetros da
 mesma forma para INSERT: bitmap de nulos inicial + valores XDR não-nulos.)
 
+### `op_exec_immediate` (64) — DDL/DML sem prepare
+Confirmado via strace de `isc_start_transaction` + `isc_dsql_execute_immediate` (cliente C mínimo):
+```
+00 00 00 40   op_exec_immediate
+00 00 00 01   tx_handle     ← CAMPO 1 é a transação (não o banco!)
+00 00 00 00   db_handle     ← CAMPO 2 é o banco de dados
+00 00 00 03   dialect = 3
+<cstring: SQL text>
+<cstring: items (vazio)>
+00 00 00 00   buffer_length = 0
+```
+**Atenção:** a ordem é `tx_handle | db_handle` — oposta à expectativa baseada no nome `p_exnod_database`.
+O servidor v19 NÃO tem campo de timeout extra (ao contrário de op_prepare/op_execute no v16+).
+O handle de transação deve ser real (não 0); tx_handle=0 falha para DDL mesmo com db_handle correto.
+O driver cria uma transação implícita e faz commit quando `tx=None` é passado para `exec_immediate`.
+
 ### Ops restantes a capturar quando necessário
 - op_free_statement(67): handle + modo (close=1 / drop=2 / unprepare=4).
 - INSERT/parâmetros: in_blr + in_message (codificar parâmetros, mesmas regras XDR).

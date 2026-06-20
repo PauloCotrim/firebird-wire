@@ -275,3 +275,36 @@ async fn pool_max_size_respected() -> Result<()> {
     drop(c2);
     Ok(())
 }
+
+#[tokio::test]
+async fn exec_immediate_ddl() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // DDL com tx=None: o servidor gerencia a transacao internamente (como o isql faz).
+    conn.exec_immediate(None, "CREATE TABLE fdb_test_exec_imm (id INTEGER, nome VARCHAR(50))").await?;
+    println!("CREATE TABLE ok");
+
+    // DML via exec_immediate com transacao explicita.
+    let tx = conn.begin().await?;
+    conn.exec_immediate(Some(&tx), "INSERT INTO fdb_test_exec_imm VALUES (1, 'teste')").await?;
+    tx.commit(&mut conn).await?;
+
+    // Verifica que a linha existe.
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT id, nome FROM fdb_test_exec_imm").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0][0], Value::Int(1)));
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    println!("INSERT + SELECT ok");
+
+    // Limpa a tabela de teste.
+    conn.exec_immediate(None, "DROP TABLE fdb_test_exec_imm").await?;
+    println!("DROP TABLE ok");
+
+    conn.close().await?;
+    Ok(())
+}
