@@ -8,7 +8,7 @@
 //!   FB_USER=SYSDBA FB_PASSWORD=yourpw cargo test --test integration -- --nocapture
 //! ```
 
-use fdb_driver::{ConnectConfig, Connection, Pool, PoolConfig, Result, Value, WireCrypt};
+use fdb_driver::{CivilDate, CivilTime, ConnectConfig, Connection, Pool, PoolConfig, Result, Value, WireCrypt};
 use fdb_driver::wire::consts::batch_cs;
 
 fn config() -> Option<ConnectConfig> {
@@ -387,6 +387,64 @@ async fn batch_per_row_errors() -> Result<()> {
     tx.rollback(&mut conn).await?;
 
     conn.exec_immediate(None, "DROP TABLE fdb_batch_e").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn date_time_civil_conversion() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    // O servidor faz o CAST de literais para DATE/TIME/TIMESTAMP; checamos que
+    // nossa decodificação dos inteiros crus bate com os componentes civis.
+    let mut stmt = conn
+        .prepare(
+            &tx,
+            "SELECT CAST('2026-06-20' AS DATE), \
+                    CAST('13:45:30.1234' AS TIME), \
+                    CAST('2000-02-29 23:59:59' AS TIMESTAMP) \
+             FROM rdb$database",
+        )
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+
+    assert_eq!(r[0].as_civil_date(), Some(CivilDate { year: 2026, month: 6, day: 20 }));
+    assert_eq!(
+        r[1].as_civil_time(),
+        Some(CivilTime { hour: 13, minute: 45, second: 30, frac: 1234 })
+    );
+    let ts = r[2].as_civil_timestamp().unwrap();
+    assert_eq!(ts.date, CivilDate { year: 2000, month: 2, day: 29 });
+    assert_eq!(ts.time, CivilTime { hour: 23, minute: 59, second: 59, frac: 0 });
+    println!("date={:?} time={:?} ts={:?}", r[0].as_civil_date(), r[1].as_civil_time(), ts);
+
+    // Ida e volta: enviar um DATE/TIME construídos por nós como parâmetros, deixar
+    // o servidor reinterpretá-los e relê-los — valida nossa codificação de saída.
+    let mut p = conn
+        .prepare(&tx, "SELECT CAST(? AS DATE), CAST(? AS TIME) FROM rdb$database")
+        .await?;
+    p.execute(
+        &mut conn,
+        &tx,
+        &[Value::date(2026, 6, 20), Value::time(13, 45, 30, 1234)],
+    )
+    .await?;
+    let back = p.fetch_all(&mut conn).await?;
+    println!("DATE/TIME ida e volta: {:?} {:?}", back[0][0], back[0][1]);
+    assert_eq!(back[0][0].as_civil_date(), Some(CivilDate { year: 2026, month: 6, day: 20 }));
+    assert_eq!(
+        back[0][1].as_civil_time(),
+        Some(CivilTime { hour: 13, minute: 45, second: 30, frac: 1234 })
+    );
+
+    p.drop_statement(&mut conn).await?;
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
     conn.close().await?;
     Ok(())
 }

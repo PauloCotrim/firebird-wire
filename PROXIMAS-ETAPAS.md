@@ -64,9 +64,11 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
 - ~~**`exec_immediate`**~~ ✓ FEITO — `Connection::exec_immediate(Option<&tx>, sql)`
   usa `op_exec_immediate` (64). Layout real: `tx_handle | db_handle | dialect | sql | items | buf_len`.
   Cria tx implícita e faz commit quando `tx=None`. 12/12 testes passam.
-- **Datas/horas legíveis:** hoje `Value::Date`/`Time`/`Timestamp` guardam inteiros
-  crus (dias desde 1858-11-17; frações de 1/10000 s). Converter para um tipo de
-  data amigável (ex.: integração opcional com `chrono`/`time`).
+- ~~**Datas/horas legíveis**~~ ✓ FEITO — `Value::as_civil_date/as_civil_time/
+  as_civil_timestamp` decodificam os inteiros crus (dias desde 1858-11-17;
+  frações de 1/10000 s) em `CivilDate`/`CivilTime`/`CivilTimestamp` (algoritmo de
+  Hinnant, sem dependência externa). Construtores `Value::date/time/timestamp`
+  fazem o caminho inverso. 3 testes unitários + 1 ao vivo (`date_time_civil_conversion`).
 - **Criptografia ChaCha20:** hoje só ARC4 (o `lib.rs` menciona ChaCha20).
 - **Fetch maior que `i16`:** `FETCH_BATCH=200`; avaliar tamanho ideal / streaming.
 - **Limpeza:** 3 avisos de clippy pré-existentes em código antigo
