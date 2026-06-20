@@ -48,7 +48,7 @@ pub enum LockResolution {
 }
 
 /// Construtor (builder) para o Transaction Parameter Buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransactionBuilder {
     pub isolation: IsolationLevel,
     pub access: AccessMode,
@@ -59,19 +59,6 @@ pub struct TransactionBuilder {
     pub no_auto_undo: bool,
     /// Faz commit automático de cada instrução DML no lado do servidor.
     pub auto_commit: bool,
-}
-
-impl Default for TransactionBuilder {
-    fn default() -> Self {
-        TransactionBuilder {
-            isolation: IsolationLevel::default(),
-            access: AccessMode::default(),
-            lock_resolution: LockResolution::default(),
-            lock_timeout: None,
-            no_auto_undo: false,
-            auto_commit: false,
-        }
-    }
 }
 
 impl TransactionBuilder {

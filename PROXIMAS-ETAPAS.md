@@ -74,8 +74,8 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
   fazem o caminho inverso. 3 testes unitários + 1 ao vivo (`date_time_civil_conversion`).
 - **Criptografia ChaCha20:** hoje só ARC4 (o `lib.rs` menciona ChaCha20).
 - **Fetch maior que `i16`:** `FETCH_BATCH=200`; avaliar tamanho ideal / streaming.
-- **Limpeza:** 3 avisos de clippy pré-existentes em código antigo
-  (`connection.rs:403`, `transaction.rs:64`, `wire/xdr.rs:89`).
+- ~~**Limpeza:** avisos de clippy~~ ✓ FEITO — `cargo clippy` limpo (collapsible_if,
+  derivable Default em TransactionBuilder, is_multiple_of, unnecessary_cast).
 
 ---
 

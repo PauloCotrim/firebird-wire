@@ -439,10 +439,8 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: Option<&AuthData>) -> V
     if let Some(t) = config.connect_timeout {
         pb.int(dpb::CONNECT_TIMEOUT, t.as_secs().clamp(1, i32::MAX as u64) as i32);
     }
-    if create {
-        if let Some(size) = config.page_size {
-            pb.int(dpb::PAGE_SIZE, size);
-        }
+    if create && let Some(size) = config.page_size {
+        pb.int(dpb::PAGE_SIZE, size);
     }
 
     pb.int(dpb::PROCESS_ID, std::process::id() as i32);

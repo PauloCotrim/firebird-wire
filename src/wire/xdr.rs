@@ -86,7 +86,7 @@ impl XdrWriter {
     /// Preenche (padding) o buffer com bytes zero até o próximo limite de 4 bytes.
     #[inline]
     pub fn align(&mut self) -> &mut Self {
-        while self.buf.len() % 4 != 0 {
+        while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
         self
