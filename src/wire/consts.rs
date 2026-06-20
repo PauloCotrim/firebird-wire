@@ -469,9 +469,13 @@ pub mod batch_info {
 }
 
 /// Códigos de estado de conclusão de `op_batch_cs` (`IBatchCompletionState`).
+/// Valores confirmados via wire: numa entrada do vetor de contagens, `>= 0` é o
+/// número de linhas afetadas; `EXECUTE_FAILED` marca a mensagem que falhou.
 pub mod batch_cs {
-    /// Código de retorno por mensagem que significa "nenhuma info de registros afetados disponível".
-    pub const NO_MORE_ERRORS: i32 = -1;
-    pub const EXECUTE_FAILED: i32 = -2;
-    pub const SUCCESS_NO_INFO: i32 = -3;
+    /// Aquela mensagem falhou ao executar (o detalhe vem no vetor de erros).
+    pub const EXECUTE_FAILED: i32 = -1;
+    /// Sucesso, mas o servidor não reportou a contagem de linhas afetadas.
+    pub const SUCCESS_NO_INFO: i32 = -2;
+    /// Sentinela de `findError`: não há mais posições com erro (posição `u32`).
+    pub const NO_MORE_ERRORS: u32 = u32::MAX;
 }

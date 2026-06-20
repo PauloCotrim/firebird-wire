@@ -227,8 +227,52 @@ O servidor v19 NÃO tem campo de timeout extra (ao contrário de op_prepare/op_e
 O handle de transação deve ser real (não 0); tx_handle=0 falha para DDL mesmo com db_handle correto.
 O driver cria uma transação implícita e faz commit quando `tx=None` é passado para `exec_immediate`.
 
+### DML em lote (`op_batch_*`, 99–103) — RESOLVIDO
+Capturado de um cliente C++ usando a interface OO `IBatch` (ver `11.batch.cpp`),
+sob `strace -f -x -e trace=sendto,recvfrom`. Fluxo: allocate+prepare (já
+conhecidos), depois:
+
+**`op_batch_create` (99):**
+```
+00 00 00 63   op
+00 00 00 02   stmt handle
+[CSTRING]     blr da mensagem: len(4) + BLR + pad   (igual ao in_blr de op_execute)
+00 00 00 1e   p_batch_msglen = tamanho do buffer de mensagem do CLIENTE (não compactado)
+[CSTRING]     pb: len(4) + parameter block + pad
+```
+- O `msglen` é o layout que o BLR descreve (campo alinhado + indicador de nulo
+  SQL_SHORT cada), SEM arredondamento final. INTEGER+VARCHAR(20)=30. Ver
+  `message::message_buffer_len`.
+- O PB usa byte de versão (1) + clumplets com comprimento LE de 4 bytes:
+  `01 02 04000000 01000000` = versão1 + TAG_RECORD_COUNTS(2) len=4 valor=1.
+  Outras tags: MULTIERROR=1, BLOB_POLICY=4 (ver `batch_tag`).
+
+**`op_batch_msg` (100):** `stmt | count(u32) | mensagens`. Cada mensagem está no
+mesmo formato compacto de `op_execute` (bitmap de nulos LE + valores XDR das
+não-nulas), já alinhado a 4; concatenadas sem moldura entre elas.
+
+**`op_batch_exec` (101):** `stmt | transaction`. Responde com `op_batch_cs`.
+
+**`op_batch_cs` (103)** — estado de conclusão (resposta do exec):
+```
+op | stmt | reccount | updates | vectors | errors |
+updates × i32   (contagens por msg: >=0 linhas; -1=EXECUTE_FAILED; -2=SUCCESS_NO_INFO)
+vectors × (pos u32 + status vector)   (erros detalhados por msg)
+errors  × u32   (lista simples de posições com erro; vazia quando há detalhados)
+```
+Confirmado com erros forçados (PK duplicada + MULTIERROR): `updates=[1,1,-1,1,-1]`,
+`vectors=2` com posições 2 e 4 (cada uma com seu status vector de violação de PK).
+
+**`op_batch_rls` (102):** `stmt` (libera o batch). O cliente C ainda envia
+`op_free_statement(67)` depois para soltar a instrução.
+
+**`op_batch_sync` (110):** só o op code (sem handle). O cliente C agrupa
+create+msg e usa o sync para drenar as respostas adiadas; o servidor responde a
+cada op deferido com um `op_response` (3 respostas de 32 bytes coalescidas numa
+recv de 96 bytes). Como nosso driver é síncrono (lê a resposta de cada op na
+hora), NÃO precisamos de batch_sync. Ver `batch.rs`.
+
 ### Ops restantes a capturar quando necessário
-- op_free_statement(67): handle + modo (close=1 / drop=2 / unprepare=4).
-- INSERT/parâmetros: in_blr + in_message (codificar parâmetros, mesmas regras XDR).
-- DML em lote/array: op_batch_create(99), op_batch_msg(100), op_batch_exec(101),
-  op_batch_cs(103), op_batch_rls(102) — capturar de um cliente que use IBatch.
+- BLOBs em batch: op_batch_regblob(104), op_batch_blob_stream(105),
+  op_batch_set_bpb(106) — capturar das Partes 2–4 de `11.batch.cpp`.
+- Cursores roláveis: op_fetch_scroll(112).

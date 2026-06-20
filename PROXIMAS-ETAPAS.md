@@ -16,7 +16,13 @@ sugerida de valor. Detalhes de protocolo já descobertos ficam em
   tipo `BlobWriter` — `op_create_blob2` / `op_put_segment` / `op_close_blob` /
   `op_cancel_blob`). Dois testes de integração: roundtrip e multipart.
 - **Pool de conexões** (`Pool`, `PoolConfig`, `PooledConnection` — `pool.rs`).
-  Semáforo limita `max_size`, devolução automática no `Drop`. 11/11 testes passam.
+  Semáforo limita `max_size`, devolução automática no `Drop`.
+- **`exec_immediate`** (`Connection::exec_immediate` — `op_exec_immediate` 64),
+  DDL/DML sem prepare; cria transação implícita quando `tx=None`.
+- **DML em lote** (`Connection::create_batch`, tipo `Batch` / `BatchResult` /
+  `BatchError` — `batch.rs`, `op_batch_create/msg/exec/cs/rls` 99–103). Reporta
+  contagens e erros por linha (RECORD_COUNTS + MULTIERROR). Dois testes ao vivo:
+  roundtrip e erros por linha. **14/14 testes de integração passam.**
 
 **Como rodar os testes ao vivo** (servidor em `127.0.0.1:3555`, base `employee`,
 SYSDBA / `masterkey`):
@@ -34,19 +40,13 @@ alias/owner e os op codes de blob.
 
 ---
 
-## 1. DML em lote / array (`op_batch_*`) — MAIOR valor
+## 1. ~~DML em lote / array (`op_batch_*`)~~ ✓ FEITO
 
-O recurso "principal" anunciado no `lib.rs`. Inserir/atualizar muitas linhas numa
-ida só. Op codes já definidos em `consts.rs` (batch_create=99 … batch_cs=103,
-info_batch=111).
-
-- Capturar de um cliente que use `IBatch` (API OO do FB4+) — o cliente C de
-  referência precisa usar a interface `Batch` do `IAttachment`.
-- Ops a decodificar: `op_batch_create` (stmt + BPB + formato da mensagem),
-  `op_batch_msg` (lote de mensagens), `op_batch_exec`, `op_batch_rls`,
-  `op_batch_cs` (completion state: erros por linha).
-- Cuidado com o BPB de batch (usa comprimentos de 4 bytes — ver
-  `ParameterBuffer::bytes_be_len4`, já existe).
+`Connection::create_batch` + tipo `Batch` (ver `batch.rs`). Decodificado de um
+cliente C++ `IBatch` (ver `PROTOCOL-NOTES.md` para o layout completo dos op codes
+99–103). Reporta contagens e erros por linha. Falta apenas o suporte a BLOBs em
+batch (`op_batch_regblob` 104 / `op_batch_blob_stream` 105) — capturar das
+Partes 2–4 de `/opt/firebird/examples/interfaces/11.batch.cpp` quando necessário.
 
 ## 2. ~~Escrita de BLOBs~~ ✓ FEITO
 

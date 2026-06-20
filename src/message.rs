@@ -17,6 +17,51 @@ pub fn null_bitmap_len(ncols: usize) -> usize {
     align4(ncols.div_ceil(8))
 }
 
+/// Comprimento do buffer de mensagem *do lado do cliente* (não compactado) que o
+/// servidor espera em `op_batch_create` (`p_batch_msglen`). É o layout que o BLR
+/// descreve: cada campo é alinhado à sua fronteira natural, seguido de um
+/// indicador de nulo `SQL_SHORT` (2 bytes, alinhamento 2). Sem arredondamento
+/// final — confirmado por captura (INTEGER + VARCHAR(20) → 30 bytes).
+pub fn message_buffer_len(columns: &[ColumnMeta]) -> u32 {
+    let mut off: usize = 0;
+    for col in columns {
+        let (len, alignment) = type_size_align(col);
+        off = align_up(off, alignment);
+        off += len;
+        // indicador de nulo: SQL_SHORT, 2 bytes, alinhamento 2.
+        off = align_up(off, 2);
+        off += 2;
+    }
+    off as u32
+}
+
+#[inline]
+fn align_up(n: usize, alignment: usize) -> usize {
+    (n + alignment - 1) & !(alignment - 1)
+}
+
+/// `(comprimento dos dados, alinhamento)` de um campo no buffer de mensagem.
+fn type_size_align(col: &ColumnMeta) -> (usize, usize) {
+    let n = col.length as usize;
+    match sql_type::base(col.sql_type) {
+        sql_type::TEXT => (n, 1),
+        sql_type::VARYING => (n + 2, 2),
+        sql_type::SHORT => (2, 2),
+        sql_type::LONG => (4, 4),
+        sql_type::FLOAT => (4, 4),
+        sql_type::TYPE_DATE | sql_type::TYPE_TIME => (4, 4),
+        sql_type::INT64 => (8, 8),
+        sql_type::DOUBLE | sql_type::D_FLOAT => (8, 8),
+        sql_type::TIMESTAMP => (8, 4),
+        sql_type::BLOB | sql_type::QUAD => (8, 4),
+        sql_type::INT128 => (16, 8),
+        sql_type::BOOLEAN => (1, 1),
+        sql_type::DEC16 => (8, 8),
+        sql_type::DEC34 => (16, 8),
+        _ => (8, 8),
+    }
+}
+
 /// Codifica uma linha (mensagem de parâmetros de entrada) no formato de
 /// transmissão que o servidor espera: um bitmap de nulos little-endian inicial
 /// seguido do valor XDR de cada coluna NÃO-NULL, em ordem. O inverso de
@@ -203,5 +248,40 @@ fn text_or_bytes(col: &ColumnMeta, raw: Vec<u8>) -> Value {
             &s
         };
         Value::Text(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(sql_type: i32, length: i32) -> ColumnMeta {
+        ColumnMeta { sql_type, length, ..Default::default() }
+    }
+
+    #[test]
+    fn buffer_len_integer_and_varchar() {
+        // INTEGER + VARCHAR(20): confirmado por captura do cliente C (IBatch) = 30.
+        // int(4)@0 + null(2)@4 → 6; varchar(22)@6 + null(2)@28 → 30.
+        let cols = [col(sql_type::LONG, 4), col(sql_type::VARYING, 20)];
+        assert_eq!(message_buffer_len(&cols), 30);
+    }
+
+    #[test]
+    fn buffer_len_respects_alignment() {
+        // SMALLINT(2)@0 + null(2)@2 → 4; BIGINT alinha a 8 → 8, +8 → 16,
+        // null(2)@16 → 18.
+        let cols = [col(sql_type::SHORT, 2), col(sql_type::INT64, 8)];
+        assert_eq!(message_buffer_len(&cols), 18);
+    }
+
+    #[test]
+    fn encode_row_is_4_aligned() {
+        // Cada mensagem codificada deve terminar em fronteira de 4 bytes para que
+        // a concatenação no op_batch_msg permaneça alinhada.
+        let cols = [col(sql_type::LONG, 4), col(sql_type::VARYING, 20)];
+        let msg = encode_row(&cols, &[Value::Int(1), Value::Text("um".into())]).unwrap();
+        assert_eq!(msg.len() % 4, 0);
+        assert_eq!(msg.len(), 16); // bitmap(4) + int(4) + len(4)+"um"+pad(2)=8
     }
 }

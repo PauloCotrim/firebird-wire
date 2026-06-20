@@ -9,6 +9,7 @@
 //! ```
 
 use fdb_driver::{ConnectConfig, Connection, Pool, PoolConfig, Result, Value, WireCrypt};
+use fdb_driver::wire::consts::batch_cs;
 
 fn config() -> Option<ConnectConfig> {
     let password = std::env::var("FB_PASSWORD").ok()?;
@@ -305,6 +306,87 @@ async fn exec_immediate_ddl() -> Result<()> {
     conn.exec_immediate(None, "DROP TABLE fdb_test_exec_imm").await?;
     println!("DROP TABLE ok");
 
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_insert_roundtrip() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // Tabela de teste limpa.
+    conn.exec_immediate(None, "RECREATE TABLE fdb_batch_t (id INTEGER, nome VARCHAR(20))").await?;
+
+    let tx = conn.begin().await?;
+    let mut batch = conn.create_batch(&tx, "INSERT INTO fdb_batch_t (id, nome) VALUES (?, ?)").await?;
+    assert_eq!(batch.params().len(), 2);
+
+    for (id, nome) in [(1, "um"), (2, "dois"), (3, "tres")] {
+        batch.add(&[Value::Int(id), Value::Text(nome.into())])?;
+    }
+    assert_eq!(batch.pending(), 3);
+
+    let result = batch.execute(&mut conn, &tx).await?;
+    println!("batch: total={} update_counts={:?}", result.total, result.update_counts);
+    assert_eq!(result.total, 3);
+    assert_eq!(result.update_counts, vec![1, 1, 1]);
+    assert!(result.all_succeeded());
+    assert_eq!(result.total_affected(), 3);
+
+    batch.close(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    // Confere que as 3 linhas foram inseridas.
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT id, nome FROM fdb_batch_t ORDER BY id").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), 3);
+    assert!(matches!(rows[1][0], Value::Int(2)));
+    assert_eq!(rows[2][1].as_str(), Some("tres"));
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_t").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_per_row_errors() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // PRIMARY KEY força violação em ids duplicados.
+    conn.exec_immediate(None, "RECREATE TABLE fdb_batch_e (id INTEGER PRIMARY KEY, nome VARCHAR(20))").await?;
+
+    let tx = conn.begin().await?;
+    let mut batch = conn.create_batch(&tx, "INSERT INTO fdb_batch_e (id, nome) VALUES (?, ?)").await?;
+
+    // ids: 1, 2, 2(dup), 3, 1(dup) — as posições 2 e 4 devem falhar.
+    for (id, nome) in [(1, "a"), (2, "b"), (2, "c"), (3, "d"), (1, "e")] {
+        batch.add(&[Value::Int(id), Value::Text(nome.into())])?;
+    }
+
+    let result = batch.execute(&mut conn, &tx).await?;
+    println!("batch erros: update_counts={:?}", result.update_counts);
+    for e in &result.errors {
+        println!("  msg {} falhou: {}", e.message_index, e.error);
+    }
+    assert_eq!(result.total, 5);
+    assert_eq!(result.update_counts, vec![1, 1, batch_cs::EXECUTE_FAILED, 1, batch_cs::EXECUTE_FAILED]);
+    assert!(!result.all_succeeded());
+    assert_eq!(result.total_affected(), 3); // 3 inserções bem-sucedidas
+    // Dois erros detalhados, nas posições 2 e 4.
+    let mut posicoes: Vec<u32> = result.errors.iter().map(|e| e.message_index).collect();
+    posicoes.sort_unstable();
+    assert_eq!(posicoes, vec![2, 4]);
+
+    batch.close(&mut conn).await?;
+    tx.rollback(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_e").await?;
     conn.close().await?;
     Ok(())
 }
