@@ -1,4 +1,6 @@
-//! Leitura de BLOBs.
+//! Leitura e escrita de BLOBs.
+//!
+//! ## Leitura
 //!
 //! Uma coluna BLOB chega numa linha como um id de 8 bytes ([`Value::Blob`]); o
 //! conteúdo é buscado à parte. O fluxo clássico é:
@@ -14,6 +16,18 @@
 //! bytes. Os BLOBs são lidos pelo protocolo clássico (não inline): ver a nota
 //! sobre `inline_blob_size` em `statement.rs`.
 //!
+//! ## Escrita
+//!
+//! 1. [`Connection::create_blob`] envia `op_create_blob2` (transação) e recebe
+//!    um handle + o blob_id atribuído pelo servidor.
+//! 2. [`BlobWriter::write`] envia `op_put_segment` em partes de no máximo
+//!    [`MAX_SEGMENT`] bytes. Cada segmento vai empacotado como `[len_lo, len_hi,
+//!    bytes...]` dentro de uma cstring XDR.
+//! 3. [`BlobWriter::close`] envia `op_close_blob` e devolve o blob_id para usar
+//!    como [`Value::Blob`] em INSERT/UPDATE.
+//!
+//! Para o caso comum, [`Connection::write_blob`] faz tudo e devolve o id.
+//!
 //! [`Value::Blob`]: crate::value::Value::Blob
 
 use crate::connection::Connection;
@@ -22,6 +36,9 @@ use crate::transaction::Transaction;
 use crate::wire::consts::op;
 use crate::wire::response::read_response;
 use crate::wire::stream::op_packet;
+
+/// Tamanho máximo de um segmento por chamada de `op_put_segment` (limite do protocolo).
+const MAX_SEGMENT: usize = 65_535;
 
 /// Status de `op_get_segment` em `p_resp_object`: 0 = segmento(s) lido(s) e pode
 /// haver mais; 1 = `isc_segment` (o último segmento não coube no buffer, continua
@@ -98,6 +115,65 @@ impl Blob {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Escrita de BLOBs
+// ---------------------------------------------------------------------------
+
+/// Um BLOB aberto para escrita no servidor.
+///
+/// Criado por [`Connection::create_blob`]. Escreva dados com [`Self::write`] e
+/// feche com [`Self::close`] para obter o id do blob. Em caso de erro, use
+/// [`Self::cancel`] para liberar o handle no servidor.
+#[derive(Debug)]
+pub struct BlobWriter {
+    handle: i32,
+    /// Id atribuído pelo servidor no momento da criação; imutável.
+    blob_id: u64,
+}
+
+impl BlobWriter {
+    /// Id do blob no servidor. Use como [`Value::Blob`](crate::value::Value::Blob)
+    /// num parâmetro de INSERT/UPDATE após fechar o blob.
+    pub fn blob_id(&self) -> u64 {
+        self.blob_id
+    }
+
+    /// Envia `data` para o servidor em segmentos de no máximo [`MAX_SEGMENT`]
+    /// bytes, usando `op_put_segment`. Pode ser chamado várias vezes.
+    pub async fn write(&self, conn: &mut Connection, data: &[u8]) -> Result<()> {
+        for chunk in data.chunks(MAX_SEGMENT) {
+            // O servidor armazena o conteúdo do cstring verbatim — sem prefixo de 2 bytes.
+            let mut w = op_packet(op::PUT_SEGMENT);
+            w.put_i32(self.handle);
+            w.put_i32(chunk.len() as i32); // comprimento bruto do segmento
+            w.put_bytes(chunk);             // cstring: bytes brutos + padding XDR
+            conn.io().send(&w).await?;
+            read_response(conn.io()).await?;
+        }
+        Ok(())
+    }
+
+    /// Cancela o blob (`op_cancel_blob`), descartando o conteúdo já enviado.
+    /// Use quando ocorrer um erro após [`Connection::create_blob`].
+    pub async fn cancel(self, conn: &mut Connection) -> Result<()> {
+        let mut w = op_packet(op::CANCEL_BLOB);
+        w.put_i32(self.handle);
+        conn.io().send(&w).await?;
+        read_response(conn.io()).await?;
+        Ok(())
+    }
+
+    /// Fecha o blob (`op_close_blob`) e devolve o seu id para usar como parâmetro
+    /// de coluna BLOB em INSERT/UPDATE.
+    pub async fn close(self, conn: &mut Connection) -> Result<u64> {
+        let mut w = op_packet(op::CLOSE_BLOB);
+        w.put_i32(self.handle);
+        conn.io().send(&w).await?;
+        read_response(conn.io()).await?;
+        Ok(self.blob_id)
+    }
+}
+
 impl Connection {
     /// Abre um BLOB para leitura pelo seu id (obtido de uma coluna
     /// [`Value::Blob`](crate::value::Value::Blob)).
@@ -109,6 +185,31 @@ impl Connection {
         self.io().send(&w).await?;
         let resp = read_response(self.io()).await?;
         Ok(Blob { handle: resp.handle, eof: false })
+    }
+
+    /// Cria um BLOB vazio para escrita (`op_create_blob2`). Escreva dados com
+    /// [`BlobWriter::write`] e finalize com [`BlobWriter::close`] para obter o
+    /// id do blob. Em caso de erro, chame [`BlobWriter::cancel`].
+    pub async fn create_blob(&mut self, tx: &Transaction) -> Result<BlobWriter> {
+        let mut w = op_packet(op::CREATE_BLOB2);
+        w.put_bytes(&[]); // BPB vazia — tipo de blob padrão
+        w.put_i32(tx.handle());
+        w.put_i64(0); // blob_id ignorado na criação; o servidor atribui um novo
+        self.io().send(&w).await?;
+        let resp = read_response(self.io()).await?;
+        Ok(BlobWriter { handle: resp.handle, blob_id: resp.blob_id })
+    }
+
+    /// Conveniência: cria um BLOB, escreve `data` integralmente e o fecha,
+    /// devolvendo o id para usar como parâmetro de coluna BLOB.
+    pub async fn write_blob(&mut self, tx: &Transaction, data: &[u8]) -> Result<u64> {
+        let writer = self.create_blob(tx).await?;
+        // `write` toma `&self` (não consome writer), então podemos cancelar em caso de erro.
+        if let Err(e) = writer.write(self, data).await {
+            let _ = writer.cancel(self).await;
+            return Err(e);
+        }
+        writer.close(self).await
     }
 
     /// Conveniência: abre o BLOB, lê todo o conteúdo e o fecha, devolvendo os

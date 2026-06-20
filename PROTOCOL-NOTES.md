@@ -36,7 +36,7 @@ item 0x17; a resposta traz um bloco aninhado com os contadores `isc_info_req_*`
 (select=13, insert=14, update=15, delete=16), cada um `tag(1)+len(2 LE)+valor`.
 Um UPDATE de N linhas reporta select=N e update=N. Veja `Statement::rows_affected`.
 
-**BLOBs (leitura) — validado com proj_desc da tabela project.** Veja `blob.rs`.
+**BLOBs (leitura e escrita) — validado ao vivo.** Veja `blob.rs`.
 
 - **Correção de op codes:** os `*_blob2` estavam deslocados em 1 no `consts.rs`.
   A enum é sequencial: op_ddl=55, **op_open_blob2=56**, op_create_blob2=57,
@@ -51,6 +51,15 @@ Um UPDATE de N linhas reporta select=N e update=N. Veja `Statement::rows_affecte
   parcial, 2=isc_segstr_eof) e `p_resp_data` = segmentos empacotados, cada um
   `comprimento(2 LE) + bytes`.
 - **`op_close_blob` (39):** só o handle. Resposta op_response.
+- **`op_create_blob2` (57):** mesmo layout do `op_open_blob2` — `bpb(cstring) |
+  transaction(i32) | blob_id(quad 8B, ignorado — enviar 0)`. Resposta: op_response
+  com `p_resp_object` = novo handle, `p_resp_blob_id` = blob_id atribuído.
+- **`op_put_segment` (37):** `blob_handle(i32) | segment_len(i32) | data(cstring)`.
+  O cstring contém os bytes brutos SEM prefixo de 2 bytes LE. `segment_len` == tamanho
+  do cstring. **Atenção:** o cliente C da fbclient envolve os dados com um prefixo de
+  2 bytes LE para suportar batching de segmentos num único op, mas o servidor armazena
+  o conteúdo do cstring verbatim — portanto enviamos bytes puros.
+- **`op_cancel_blob` (38):** só o handle. Resposta op_response. Descarta o blob.
 - **Inline blobs (FB5):** com `inline_blob_size = 0xffff` no op_execute (o que o
   fbclient envia), o servidor EMBUTE blobs pequenos na resposta do fetch e o
   cliente nunca manda op_open_blob/op_get_segment — por isso uma captura strace

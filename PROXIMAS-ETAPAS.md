@@ -1,6 +1,6 @@
 # Próximas etapas (roadmap)
 
-Estado em **2026-06-19**. Visão de alto nível do que falta no driver, em ordem
+Estado em **2026-06-20**. Visão de alto nível do que falta no driver, em ordem
 sugerida de valor. Detalhes de protocolo já descobertos ficam em
 `PROTOCOL-NOTES.md`.
 
@@ -12,6 +12,9 @@ sugerida de valor. Detalhes de protocolo já descobertos ficam em
 - Parâmetros de entrada (mensagem compacta: bitmap de nulos + valores XDR).
 - Contagem de linhas afetadas (`Statement::rows_affected`).
 - Leitura de BLOBs (`Connection::read_blob`, tipo `Blob`).
+- **Escrita de BLOBs** (`Connection::write_blob`, `Connection::create_blob`,
+  tipo `BlobWriter` — `op_create_blob2` / `op_put_segment` / `op_close_blob` /
+  `op_cancel_blob`). Dois testes de integração: roundtrip e multipart. 9/9 passam.
 
 **Como rodar os testes ao vivo** (servidor em `127.0.0.1:3555`, base `employee`,
 SYSDBA / `masterkey`):
@@ -43,14 +46,9 @@ info_batch=111).
 - Cuidado com o BPB de batch (usa comprimentos de 4 bytes — ver
   `ParameterBuffer::bytes_be_len4`, já existe).
 
-## 2. Escrita de BLOBs
+## 2. ~~Escrita de BLOBs~~ ✓ FEITO
 
-Complemento natural da leitura, necessário para INSERT com colunas BLOB.
-
-- `op_create_blob2` (34/57): cria um blob, retorna handle + id.
-- `op_put_segment` (37): grava segmentos (`comprimento(2 LE) + bytes`).
-- `op_close_blob` (39): fecha; o id resultante vai no INSERT como parâmetro quad.
-- API sugerida: `Connection::create_blob` → `Blob::write` → devolve `u64` (id).
+`Connection::write_blob` / `create_blob` / `BlobWriter` (ver `blob.rs`).
 
 ## 3. Pool de conexões
 

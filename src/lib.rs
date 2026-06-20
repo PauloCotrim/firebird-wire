@@ -28,7 +28,7 @@ pub mod transaction;
 pub mod value;
 pub mod wire;
 
-pub use blob::Blob;
+pub use blob::{Blob, BlobWriter};
 pub use config::{ConnectConfig, WireCrypt};
 pub use connection::Connection;
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};

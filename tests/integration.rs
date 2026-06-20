@@ -183,3 +183,45 @@ async fn parameterized_query() -> Result<()> {
     conn.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn write_blob_roundtrip() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    // Cria um BLOB, escreve dados de teste e fecha para obter o blob_id.
+    let conteudo = b"Ola, Firebird! Teste de escrita de BLOB via op_create_blob2/op_put_segment.";
+    let blob_id = conn.write_blob(&tx, conteudo).await?;
+    println!("blob criado: id={blob_id:#018x}");
+
+    // Le o mesmo blob de volta pela mesma transacao e confere o conteudo.
+    let lido = conn.read_blob(&tx, blob_id).await?;
+    assert_eq!(lido, conteudo, "conteudo lido difere do escrito");
+    println!("blob lido: {} bytes ok", lido.len());
+
+    tx.rollback(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_blob_multipart() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    // Escreve um BLOB em duas partes usando a API de baixo nivel.
+    let writer = conn.create_blob(&tx).await?;
+    writer.write(&mut conn, b"primeira parte; ").await?;
+    writer.write(&mut conn, b"segunda parte.").await?;
+    let blob_id = writer.close(&mut conn).await?;
+
+    let lido = conn.read_blob(&tx, blob_id).await?;
+    assert_eq!(lido, b"primeira parte; segunda parte.");
+    println!("blob multipart: {} bytes ok", lido.len());
+
+    tx.rollback(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
