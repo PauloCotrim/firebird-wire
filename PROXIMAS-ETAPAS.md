@@ -117,6 +117,19 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
   Connection` emprestado). 1 teste ao vivo (`row_stream`).
 - ~~**Limpeza:** avisos de clippy~~ ✓ FEITO — `cargo clippy` limpo (collapsible_if,
   derivable Default em TransactionBuilder, is_multiple_of, unnecessary_cast).
+- ~~**Eventos do banco**~~ ✓ FEITO — `Connection::listen_events(&[nomes]) ->
+  EventListener`; `EventListener::wait(&mut conn)` bloqueia até um `POST_EVENT`
+  e devolve os nomes disparados (re-registra sozinho); `cancel`. Usa o canal
+  auxiliar (`op_connect_request` 53 → `sockaddr_in` na resposta → novo socket;
+  `op_que_events` 48 / `op_event` 52 / `op_cancel_events` 49). EPB = `versão(1) |
+  [namelen(1) | nome | count(4 LE)]`. 1 teste ao vivo (`database_events`).
+
+## Recursos maiores ainda não implementados
+
+- **Service API** (`op_service_attach`/`op_service_start`/`op_service_info`):
+  backup/restore (gbak), estatísticas (gstat), gfix, gestão de usuários.
+- Charsets multibyte além de UTF-8 (SJIS, EUC-JP, …) em `charset.rs`.
+- Conferir DECFLOAT (DEC16/DEC34) e INT128 com escala contra dados reais.
 
 ---
 

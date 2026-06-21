@@ -400,3 +400,24 @@ por isso wire e `size`/`length` divergem (mesmo padrão do stream de blobs). Ver
 
 Todos os op codes de batch (99–106) estão implementados e testados ao vivo:
 create/msg/exec/rls/cs, blob_stream (105), regblob (104) e set_bpb (106).
+
+## Eventos assíncronos (canal auxiliar) — VALIDADO AO VIVO
+
+Decodificado de um cliente C (`isc_event_block` + `isc_wait_for_event`) sob
+`strace -e trace=network,read`, com `POST_EVENT` disparado de um isql paralelo.
+
+1. **`op_connect_request` (53):** `op | type(=1 async) | db_handle | partner(=0)`.
+   Resposta `op_response` com `p_resp_data` = `sockaddr_in` de 16 bytes:
+   `família(2, host-endian) | porta(2, BE de rede) | ip(4) | zeros(8)`. O cliente
+   abre um SEGUNDO socket TCP para `(ip do servidor, porta)` = canal auxiliar.
+2. **`op_que_events` (48):** `op | db_handle | epb(cstring) | ast(4=0) | arg(4=0) |
+   event_id(4)`. EPB = `versão(1) | [namelen(1) | nome | count(4 LE)]…`. O
+   `event_id` é escolhido pelo cliente. Resposta: `op_response`.
+3. **`op_event` (52)** chega pelo canal auxiliar quando alguém faz `POST_EVENT` +
+   commit: `op | db_handle | epb(cstring com counts atualizados, LE) | ast(4) |
+   event_id(4)`. Comparando os counts com os anteriores sabe-se o que disparou.
+4. **`op_cancel_events` (49):** `op | db_handle | event_id`.
+
+Eventos são one-shot: re-registrar (`op_que_events`) após cada `op_event`. O
+canal auxiliar é só-leitura no cliente (o servidor empurra `op_event`); não há
+handshake nele. Ver `events.rs` (`Connection::listen_events`/`EventListener`).

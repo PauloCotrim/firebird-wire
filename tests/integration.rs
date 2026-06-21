@@ -485,6 +485,38 @@ async fn batch_blob_stream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn database_events() -> Result<()> {
+    use std::time::Duration;
+    let cfg = require_server!();
+
+    // Conexão A registra interesse no evento.
+    let mut conn = Connection::connect(&cfg).await?;
+    let mut ev = conn.listen_events(&["fdb_test_ev"]).await?;
+    assert_eq!(ev.names(), ["fdb_test_ev"]);
+
+    // Conexão B faz POST_EVENT (dispara no commit) após um pequeno atraso,
+    // enquanto A está bloqueada em wait().
+    let cfg2 = cfg.clone();
+    let poster = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut b = Connection::connect(&cfg2).await?;
+        b.exec_immediate(None, "EXECUTE BLOCK AS BEGIN POST_EVENT 'fdb_test_ev'; END").await?;
+        b.close().await?;
+        Ok::<(), fdb_driver::Error>(())
+    });
+
+    let fired = tokio::time::timeout(Duration::from_secs(10), ev.wait(&mut conn))
+        .await
+        .expect("evento não chegou em 10s")?;
+    assert_eq!(fired, vec!["fdb_test_ev".to_string()]);
+
+    poster.await.expect("task do poster")?;
+    ev.cancel(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn row_stream() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

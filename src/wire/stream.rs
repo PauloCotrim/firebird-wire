@@ -60,6 +60,12 @@ impl FbStream {
         self.read_cipher.is_some()
     }
 
+    /// O IP do servidor (peer) deste socket. Usado para abrir o canal auxiliar de
+    /// eventos no mesmo host.
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.sock.peer_addr().ok().map(|a| a.ip())
+    }
+
     // -- escrita -----------------------------------------------------------
 
     /// Anexa uma operação construída em XDR ao buffer de envio. Use [`Self::flush`]

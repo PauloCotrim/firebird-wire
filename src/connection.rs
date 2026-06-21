@@ -28,6 +28,8 @@ pub struct Connection {
     db_handle: i32,
     protocol_version: i32,
     charset: crate::charset::Charset,
+    /// Contador para atribuir ids únicos de registro de eventos nesta conexão.
+    event_seq: i32,
 }
 
 impl Connection {
@@ -133,7 +135,14 @@ impl Connection {
             db_handle: resp.handle,
             protocol_version,
             charset: crate::charset::Charset::from_name(&config.charset),
+            event_seq: 0,
         })
+    }
+
+    /// Devolve o próximo id de registro de eventos (único nesta conexão).
+    pub(crate) fn next_event_id(&mut self) -> i32 {
+        self.event_seq += 1;
+        self.event_seq
     }
 
     /// O charset da conexão, usado para decodificar texto vindo do servidor.

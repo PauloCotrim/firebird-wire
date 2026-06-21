@@ -32,7 +32,12 @@ pub mod op {
     pub const INFO_DATABASE: i32 = 40;
     pub const INFO_TRANSACTION: i32 = 42;
 
+    // Eventos assíncronos (canal auxiliar).
+    pub const QUE_EVENTS: i32 = 48;
+    pub const CANCEL_EVENTS: i32 = 49;
     pub const COMMIT_RETAINING: i32 = 50;
+    pub const EVENT: i32 = 52;
+    pub const CONNECT_REQUEST: i32 = 53;
 
     // Op codes de blob. A faixa baixa (34-43) é a clássica; os *_blob2 ficam na
     // faixa alta, logo antes de op_allocate_statement(62), e a enum é sequencial:

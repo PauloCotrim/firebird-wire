@@ -23,7 +23,8 @@ Construído sobre [Tokio](https://tokio.rs).
 11. [BLOBs](#blobs)
 12. [DML em lote (batch)](#dml-em-lote-batch)
 13. [BLOBs em lote](#blobs-em-lote)
-14. [Pool de conexões](#pool-de-conexões)
+14. [Eventos do banco](#eventos-do-banco)
+15. [Pool de conexões](#pool-de-conexões)
 15. [Charsets](#charsets)
 16. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
 17. [Tratamento de erros](#tratamento-de-erros)
@@ -451,6 +452,29 @@ Outras opções de blob em batch:
 
 ---
 
+## Eventos do banco
+
+Uma conexão pode aguardar **eventos** postados por outra (`POST_EVENT`), por um
+canal auxiliar assíncrono. Útil para invalidação de cache / notificações sem
+*polling*.
+
+```rust
+// Conexão A: registra e aguarda.
+let mut ev = conn.listen_events(&["estoque_mudou", "preco_mudou"]).await?;
+let disparados = ev.wait(&mut conn).await?;   // bloqueia até um POST_EVENT
+println!("dispararam: {disparados:?}");        // ex.: ["estoque_mudou"]
+ev.cancel(&mut conn).await?;                    // encerra o registro
+
+// Conexão B (em outro lugar): dispara o evento ao commitar.
+conn_b.exec_immediate(None,
+    "EXECUTE BLOCK AS BEGIN POST_EVENT 'estoque_mudou'; END").await?;
+// (ou um POST_EVENT dentro de um trigger / stored procedure)
+```
+
+`wait` re-registra automaticamente, então pode ser chamado num laço para reagir a
+postagens sucessivas. Combine com `tokio::time::timeout` se quiser um tempo
+máximo de espera.
+
 ## Pool de conexões
 
 ```rust
@@ -582,11 +606,11 @@ assíncrono.)
 - ✅ Datas/horas civis (`CivilDate`/`CivilTime`/`CivilTimestamp`)
 - ✅ **Charsets** UTF-8 / Latin-1 / Windows-1252 (leitura e escrita)
 - ✅ **Pool de conexões** (`Pool`/`PoolConfig`/`PooledConnection`)
+- ✅ **Eventos do banco** (`listen_events`/`EventListener`, canal auxiliar)
 - ✅ Guards de `Drop` (aviso de vazamento em debug)
 
 ## O que falta implementar
 
-- ⬜ **Eventos do banco** (`op_que_events`/`op_event`, `isc_event_*`)
 - ⬜ **Service API** (`op_service_*`: backup/restore, estatísticas, gfix)
 - ⬜ **Charsets multibyte** além de UTF-8 (ex.: SJIS, EUC-JP)
 - ⬜ Conferir **DECFLOAT** (DEC16/DEC34) e **INT128 com escala** contra dados reais
