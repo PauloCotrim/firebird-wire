@@ -54,6 +54,8 @@ const SEGMENT_BUFFER: i32 = 0xffff;
 pub struct Blob {
     handle: i32,
     eof: bool,
+    /// Verdadeiro após `close`; suprime o aviso de [`Drop`].
+    done: bool,
 }
 
 impl Blob {
@@ -106,12 +108,21 @@ impl Blob {
     }
 
     /// Fecha o blob (`op_close_blob`), consumindo o handle.
-    pub async fn close(self, conn: &mut Connection) -> Result<()> {
+    pub async fn close(mut self, conn: &mut Connection) -> Result<()> {
+        self.done = true;
         let mut w = op_packet(op::CLOSE_BLOB);
         w.put_i32(self.handle);
         conn.io().send(&w).await?;
         read_response(conn.io()).await?;
         Ok(())
+    }
+}
+
+impl Drop for Blob {
+    fn drop(&mut self) {
+        if !self.done {
+            crate::warn_unclosed("Blob", self.handle);
+        }
     }
 }
 
@@ -129,6 +140,8 @@ pub struct BlobWriter {
     handle: i32,
     /// Id atribuído pelo servidor no momento da criação; imutável.
     blob_id: u64,
+    /// Verdadeiro após `close`/`cancel`; suprime o aviso de [`Drop`].
+    done: bool,
 }
 
 impl BlobWriter {
@@ -155,7 +168,8 @@ impl BlobWriter {
 
     /// Cancela o blob (`op_cancel_blob`), descartando o conteúdo já enviado.
     /// Use quando ocorrer um erro após [`Connection::create_blob`].
-    pub async fn cancel(self, conn: &mut Connection) -> Result<()> {
+    pub async fn cancel(mut self, conn: &mut Connection) -> Result<()> {
+        self.done = true;
         let mut w = op_packet(op::CANCEL_BLOB);
         w.put_i32(self.handle);
         conn.io().send(&w).await?;
@@ -165,12 +179,21 @@ impl BlobWriter {
 
     /// Fecha o blob (`op_close_blob`) e devolve o seu id para usar como parâmetro
     /// de coluna BLOB em INSERT/UPDATE.
-    pub async fn close(self, conn: &mut Connection) -> Result<u64> {
+    pub async fn close(mut self, conn: &mut Connection) -> Result<u64> {
+        self.done = true;
         let mut w = op_packet(op::CLOSE_BLOB);
         w.put_i32(self.handle);
         conn.io().send(&w).await?;
         read_response(conn.io()).await?;
         Ok(self.blob_id)
+    }
+}
+
+impl Drop for BlobWriter {
+    fn drop(&mut self) {
+        if !self.done {
+            crate::warn_unclosed("BlobWriter", self.handle);
+        }
     }
 }
 
@@ -184,7 +207,7 @@ impl Connection {
         w.put_i64(blob_id as i64); // id do blob (quad de 8 bytes, big-endian)
         self.io().send(&w).await?;
         let resp = read_response(self.io()).await?;
-        Ok(Blob { handle: resp.handle, eof: false })
+        Ok(Blob { handle: resp.handle, eof: false, done: false })
     }
 
     /// Cria um BLOB vazio para escrita (`op_create_blob2`). Escreva dados com
@@ -197,7 +220,7 @@ impl Connection {
         w.put_i64(0); // blob_id ignorado na criação; o servidor atribui um novo
         self.io().send(&w).await?;
         let resp = read_response(self.io()).await?;
-        Ok(BlobWriter { handle: resp.handle, blob_id: resp.blob_id })
+        Ok(BlobWriter { handle: resp.handle, blob_id: resp.blob_id, done: false })
     }
 
     /// Conveniência: cria um BLOB, escreve `data` integralmente e o fecha,

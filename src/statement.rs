@@ -382,6 +382,21 @@ impl Statement {
         read_response(conn.io()).await?;
         Ok(())
     }
+
+    /// Marca o handle como transferido (não será liberado por este `Statement`),
+    /// suprimindo o aviso de [`Drop`]. Usado quando o handle passa a viver em
+    /// outro dono — p.ex. ao virar um [`crate::Batch`] em `create_batch`.
+    pub(crate) fn forget_handle(&mut self) {
+        self.dropped = true;
+    }
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        if !self.dropped {
+            crate::warn_unclosed("Statement", self.handle);
+        }
+    }
 }
 
 impl Connection {

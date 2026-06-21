@@ -191,6 +191,14 @@ impl Transaction {
     }
 }
 
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            crate::warn_unclosed("Transaction", self.handle);
+        }
+    }
+}
+
 impl Connection {
     /// Inicia uma transação com parâmetros padrão (snapshot, leitura e escrita, wait).
     pub async fn begin(&mut self) -> Result<Transaction> {

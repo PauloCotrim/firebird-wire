@@ -102,8 +102,11 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
 
 ## Notas de segurança / robustez ainda a endereçar
 
-- `Statement`/`Transaction`/`Blob` não fecham automaticamente no `Drop` (o estado
-  fica no servidor até o detach). Documentado, mas um guard de `Drop` que avise em
-  debug seria útil.
+- ~~Guard de `Drop` que avise em debug~~ ✓ FEITO — `Statement`, `Transaction`,
+  `Blob`, `BlobWriter` e `Batch` avisam (via `warn_unclosed`, só em
+  `debug_assertions`) quando são descartados sem fechar/liberar, sinalizando
+  vazamento de handle no servidor. `create_batch` usa `Statement::forget_handle`
+  para não disparar o aviso ao transferir o handle ao `Batch`. (Continua sem
+  fechar automaticamente — `Drop` não pode ser async.)
 - Charsets: o decode de texto usa `from_utf8_lossy`. Para charsets não-UTF8
   (WIN1252, etc.) seria preciso transcodificar conforme o charset da coluna.

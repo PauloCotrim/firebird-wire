@@ -39,3 +39,18 @@ pub use pool::{Pool, PoolConfig, PooledConnection};
 pub use statement::{RowsAffected, Statement};
 pub use transaction::{AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder};
 pub use value::{CivilDate, CivilTime, CivilTimestamp, ColumnMeta, Value};
+
+/// Emite um aviso (apenas em builds de debug) quando um recurso com estado no
+/// servidor (`Statement`, `Transaction`, `Blob`, `BlobWriter`) é solto sem ser
+/// liberado explicitamente. O handle permanece alocado no servidor até o
+/// `detach`; este aviso ajuda a localizar vazamentos durante o desenvolvimento.
+/// Em builds de release é um no-op (sem custo).
+#[inline]
+pub(crate) fn warn_unclosed(kind: &str, handle: i32) {
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[fdb] aviso: {kind} (handle {handle}) foi descartado sem fechar/liberar; \
+             o estado fica no servidor até o detach. Chame o método de fechamento adequado."
+        );
+    }
+}

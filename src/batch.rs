@@ -274,6 +274,14 @@ impl Batch {
     }
 }
 
+impl Drop for Batch {
+    fn drop(&mut self) {
+        if !self.closed {
+            crate::warn_unclosed("Batch", self.handle);
+        }
+    }
+}
+
 impl Connection {
     /// Prepara uma instrução e cria um lote (batch) sobre ela. A instrução deve
     /// ter parâmetros (`?`) — cada [`Batch::add`] fornece uma linha de valores.
@@ -282,12 +290,13 @@ impl Connection {
     /// (`TAG_RECORD_COUNTS`) e continua após erros por linha (`TAG_MULTIERROR`),
     /// de modo que [`BatchResult`] traz o resultado completo de cada linha.
     pub async fn create_batch(&mut self, tx: &Transaction, sql: &str) -> Result<Batch> {
-        let stmt = self.prepare(tx, sql).await?;
+        let mut stmt = self.prepare(tx, sql).await?;
         let handle = stmt.handle();
         let params: Vec<ColumnMeta> = stmt.params().to_vec();
-        // `Statement` não fecha o handle no Drop (estado fica no servidor), então
-        // deixá-lo cair aqui só libera memória; o handle vive no Batch e é
-        // liberado por Batch::close.
+        // O handle passa a viver no Batch (liberado por Batch::close), então
+        // marcamos como transferido para não disparar o aviso de Drop e soltamos
+        // o wrapper aqui (libera só memória).
+        stmt.forget_handle();
         drop(stmt);
 
         let blr = message_blr(&params);
