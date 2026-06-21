@@ -94,7 +94,11 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
   `WireCrypt = Disabled` e não anuncia plugin algum no handshake (o mesmo vale
   para o Arc4 já existente). Para validar, subir um servidor com `WireCrypt =
   Enabled/Required` e capturar/rodar contra ele.
-- **Fetch maior que `i16`:** `FETCH_BATCH=200`; avaliar tamanho ideal / streaming.
+- ~~**Tamanho do fetch**~~ ✓ FEITO — o prefetch deixou de ser fixo: agora é por
+  statement via `Statement::set_fetch_size(n)` (padrão 200; mínimo 1). Maior =
+  menos idas ao servidor; menor = menor latência da 1ª linha. 1 teste ao vivo
+  (`custom_fetch_size`, com prefetch 1 forçando vários lotes). (Streaming/iterator
+  assíncrono de linhas continua como possível melhoria futura.)
 - ~~**Limpeza:** avisos de clippy~~ ✓ FEITO — `cargo clippy` limpo (collapsible_if,
   derivable Default em TransactionBuilder, is_multiple_of, unnecessary_cast).
 

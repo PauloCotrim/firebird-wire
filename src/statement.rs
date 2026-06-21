@@ -80,6 +80,8 @@ pub struct Statement {
     /// Abrir o cursor como rolável (`op_execute` com `cursor_flags = 1`).
     /// Definido por [`Statement::set_scrollable`] antes do `execute`.
     scrollable: bool,
+    /// Quantas linhas pedir por `op_fetch` (prefetch). Ver [`Statement::set_fetch_size`].
+    fetch_size: i32,
     dropped: bool,
 }
 
@@ -110,6 +112,19 @@ impl Statement {
     /// Se este statement foi marcado para abrir um cursor rolável.
     pub fn is_scrollable(&self) -> bool {
         self.scrollable
+    }
+
+    /// Define quantas linhas pedir por `op_fetch` (prefetch). Valores maiores
+    /// reduzem o número de idas ao servidor em SELECTs grandes, ao custo de mais
+    /// memória de buffer por lote; valores menores reduzem a latência da primeira
+    /// linha. O padrão é 200. `n` é fixado em pelo menos 1.
+    pub fn set_fetch_size(&mut self, n: i32) {
+        self.fetch_size = n.max(1);
+    }
+
+    /// O tamanho de prefetch atual (ver [`Self::set_fetch_size`]).
+    pub fn fetch_size(&self) -> i32 {
+        self.fetch_size
     }
 
     /// Metadados das colunas de saída (vazio para instruções que não são SELECT).
@@ -198,7 +213,7 @@ impl Statement {
         w.put_i32(self.handle);
         w.put_bytes(&out_blr);
         w.put_i32(0); // message number
-        w.put_i32(FETCH_BATCH);
+        w.put_i32(self.fetch_size);
         conn.io().send(&w).await?;
 
         loop {
@@ -432,6 +447,7 @@ impl Connection {
             buffered: std::collections::VecDeque::new(),
             exhausted: false,
             scrollable: false,
+            fetch_size: FETCH_BATCH,
             dropped: false,
         })
     }

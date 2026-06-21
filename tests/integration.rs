@@ -450,6 +450,36 @@ async fn batch_blob_stream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn custom_fetch_size() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    const SQL: &str = "SELECT emp_no FROM employee ORDER BY emp_no";
+
+    // Baseline com o prefetch padrão.
+    let mut a = conn.prepare(&tx, SQL).await?;
+    a.execute(&mut conn, &tx, &[]).await?;
+    let total = a.fetch_all(&mut conn).await?.len();
+    a.drop_statement(&mut conn).await?;
+    assert!(total > 5, "employee deveria ter mais de 5 funcionários");
+
+    // Prefetch minúsculo (1 linha por op_fetch) força vários lotes; o resultado
+    // deve ser idêntico.
+    let mut b = conn.prepare(&tx, SQL).await?;
+    b.set_fetch_size(1);
+    assert_eq!(b.fetch_size(), 1);
+    b.execute(&mut conn, &tx, &[]).await?;
+    let rows = b.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), total, "fetch_size não deve alterar o total de linhas");
+    b.drop_statement(&mut conn).await?;
+
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn charset_iso8859_1_decode() -> Result<()> {
     let cfg = require_server!();
 
