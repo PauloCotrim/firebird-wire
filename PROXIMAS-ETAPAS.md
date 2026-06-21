@@ -105,8 +105,13 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
 - ~~**Tamanho do fetch**~~ ✓ FEITO — o prefetch deixou de ser fixo: agora é por
   statement via `Statement::set_fetch_size(n)` (padrão 200; mínimo 1). Maior =
   menos idas ao servidor; menor = menor latência da 1ª linha. 1 teste ao vivo
-  (`custom_fetch_size`, com prefetch 1 forçando vários lotes). (Streaming/iterator
-  assíncrono de linhas continua como possível melhoria futura.)
+  (`custom_fetch_size`, com prefetch 1 forçando vários lotes).
+- ~~**Streaming/iterator assíncrono de linhas**~~ ✓ FEITO — `Statement::rows(&mut
+  conn)` devolve um [`RowStream`] que entrega uma linha por vez via `next().await`
+  (buscando lotes sob demanda, sem materializar tudo como `fetch_all`), além de
+  `try_collect` e `try_for_each`. É um *lending iterator* (não `futures::Stream`,
+  para não exigir dependência nem future auto-referencial, já que toma `&mut
+  Connection` emprestado). 1 teste ao vivo (`row_stream`).
 - ~~**Limpeza:** avisos de clippy~~ ✓ FEITO — `cargo clippy` limpo (collapsible_if,
   derivable Default em TransactionBuilder, is_multiple_of, unnecessary_cast).
 

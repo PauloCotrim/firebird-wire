@@ -484,6 +484,62 @@ async fn batch_blob_stream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn row_stream() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    const SQL: &str = "SELECT emp_no FROM employee ORDER BY emp_no";
+
+    // Baseline.
+    let mut base = conn.prepare(&tx, SQL).await?;
+    base.execute(&mut conn, &tx, &[]).await?;
+    let total = base.fetch_all(&mut conn).await?.len();
+    base.drop_statement(&mut conn).await?;
+    assert!(total > 5);
+
+    // 1. Itera via next() com fetch_size pequeno (força vários lotes).
+    let mut s1 = conn.prepare(&tx, SQL).await?;
+    s1.set_fetch_size(2);
+    s1.execute(&mut conn, &tx, &[]).await?;
+    let mut count = 0;
+    let mut prev = i64::MIN;
+    {
+        let mut rows = s1.rows(&mut conn);
+        while let Some(row) = rows.next().await? {
+            let n = row[0].as_i64().expect("emp_no inteiro");
+            assert!(n >= prev, "linhas deveriam vir ordenadas");
+            prev = n;
+            count += 1;
+        }
+    }
+    assert_eq!(count, total);
+    s1.drop_statement(&mut conn).await?;
+
+    // 2. try_collect coleta o restante.
+    let mut s2 = conn.prepare(&tx, SQL).await?;
+    s2.execute(&mut conn, &tx, &[]).await?;
+    let collected = s2.rows(&mut conn).try_collect().await?;
+    assert_eq!(collected.len(), total);
+    s2.drop_statement(&mut conn).await?;
+
+    // 3. try_for_each visita cada linha.
+    let mut s3 = conn.prepare(&tx, SQL).await?;
+    s3.execute(&mut conn, &tx, &[]).await?;
+    let mut seen = 0;
+    s3.rows(&mut conn).try_for_each(|_row| {
+        seen += 1;
+        Ok(())
+    }).await?;
+    assert_eq!(seen, total);
+    s3.drop_statement(&mut conn).await?;
+
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn custom_fetch_size() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

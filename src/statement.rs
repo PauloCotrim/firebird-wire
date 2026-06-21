@@ -261,6 +261,21 @@ impl Statement {
         Ok(rows)
     }
 
+    /// Cria um stream assíncrono sobre as linhas do cursor (ver [`RowStream`]),
+    /// empacotando a conexão para não precisar repassá-la a cada linha. As linhas
+    /// chegam sob demanda (em lotes de [`Self::fetch_size`]), sem materializar
+    /// tudo na memória como [`Self::fetch_all`].
+    ///
+    /// ```text
+    /// let mut rows = stmt.rows(&mut conn);
+    /// while let Some(row) = rows.next().await? {
+    ///     println!("{row:?}");
+    /// }
+    /// ```
+    pub fn rows<'a>(&'a mut self, conn: &'a mut Connection) -> RowStream<'a> {
+        RowStream { stmt: self, conn }
+    }
+
     /// Reposiciona o cursor (rolável) e retorna a única linha naquela posição, ou
     /// `None` se ela cai fora do conjunto de resultados. Envia `op_fetch_scroll`
     /// (FB5); o cursor precisa ter sido aberto com [`Self::set_scrollable`].
@@ -417,6 +432,48 @@ impl Drop for Statement {
         if !self.dropped {
             crate::warn_unclosed("Statement", self.handle);
         }
+    }
+}
+
+/// Stream assíncrono sobre as linhas de um cursor aberto, criado por
+/// [`Statement::rows`]. Entrega uma linha por vez via [`Self::next`], buscando
+/// lotes do servidor sob demanda — não materializa o resultado inteiro.
+///
+/// É um *lending iterator* (`next(&mut self)`), não um `futures::Stream`: como
+/// o stream toma `&mut Connection` emprestado, um `Stream` exigiria um future
+/// auto-referencial (e uma dependência a mais). Para a maioria dos usos, o laço
+/// `while let Some(row) = rows.next().await?` é suficiente; há também
+/// [`Self::try_collect`] e [`Self::try_for_each`].
+pub struct RowStream<'a> {
+    stmt: &'a mut Statement,
+    conn: &'a mut Connection,
+}
+
+impl RowStream<'_> {
+    /// A próxima linha, ou `None` no fim do cursor.
+    pub async fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        self.stmt.fetch(self.conn).await
+    }
+
+    /// Coleta todas as linhas restantes num vetor (equivalente a
+    /// [`Statement::fetch_all`], mas consumindo o stream).
+    pub async fn try_collect(mut self) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        while let Some(row) = self.next().await? {
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Aplica `f` a cada linha restante, parando no primeiro erro.
+    pub async fn try_for_each<F>(mut self, mut f: F) -> Result<()>
+    where
+        F: FnMut(Vec<Value>) -> Result<()>,
+    {
+        while let Some(row) = self.next().await? {
+            f(row)?;
+        }
+        Ok(())
     }
 }
 
