@@ -408,6 +408,7 @@ pub mod blr {
     pub const SHORT: u8 = 7; // + scale(1)
     pub const LONG: u8 = 8; // + scale(1)
     pub const QUAD: u8 = 9; // + scale(1) — também id de blob
+    pub const BLOB2: u8 = 17; // + sub_type(2 LE) + charset(2 LE) — campo BLOB na mensagem
     pub const FLOAT: u8 = 10;
     pub const DOUBLE: u8 = 27;
     pub const D_FLOAT: u8 = 11;

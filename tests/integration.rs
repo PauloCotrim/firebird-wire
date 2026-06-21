@@ -392,6 +392,64 @@ async fn batch_per_row_errors() -> Result<()> {
 }
 
 #[tokio::test]
+async fn batch_blob_stream() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // Tabela com coluna BLOB: a política STREAM é ativada automaticamente.
+    conn.exec_immediate(None, "RECREATE TABLE fdb_batch_b (id INTEGER, dados BLOB SUB_TYPE 0)")
+        .await?;
+
+    let conteudos: [&[u8]; 3] = [
+        b"primeiro blob via batch",
+        b"segundo, um pouco maior, com mais bytes para forcar tamanho diferente",
+        b"3",
+    ];
+
+    let tx = conn.begin().await?;
+    let mut batch = conn
+        .create_batch(&tx, "INSERT INTO fdb_batch_b (id, dados) VALUES (?, ?)")
+        .await?;
+
+    for (i, dados) in conteudos.iter().enumerate() {
+        let blob_id = batch.add_blob(dados)?;
+        batch.add(&[Value::Int(i as i32 + 1), Value::Blob(blob_id)])?;
+    }
+
+    let result = batch.execute(&mut conn, &tx).await?;
+    println!("batch blob: update_counts={:?}", result.update_counts);
+    assert_eq!(result.total, 3);
+    assert!(result.all_succeeded());
+    assert_eq!(result.total_affected(), 3);
+
+    batch.close(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    // Lê de volta cada blob e confere o conteúdo.
+    let tx = conn.begin().await?;
+    let mut stmt = conn
+        .prepare(&tx, "SELECT id, dados FROM fdb_batch_b ORDER BY id")
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), 3);
+    for (i, row) in rows.iter().enumerate() {
+        let blob_id = match row[1] {
+            Value::Blob(id) => id,
+            ref other => panic!("esperava Value::Blob, veio {other:?}"),
+        };
+        let bytes = conn.read_blob(&tx, blob_id).await?;
+        assert_eq!(bytes, conteudos[i], "conteúdo do blob {i} difere");
+    }
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_b").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn scrollable_cursor() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

@@ -305,6 +305,38 @@ Resposta: `op_fetch_response (66)` igual ao fetch normal — `status | count` po
 linha, terminador com `count=0`; `status=100` ⇒ posição fora do cursor (sem
 linha). Ver `Statement::fetch_scroll` em `statement.rs`.
 
+### BLOBs em batch (`op_batch_blob_stream`, 105) — RESOLVIDO
+
+Política `BLOB_STREAM`: no `op_batch_create`, o PB ganha o clumplet
+`TAG_BLOB_POLICY(4) = 3`. Crucial: o `message_blr` da instrução precisa declarar
+a coluna BLOB com **`blr_blob2`(17)** = `17 | sub_type(2 LE) | charset(2 LE)`
+(não `blr_quad`!); senão o servidor não vê coluna de blob e o
+`op_batch_blob_stream` falha com `isc_batch_blobs` ("no blobs associated with
+batch statement"). A linha referencia o blob pelo id (quad) no campo BLOB.
+
+`op_batch_blob_stream` (105): `op | stmt | length(u32) | stream`.
+- `stream` = concatenação CRUA (sem padding entre blobs) dos blobs, cada um
+  `id(quad 8B BE) | size(4B BE) | bpb_size(4B BE) | bpb | dados`. Tudo big-endian.
+- `length` ≠ bytes no wire: é o tamanho do BUFFER que o servidor aloca, a soma de
+  `align4(16 + bpb + dados)` por blob, e **deve ser múltiplo de 4** (senão o
+  servidor rejeita e fecha). O servidor (`xdr_blob_stream`) percorre o stream
+  lendo cada blob com `xdr_quad`/`xdr_u_long`/`xdr_bytes` (que NÃO dão padding no
+  wire) e avança o ponteiro do buffer com alinhamento de 4 SEM consumir bytes do
+  wire; o laço para quando o que resta é < 16 (cabeçalho parcial) ou chega a 0.
+  Por isso o wire carrega menos bytes que `length`. Captura: dados de 14 B →
+  conteúdo wire 30 B, `length` 32; dados de 17 B → 33 B, `length` 36.
+- Os blobs vão ANTES das mensagens (`op_batch_msg`). O `op_batch_msg` codifica o
+  campo BLOB da linha como o id (quad 8B BE), igual a qualquer `Value::Blob`.
+- A próxima op após o blob stream pode começar em offset NÃO múltiplo de 4 (o
+  fbclient coalesce blob_stream + msg num envio só; nós enviamos separados e o
+  servidor lê em sequência sem problema). Resposta: `op_response` normal.
+
+Ver `Batch::add_blob` / `execute` em `batch.rs`. 1 teste ao vivo
+(`batch_blob_stream`, 3 blobs de tamanhos diferentes, lidos de volta e conferidos).
+
 ### Ops restantes a capturar quando necessário
-- BLOBs em batch: op_batch_regblob(104), op_batch_blob_stream(105),
-  op_batch_set_bpb(106) — capturar das Partes 2–4 de `11.batch.cpp`.
+- `op_batch_regblob` (104): `op | stmt | existing_id(quad) | batch_id(quad)` —
+  mapeia um BLOB já criado (via `create_blob`/IBlob) a um id do batch. Confirmado
+  no `protocol.cpp` (P_BATCH_REGBLOB = stmt short + 2 quads). Parte 4 do
+  `11.batch.cpp`; menos comum, ainda não implementado.
+- `op_batch_set_bpb` (106) — para BLOBs segmentados/com BPB no batch.

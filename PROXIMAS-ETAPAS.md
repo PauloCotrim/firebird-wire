@@ -44,9 +44,18 @@ alias/owner e os op codes de blob.
 
 `Connection::create_batch` + tipo `Batch` (ver `batch.rs`). Decodificado de um
 cliente C++ `IBatch` (ver `PROTOCOL-NOTES.md` para o layout completo dos op codes
-99–103). Reporta contagens e erros por linha. Falta apenas o suporte a BLOBs em
-batch (`op_batch_regblob` 104 / `op_batch_blob_stream` 105) — capturar das
-Partes 2–4 de `/opt/firebird/examples/interfaces/11.batch.cpp` quando necessário.
+99–103). Reporta contagens e erros por linha.
+
+**BLOBs em batch (política STREAM)** — ✓ FEITO. Se a instrução tem coluna BLOB,
+`create_batch` ativa `TAG_BLOB_POLICY = BLOB_STREAM`; o chamador usa
+`Batch::add_blob(dados) -> id` e põe o id (`Value::Blob`) na linha. Em `execute`
+os blobs vão em `op_batch_blob_stream` (105) ANTES das mensagens. Layout em
+`PROTOCOL-NOTES.md`; decodificado da Parte 3 do `11.batch.cpp` + do
+`xdr_blob_stream` do servidor. 1 teste ao vivo (`batch_blob_stream`). Também foi
+preciso emitir `blr_blob2` (17) para colunas BLOB no `message_blr` (antes era
+`blr_quad`), senão o servidor não reconhece a coluna como blob.
+Falta `op_batch_regblob` (104), usado para mapear um BLOB pré-existente (criado
+via `create_blob`) a um id do batch — Parte 4 do `11.batch.cpp`, menos comum.
 
 ## 2. ~~Escrita de BLOBs~~ ✓ FEITO
 

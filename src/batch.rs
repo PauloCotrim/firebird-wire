@@ -27,6 +27,27 @@
 //!
 //! O cliente C agrupa create+msg e usa `op_batch_sync` (110) para drenar as
 //! respostas adiadas; nós, sendo síncronos, lemos a resposta de cada op na hora.
+//!
+//! # BLOBs em lote (política STREAM, `op_batch_blob_stream` 105)
+//!
+//! Quando a instrução tem coluna BLOB, [`Connection::create_batch`] ativa a
+//! política `BLOB_STREAM` no PB (`TAG_BLOB_POLICY` = 3). O chamador então usa
+//! [`Batch::add_blob`] para registrar cada blob e recebe um id (quad) para pôr
+//! no campo da linha. Em [`Batch::execute`], antes das mensagens, enviamos:
+//!
+//! `op_batch_blob_stream` (105): `stmt | length(u32) | stream`. O `stream` é a
+//! concatenação CRUA (sem padding) dos blobs, cada um `id(quad 8B BE) | size(4B
+//! BE) | bpb_size(4B BE) | bpb | dados`. O `length` NÃO é o número de bytes no
+//! wire: é o tamanho do buffer que o servidor aloca — a soma de `align4(16 +
+//! bpb + dados)` de cada blob — e deve ser múltiplo de 4 (o servidor rejeita
+//! caso contrário). Ao percorrer o stream (ver `xdr_blob_stream` no servidor),
+//! ele avança o ponteiro do buffer com alinhamento de 4 SEM consumir bytes do
+//! wire para o padding; o laço termina quando o que resta é menor que um
+//! cabeçalho (16 B) ou chega a zero. Por isso o wire carrega menos bytes que
+//! `length`, e a próxima op pode começar em offset não múltiplo de 4.
+//! Confirmado por captura do `11.batch.cpp` (conteúdo 30 B → length 32; 33 B →
+//! 36) e pelo código do servidor. Os blobs vão **antes** das mensagens porque a
+//! linha referencia o id já registrado.
 
 use crate::blr::message_blr;
 use crate::connection::Connection;
@@ -50,8 +71,31 @@ pub struct Batch {
     /// Mensagens já codificadas mas ainda não enviadas/executadas.
     pending: Vec<u8>,
     pending_count: u32,
+    /// Stream de BLOBs acumulado (cabeçalho + dados de cada blob), ainda não
+    /// enviado. Só usado em batches com coluna BLOB (política STREAM). Os blobs
+    /// vão concatenados SEM padding no wire (o servidor reconstrói o alinhamento
+    /// no buffer dele).
+    pending_blobs: Vec<u8>,
+    /// Comprimento *alinhado* do stream de blobs (campo `p_batch_blob_data` do
+    /// op_batch_blob_stream): a soma de `align4(16 + dados)` de cada blob. É o
+    /// tamanho do buffer que o servidor aloca, e deve ser múltiplo de
+    /// `BLOB_ALIGN` (o servidor rejeita caso contrário). Sempre `>=` o número de
+    /// bytes efetivamente enviados.
+    blob_stream_len: usize,
+    /// Próximo id (quad) a atribuir em [`Batch::add_blob`]. Começa em 1; o id 0
+    /// é reservado (quad nulo).
+    next_blob_id: u64,
+    /// Verdadeiro se a instrução tem ao menos uma coluna BLOB (política STREAM
+    /// ativada na criação).
+    blob_stream: bool,
     closed: bool,
 }
+
+/// Alinhamento (em bytes) de cada blob dentro do stream de `op_batch_blob_stream`.
+/// O servidor FB5 usa 4 (confirmado por captura: conteúdo de 30 B → campo de
+/// comprimento 32; de 33 B → 36). É o valor que `IBatch::getBlobAlignment`
+/// retorna para o protocolo remoto.
+const BLOB_ALIGN: usize = 4;
 
 impl Batch {
     /// O handle da instrução/batch no servidor.
@@ -67,6 +111,41 @@ impl Batch {
     /// Os metadados dos parâmetros de entrada (a forma de cada linha esperada).
     pub fn params(&self) -> &[ColumnMeta] {
         &self.params
+    }
+
+    /// Registra um BLOB no stream do lote e devolve seu id (quad), que deve ser
+    /// posto no campo BLOB da linha correspondente como [`Value::Blob`].
+    ///
+    /// Só funciona em batches cuja instrução tem coluna BLOB (a política STREAM é
+    /// ativada automaticamente em [`Connection::create_batch`] nesse caso). Como
+    /// [`Self::add`], apenas acumula na memória; os blobs vão à rede em
+    /// [`Self::execute`], **antes** das mensagens que os referenciam.
+    ///
+    /// ```text
+    /// let id = batch.add_blob(b"conteudo do blob")?;
+    /// batch.add(&[Value::Text("BAT31".into()), Value::Blob(id)])?;
+    /// ```
+    pub fn add_blob(&mut self, data: &[u8]) -> Result<u64> {
+        if !self.blob_stream {
+            return Err(Error::protocol(
+                "add_blob exige uma coluna BLOB na instrução do batch",
+            ));
+        }
+        let id = self.next_blob_id;
+        self.next_blob_id += 1;
+        // Cabeçalho + dados do blob, no wire e tudo big-endian (como o resto do
+        // protocolo): id(quad 8B) | size(4B) | bpb_size(4B = 0) | dados. Sem BPB
+        // e SEM padding — os blobs vão concatenados crus; o servidor avança o
+        // ponteiro do buffer dele com alinhamento de 4 ao percorrer o stream.
+        self.pending_blobs.extend_from_slice(&id.to_be_bytes());
+        self.pending_blobs.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        self.pending_blobs.extend_from_slice(&0u32.to_be_bytes());
+        self.pending_blobs.extend_from_slice(data);
+        // O campo de comprimento conta o tamanho ALINHADO (16 do cabeçalho +
+        // dados, arredondado para múltiplo de BLOB_ALIGN) de cada blob.
+        let content = 16 + data.len();
+        self.blob_stream_len += content.div_ceil(BLOB_ALIGN) * BLOB_ALIGN;
+        Ok(id)
     }
 
     /// Adiciona uma linha ao lote. Os valores devem corresponder, em número e
@@ -85,6 +164,21 @@ impl Batch {
     pub async fn execute(&mut self, conn: &mut Connection, tx: &Transaction) -> Result<BatchResult> {
         if self.closed {
             return Err(Error::protocol("batch já foi fechado"));
+        }
+        // 0. Envia os BLOBs pendentes (op_batch_blob_stream) ANTES das mensagens,
+        //    pois cada mensagem referencia um id de blob já registrado.
+        if !self.pending_blobs.is_empty() {
+            let mut w = op_packet(op::BATCH_BLOB_STREAM);
+            w.put_i32(self.handle);
+            // Comprimento alinhado (≥ bytes no wire), depois os blobs crus. Não
+            // alinhamos o pacote: o servidor recompõe o alinhamento internamente
+            // e a próxima op pode começar em offset não múltiplo de 4.
+            w.put_i32(self.blob_stream_len as i32);
+            w.put_raw(&self.pending_blobs);
+            conn.io().send(&w).await?;
+            read_response(conn.io()).await?;
+            self.pending_blobs.clear();
+            self.blob_stream_len = 0;
         }
         // 1. Envia as mensagens pendentes (op_batch_msg), se houver.
         if self.pending_count > 0 {
@@ -112,6 +206,8 @@ impl Batch {
     pub async fn cancel(&mut self, conn: &mut Connection) -> Result<()> {
         self.pending.clear();
         self.pending_count = 0;
+        self.pending_blobs.clear();
+        self.blob_stream_len = 0;
         let mut w = op_packet(op::BATCH_CANCEL);
         w.put_i32(self.handle);
         conn.io().send(&w).await?;
@@ -156,11 +252,20 @@ impl Connection {
         let blr = message_blr(&params);
         let msglen = message_buffer_len(&params);
 
+        // Se houver coluna BLOB, ativa a política STREAM: os blobs são enviados
+        // em `op_batch_blob_stream` e a linha referencia o id (ver `add_blob`).
+        let blob_stream = params
+            .iter()
+            .any(|c| sql_type::base(c.sql_type) == sql_type::BLOB);
+
         // Buffer de parâmetros do batch: byte de versão (1) seguido de clumplets
         // com comprimento LE de 4 bytes. Pede contagens por linha e multierro.
         let mut pb = ParameterBuffer::new(1);
         pb.bytes_be_len4(batch_tag::RECORD_COUNTS, &1u32.to_le_bytes());
         pb.bytes_be_len4(batch_tag::MULTIERROR, &1u32.to_le_bytes());
+        if blob_stream {
+            pb.bytes_be_len4(batch_tag::BLOB_POLICY, &(blob_policy::STREAM as u32).to_le_bytes());
+        }
 
         let mut w = op_packet(op::BATCH_CREATE);
         w.put_i32(handle);
@@ -170,7 +275,17 @@ impl Connection {
         self.io().send(&w).await?;
         read_response(self.io()).await?;
 
-        Ok(Batch { handle, params, pending: Vec::new(), pending_count: 0, closed: false })
+        Ok(Batch {
+            handle,
+            params,
+            pending: Vec::new(),
+            pending_count: 0,
+            pending_blobs: Vec::new(),
+            blob_stream_len: 0,
+            next_blob_id: 1,
+            blob_stream,
+            closed: false,
+        })
     }
 }
 

@@ -68,8 +68,13 @@ fn push_type(b: &mut Vec<u8>, col: &ColumnMeta) {
         sql_type::TYPE_TIME => b.push(blr::SQL_TIME),
         sql_type::TIMESTAMP => b.push(blr::TIMESTAMP),
         sql_type::BLOB => {
-            b.push(blr::QUAD);
-            b.push(0);
+            // blr_blob2: o servidor reconhece o campo como BLOB pela metadata
+            // (necessário para o batch habilitar o stream de blobs). Segue o
+            // sub_type (2 LE) e o charset (2 LE); fbclient usa 0/0 no campo da
+            // mensagem (a conversão para o tipo da coluna é feita no servidor).
+            b.push(blr::BLOB2);
+            b.extend_from_slice(&(col.sub_type as u16).to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
         }
         sql_type::BOOLEAN => b.push(blr::BOOL),
         sql_type::DEC16 => b.push(blr::DEC64),
