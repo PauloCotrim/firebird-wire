@@ -67,7 +67,7 @@ fn type_size_align(col: &ColumnMeta) -> (usize, usize) {
 /// transmissão que o servidor espera: um bitmap de nulos little-endian inicial
 /// seguido do valor XDR de cada coluna NÃO-NULL, em ordem. O inverso de
 /// [`decode_row`].
-pub fn encode_row(columns: &[ColumnMeta], values: &[Value]) -> Result<Vec<u8>> {
+pub fn encode_row(columns: &[ColumnMeta], values: &[Value], charset: Charset) -> Result<Vec<u8>> {
     if values.len() != columns.len() {
         return Err(Error::protocol(format!(
             "parameter count mismatch: statement expects {}, got {}",
@@ -80,7 +80,7 @@ pub fn encode_row(columns: &[ColumnMeta], values: &[Value]) -> Result<Vec<u8>> {
         if val.is_null() {
             out[i / 8] |= 1 << (i % 8);
         } else {
-            encode_value(&mut out, col, val)?;
+            encode_value(&mut out, col, val, charset)?;
         }
     }
     Ok(out)
@@ -96,7 +96,7 @@ fn put_pad(out: &mut Vec<u8>, data_len: usize) {
     }
 }
 
-fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value) -> Result<()> {
+fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Charset) -> Result<()> {
     let mismatch = || Error::protocol(format!("value does not fit column type {}", col.sql_type));
     match sql_type::base(col.sql_type) {
         sql_type::SHORT => put_i32_be(out, i32::from(val.as_i64().ok_or_else(mismatch)? as i16)),
@@ -117,15 +117,15 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value) -> Result<()> 
             _ => return Err(mismatch()),
         },
         sql_type::VARYING => {
-            let bytes = text_bytes(val)?;
+            let bytes = text_bytes(val, charset)?;
             put_i32_be(out, bytes.len() as i32);
-            out.extend_from_slice(bytes);
+            out.extend_from_slice(&bytes);
             put_pad(out, bytes.len());
         }
         sql_type::TEXT => {
-            let bytes = text_bytes(val)?;
+            let bytes = text_bytes(val, charset)?;
             let n = col.length as usize;
-            out.extend_from_slice(bytes);
+            out.extend_from_slice(&bytes);
             // Preenche CHAR(n) à direita com espaços até sua largura declarada.
             for _ in bytes.len()..n {
                 out.push(b' ');
@@ -154,10 +154,12 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value) -> Result<()> 
     Ok(())
 }
 
-fn text_bytes(val: &Value) -> Result<&[u8]> {
+fn text_bytes(val: &Value, charset: Charset) -> Result<std::borrow::Cow<'_, [u8]>> {
+    use std::borrow::Cow;
     match val {
-        Value::Text(s) => Ok(s.as_bytes()),
-        Value::Bytes(b) => Ok(b),
+        // Texto é transcodificado para o charset da conexão; bytes/OCTETS vão crus.
+        Value::Text(s) => Ok(Cow::Owned(charset.encode(s))),
+        Value::Bytes(b) => Ok(Cow::Borrowed(b)),
         _ => Err(Error::protocol("expected a text/bytes value")),
     }
 }
@@ -288,7 +290,8 @@ mod tests {
         // Cada mensagem codificada deve terminar em fronteira de 4 bytes para que
         // a concatenação no op_batch_msg permaneça alinhada.
         let cols = [col(sql_type::LONG, 4), col(sql_type::VARYING, 20)];
-        let msg = encode_row(&cols, &[Value::Int(1), Value::Text("um".into())]).unwrap();
+        let msg =
+            encode_row(&cols, &[Value::Int(1), Value::Text("um".into())], Charset::Utf8).unwrap();
         assert_eq!(msg.len() % 4, 0);
         assert_eq!(msg.len(), 16); // bitmap(4) + int(4) + len(4)+"um"+pad(2)=8
     }

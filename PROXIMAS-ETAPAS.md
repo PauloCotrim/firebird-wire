@@ -119,11 +119,12 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
   vazamento de handle no servidor. `create_batch` usa `Statement::forget_handle`
   para não disparar o aviso ao transferir o handle ao `Batch`. (Continua sem
   fechar automaticamente — `Drop` não pode ser async.)
-- ~~Charsets não-UTF8~~ ✓ FEITO (comuns) — `charset.rs` (`Charset`) decodifica o
-  texto conforme o charset da CONEXÃO (o servidor translitera para ele antes de
-  enviar). Suporta UTF-8 (padrão), ISO-8859-1/Latin-1 e Windows-1252
-  nativamente; outros nomes recaem em UTF-8 com perdas. Colunas `OCTETS`
-  continuam binárias. 1 teste ao vivo (`charset_iso8859_1_decode`, lendo por uma
-  conexão ISO8859_1). Falta: charsets multibyte além de UTF-8 (ex.: SJIS, EUC) e
-  o caminho de ENCODE para conexões não-UTF8 (hoje o INSERT manda sempre bytes
-  UTF-8, então insira por uma conexão UTF8).
+- ~~Charsets não-UTF8 (leitura e escrita)~~ ✓ FEITO (comuns) — `charset.rs`
+  (`Charset`) decodifica E codifica o texto conforme o charset da CONEXÃO.
+  `Charset::decode` (servidor → `String`) e `Charset::encode` (`String` →
+  servidor, para parâmetros de INSERT/UPDATE). Suporta UTF-8 (padrão),
+  ISO-8859-1/Latin-1 e Windows-1252 nativamente; outros nomes recaem em UTF-8.
+  Colunas `OCTETS` continuam binárias; caracteres não representáveis no charset
+  alvo viram `?` no encode. 2 testes ao vivo: `charset_iso8859_1_decode` e
+  `charset_win1252_roundtrip` (insert+select numa conexão WIN1252, com €, travessão
+  e aspas curvas). Falta: charsets multibyte além de UTF-8 (ex.: SJIS, EUC).

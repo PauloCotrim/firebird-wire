@@ -148,7 +148,11 @@ impl Statement {
     ) -> Result<()> {
         let has_params = !self.params.is_empty();
         let in_blr = if has_params { message_blr(&self.params) } else { Vec::new() };
-        let message = if has_params { encode_row(&self.params, params)? } else { Vec::new() };
+        let message = if has_params {
+            encode_row(&self.params, params, conn.charset())?
+        } else {
+            Vec::new()
+        };
 
         let mut w = op_packet(op::EXECUTE);
         w.put_i32(self.handle);

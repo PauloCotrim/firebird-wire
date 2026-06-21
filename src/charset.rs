@@ -49,6 +49,20 @@ impl Charset {
             Charset::Win1252 => raw.iter().map(|&b| win1252_char(b)).collect(),
         }
     }
+
+    /// Codifica uma `&str` para bytes conforme o charset (o inverso de
+    /// [`Self::decode`]), para enviar parâmetros de texto ao servidor numa conexão
+    /// não-UTF8. Caracteres não representáveis no charset alvo viram `?`.
+    pub fn encode(self, s: &str) -> Vec<u8> {
+        match self {
+            Charset::Utf8 | Charset::Unknown => s.as_bytes().to_vec(),
+            Charset::Latin1 => s
+                .chars()
+                .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
+                .collect(),
+            Charset::Win1252 => s.chars().map(win1252_byte).collect(),
+        }
+    }
 }
 
 /// Mapeia um byte Windows-1252 para `char`. Igual a Latin-1 fora de
@@ -88,6 +102,44 @@ fn win1252_char(b: u8) -> char {
     }
 }
 
+/// Mapeia um `char` para um byte Windows-1252 (inverso de [`win1252_char`]).
+/// Caracteres fora do CP-1252 viram `?`.
+fn win1252_byte(c: char) -> u8 {
+    match c {
+        '\u{20AC}' => 0x80,
+        '\u{201A}' => 0x82,
+        '\u{0192}' => 0x83,
+        '\u{201E}' => 0x84,
+        '\u{2026}' => 0x85,
+        '\u{2020}' => 0x86,
+        '\u{2021}' => 0x87,
+        '\u{02C6}' => 0x88,
+        '\u{2030}' => 0x89,
+        '\u{0160}' => 0x8A,
+        '\u{2039}' => 0x8B,
+        '\u{0152}' => 0x8C,
+        '\u{017D}' => 0x8E,
+        '\u{2018}' => 0x91,
+        '\u{2019}' => 0x92,
+        '\u{201C}' => 0x93,
+        '\u{201D}' => 0x94,
+        '\u{2022}' => 0x95,
+        '\u{2013}' => 0x96,
+        '\u{2014}' => 0x97,
+        '\u{02DC}' => 0x98,
+        '\u{2122}' => 0x99,
+        '\u{0161}' => 0x9A,
+        '\u{203A}' => 0x9B,
+        '\u{0153}' => 0x9C,
+        '\u{017E}' => 0x9E,
+        '\u{0178}' => 0x9F,
+        // < 0x80 e 0xA0..=0xFF: igual a Latin-1 (o code point é o byte). As
+        // posições C1 não atribuídas (0x81/0x8D/0x8F/0x90/0x9D) também caem aqui.
+        c if (c as u32) <= 0xFF => c as u8,
+        _ => b'?',
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +171,24 @@ mod tests {
     #[test]
     fn utf8_passthrough() {
         assert_eq!(Charset::Utf8.decode("café €".as_bytes()), "café €");
+    }
+
+    #[test]
+    fn encode_inverts_decode() {
+        for (cs, bytes) in [
+            (Charset::Latin1, vec![0x48u8, 0xE9, 0xF1, 0x20, 0xFF]),
+            (Charset::Win1252, vec![0x80, 0x93, 0x94, 0xE9, 0x97]),
+        ] {
+            let s = cs.decode(&bytes);
+            assert_eq!(cs.encode(&s), bytes, "roundtrip falhou para {cs:?}");
+        }
+    }
+
+    #[test]
+    fn encode_unrepresentable_is_question_mark() {
+        // '€' (U+20AC) não existe em Latin-1.
+        assert_eq!(Charset::Latin1.encode("a€b"), b"a?b");
+        // CJK fora de Win-1252.
+        assert_eq!(Charset::Win1252.encode("x\u{4E00}y"), b"x?y");
     }
 }

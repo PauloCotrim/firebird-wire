@@ -104,6 +104,9 @@ pub struct Batch {
     /// Verdadeiro se a instrução tem ao menos uma coluna BLOB (política STREAM
     /// ativada na criação).
     blob_stream: bool,
+    /// Charset da conexão, usado para codificar parâmetros de texto em
+    /// [`Batch::add`] (capturado na criação, já que `add` não recebe a conexão).
+    charset: crate::charset::Charset,
     /// BPB padrão a aplicar aos blobs do batch (`op_batch_set_bpb`), se definido.
     /// Enviado em [`Batch::execute`] antes do stream de blobs.
     default_bpb: Option<Vec<u8>>,
@@ -267,7 +270,7 @@ impl Batch {
     /// tipo, aos parâmetros da instrução (ver [`Self::params`]). Apenas acumula
     /// na memória; nada vai à rede até [`Self::execute`].
     pub fn add(&mut self, values: &[Value]) -> Result<()> {
-        let msg = encode_row(&self.params, values)?;
+        let msg = encode_row(&self.params, values, self.charset)?;
         self.pending.extend_from_slice(&msg);
         self.pending_count += 1;
         Ok(())
@@ -430,6 +433,7 @@ impl Connection {
             pending_regblobs: Vec::new(),
             next_blob_id: 1,
             blob_stream,
+            charset: self.charset(),
             default_bpb: None,
             blob_segmented: false,
             closed: false,

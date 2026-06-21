@@ -517,6 +517,36 @@ async fn charset_iso8859_1_decode() -> Result<()> {
 }
 
 #[tokio::test]
+async fn charset_win1252_roundtrip() -> Result<()> {
+    let cfg = require_server!();
+    // Texto com caracteres específicos de Windows-1252 (€, aspas curvas, —) +
+    // acentos. Testa o caminho de ENCODE (String → bytes Win-1252 ao inserir) e
+    // de DECODE (bytes → String ao ler), ambos pela mesma conexão WIN1252.
+    const TXT: &str = "preço €99 \u{2014} \u{201C}olá\u{201D} café";
+
+    let cfg_win = cfg.clone().charset("WIN1252");
+    let mut conn = Connection::connect(&cfg_win).await?;
+    conn.exec_immediate(None, "RECREATE TABLE fdb_cs2 (txt VARCHAR(40) CHARACTER SET WIN1252)")
+        .await?;
+
+    let tx = conn.begin().await?;
+    let mut ins = conn.prepare(&tx, "INSERT INTO fdb_cs2 (txt) VALUES (?)").await?;
+    ins.execute(&mut conn, &tx, &[Value::Text(TXT.into())]).await?;
+    ins.drop_statement(&mut conn).await?;
+
+    let mut stmt = conn.prepare(&tx, "SELECT txt FROM fdb_cs2").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    assert_eq!(row[0].as_str(), Some(TXT));
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_cs2").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn batch_segmented_blob() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;
