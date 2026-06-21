@@ -48,6 +48,10 @@
 //! Confirmado por captura do `11.batch.cpp` (conteúdo 30 B → length 32; 33 B →
 //! 36) e pelo código do servidor. Os blobs vão **antes** das mensagens porque a
 //! linha referencia o id já registrado.
+//!
+//! `op_batch_regblob` (104): `stmt | id_existente(quad 8B BE) | id_batch(quad)`.
+//! Mapeia um BLOB já gravado fora do batch ([`Connection::write_blob`]) a um id
+//! local, evitando reenviar os dados. Ver [`Batch::register_blob`].
 
 use crate::blr::message_blr;
 use crate::connection::Connection;
@@ -82,8 +86,12 @@ pub struct Batch {
     /// `BLOB_ALIGN` (o servidor rejeita caso contrário). Sempre `>=` o número de
     /// bytes efetivamente enviados.
     blob_stream_len: usize,
-    /// Próximo id (quad) a atribuir em [`Batch::add_blob`]. Começa em 1; o id 0
-    /// é reservado (quad nulo).
+    /// Registros pendentes de BLOBs pré-existentes (`op_batch_regblob`): cada par
+    /// é `(id_existente, id_no_batch)`. Enviados em [`Batch::execute`] antes das
+    /// mensagens, junto com o stream de blobs.
+    pending_regblobs: Vec<(u64, u64)>,
+    /// Próximo id (quad) a atribuir em [`Batch::add_blob`]/[`Batch::register_blob`].
+    /// Começa em 1; o id 0 é reservado (quad nulo).
     next_blob_id: u64,
     /// Verdadeiro se a instrução tem ao menos uma coluna BLOB (política STREAM
     /// ativada na criação).
@@ -148,6 +156,26 @@ impl Batch {
         Ok(id)
     }
 
+    /// Mapeia um BLOB **já existente** (criado fora do batch, p.ex. via
+    /// [`Connection::write_blob`]/[`Connection::create_blob`]) para um id local
+    /// do batch e devolve esse id, que deve ir no campo BLOB da linha como
+    /// [`Value::Blob`]. Útil para reaproveitar BLOBs grandes já gravados sem
+    /// reenviá-los pelo stream (`op_batch_regblob`).
+    ///
+    /// Como [`Self::add_blob`], só vale em batches com coluna BLOB; o registro é
+    /// acumulado e enviado em [`Self::execute`], antes das mensagens.
+    pub fn register_blob(&mut self, existing_id: u64) -> Result<u64> {
+        if !self.blob_stream {
+            return Err(Error::protocol(
+                "register_blob exige uma coluna BLOB na instrução do batch",
+            ));
+        }
+        let batch_id = self.next_blob_id;
+        self.next_blob_id += 1;
+        self.pending_regblobs.push((existing_id, batch_id));
+        Ok(batch_id)
+    }
+
     /// Adiciona uma linha ao lote. Os valores devem corresponder, em número e
     /// tipo, aos parâmetros da instrução (ver [`Self::params`]). Apenas acumula
     /// na memória; nada vai à rede até [`Self::execute`].
@@ -180,6 +208,18 @@ impl Batch {
             self.pending_blobs.clear();
             self.blob_stream_len = 0;
         }
+        // 0b. Registra BLOBs pré-existentes (op_batch_regblob), também antes das
+        //     mensagens. Layout: stmt | id_existente(quad 8B BE) | id_batch(quad).
+        if !self.pending_regblobs.is_empty() {
+            for (existing_id, batch_id) in std::mem::take(&mut self.pending_regblobs) {
+                let mut w = op_packet(op::BATCH_REGBLOB);
+                w.put_i32(self.handle);
+                w.put_raw(&existing_id.to_be_bytes());
+                w.put_raw(&batch_id.to_be_bytes());
+                conn.io().send(&w).await?;
+                read_response(conn.io()).await?;
+            }
+        }
         // 1. Envia as mensagens pendentes (op_batch_msg), se houver.
         if self.pending_count > 0 {
             let mut w = op_packet(op::BATCH_MSG);
@@ -208,6 +248,7 @@ impl Batch {
         self.pending_count = 0;
         self.pending_blobs.clear();
         self.blob_stream_len = 0;
+        self.pending_regblobs.clear();
         let mut w = op_packet(op::BATCH_CANCEL);
         w.put_i32(self.handle);
         conn.io().send(&w).await?;
@@ -282,6 +323,7 @@ impl Connection {
             pending_count: 0,
             pending_blobs: Vec::new(),
             blob_stream_len: 0,
+            pending_regblobs: Vec::new(),
             next_blob_id: 1,
             blob_stream,
             closed: false,

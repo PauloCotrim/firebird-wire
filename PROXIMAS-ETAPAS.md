@@ -54,8 +54,11 @@ os blobs vão em `op_batch_blob_stream` (105) ANTES das mensagens. Layout em
 `xdr_blob_stream` do servidor. 1 teste ao vivo (`batch_blob_stream`). Também foi
 preciso emitir `blr_blob2` (17) para colunas BLOB no `message_blr` (antes era
 `blr_quad`), senão o servidor não reconhece a coluna como blob.
-Falta `op_batch_regblob` (104), usado para mapear um BLOB pré-existente (criado
-via `create_blob`) a um id do batch — Parte 4 do `11.batch.cpp`, menos comum.
+**`op_batch_regblob` (104)** — ✓ FEITO. `Batch::register_blob(id_existente) ->
+id_batch` mapeia um BLOB já gravado (via `write_blob`/`create_blob`) para um id
+local do batch, sem reenviar os dados. Layout `stmt | quad existente | quad
+batch`. 1 teste ao vivo (`batch_register_blob`). Falta só `op_batch_set_bpb`
+(106), para BLOBs segmentados/com BPB.
 
 ## 2. ~~Escrita de BLOBs~~ ✓ FEITO
 

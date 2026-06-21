@@ -450,6 +450,53 @@ async fn batch_blob_stream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn batch_register_blob() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    conn.exec_immediate(None, "RECREATE TABLE fdb_batch_r (id INTEGER, dados BLOB SUB_TYPE 0)")
+        .await?;
+
+    let tx = conn.begin().await?;
+
+    // Cria um BLOB "à parte" (API tradicional) e pega seu id.
+    let conteudo = b"blob pre-existente registrado no batch via op_batch_regblob";
+    let real_id = conn.write_blob(&tx, conteudo).await?;
+
+    // Registra esse blob no batch e usa o id devolvido na linha.
+    let mut batch = conn
+        .create_batch(&tx, "INSERT INTO fdb_batch_r (id, dados) VALUES (?, ?)")
+        .await?;
+    let batch_id = batch.register_blob(real_id)?;
+    batch.add(&[Value::Int(1), Value::Blob(batch_id)])?;
+
+    let result = batch.execute(&mut conn, &tx).await?;
+    assert_eq!(result.total, 1);
+    assert!(result.all_succeeded());
+
+    batch.close(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    // Lê de volta e confere que o conteúdo é o do blob pré-existente.
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT dados FROM fdb_batch_r WHERE id = 1").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    let blob_id = match row[0] {
+        Value::Blob(id) => id,
+        ref other => panic!("esperava Value::Blob, veio {other:?}"),
+    };
+    let bytes = conn.read_blob(&tx, blob_id).await?;
+    assert_eq!(bytes, conteudo);
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_r").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn scrollable_cursor() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;
