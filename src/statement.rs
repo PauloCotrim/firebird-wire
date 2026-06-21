@@ -223,7 +223,8 @@ impl Statement {
                 return Ok(());
             }
 
-            let row = decode_row(conn.io(), &self.columns).await?;
+            let cs = conn.charset();
+            let row = decode_row(conn.io(), &self.columns, cs).await?;
             self.buffered.push_back(row);
             if status == 100 {
                 self.exhausted = true;
@@ -289,7 +290,8 @@ impl Statement {
             if count == 0 {
                 break;
             }
-            let r = decode_row(conn.io(), &self.columns).await?;
+            let cs = conn.charset();
+            let r = decode_row(conn.io(), &self.columns, cs).await?;
             if row.is_none() {
                 row = Some(r);
             }

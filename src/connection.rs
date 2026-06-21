@@ -27,6 +27,7 @@ pub struct Connection {
     stream: FbStream,
     db_handle: i32,
     protocol_version: i32,
+    charset: crate::charset::Charset,
 }
 
 impl Connection {
@@ -109,7 +110,17 @@ impl Connection {
         stream.send(&w).await?;
         let resp = attach_response(&mut stream).await?;
 
-        Ok(Connection { stream, db_handle: resp.handle, protocol_version })
+        Ok(Connection {
+            stream,
+            db_handle: resp.handle,
+            protocol_version,
+            charset: crate::charset::Charset::from_name(&config.charset),
+        })
+    }
+
+    /// O charset da conexão, usado para decodificar texto vindo do servidor.
+    pub fn charset(&self) -> crate::charset::Charset {
+        self.charset
     }
 
     /// Desanexa (detach) do banco de dados e fecha o socket.

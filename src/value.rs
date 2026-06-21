@@ -17,7 +17,8 @@ pub enum Value {
     BigInt(i64),
     Float(f32),
     Double(f64),
-    /// Texto CHAR/VARCHAR (decodificado com perdas como UTF-8/latin-1 pelo charset do chamador).
+    /// Texto CHAR/VARCHAR, decodificado conforme o charset da conexão (ver
+    /// [`crate::charset::Charset`]); CHAR vem sem o padding de espaços à direita.
     Text(String),
     /// Bytes brutos para CHAR/VARCHAR binário (OCTETS) e outros dados opacos.
     Bytes(Vec<u8>),

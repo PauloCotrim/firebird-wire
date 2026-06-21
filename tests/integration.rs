@@ -450,6 +450,43 @@ async fn batch_blob_stream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn charset_iso8859_1_decode() -> Result<()> {
+    let cfg = require_server!();
+
+    // Só caracteres representáveis em Latin-1 (é, ñ, ç, ã).
+    const TXT: &str = "café señor ação";
+
+    // 1. Insere por uma conexão UTF8 (encode correto). A coluna é ISO8859_1, então
+    //    o servidor translitera UTF8 → Latin-1 ao armazenar.
+    let mut conn = Connection::connect(&cfg).await?;
+    conn.exec_immediate(None, "RECREATE TABLE fdb_cs (txt VARCHAR(30) CHARACTER SET ISO8859_1)")
+        .await?;
+    let tx = conn.begin().await?;
+    let mut ins = conn.prepare(&tx, "INSERT INTO fdb_cs (txt) VALUES (?)").await?;
+    ins.execute(&mut conn, &tx, &[Value::Text(TXT.into())]).await?;
+    ins.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+
+    // 2. Lê pela conexão ISO8859_1: coluna e conexão em Latin-1, então o servidor
+    //    entrega os bytes crus (ex.: 'é' = 0xE9), que o decoder converte de volta.
+    //    Decodificar esses bytes como UTF-8 daria caractere de substituição.
+    let cfg_latin1 = cfg.clone().charset("ISO8859_1");
+    let mut conn = Connection::connect(&cfg_latin1).await?;
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT txt FROM fdb_cs").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    assert_eq!(row[0].as_str(), Some(TXT));
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_cs").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn batch_register_blob() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

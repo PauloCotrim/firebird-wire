@@ -19,6 +19,7 @@
 pub mod auth;
 pub mod batch;
 pub mod blob;
+pub mod charset;
 pub mod blr;
 pub mod config;
 pub mod connection;
@@ -32,6 +33,7 @@ pub mod wire;
 
 pub use batch::{Batch, BatchError, BatchResult};
 pub use blob::{Blob, BlobWriter};
+pub use charset::Charset;
 pub use config::{ConnectConfig, WireCrypt};
 pub use connection::Connection;
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};

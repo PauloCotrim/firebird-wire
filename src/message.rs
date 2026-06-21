@@ -7,6 +7,7 @@
 //! mensagens têm comprimento variável e devem ser decodificadas campo a campo
 //! direto do stream.
 
+use crate::charset::Charset;
 use crate::error::{Error, Result};
 use crate::value::{align4, ColumnMeta, Value};
 use crate::wire::consts::sql_type;
@@ -178,7 +179,12 @@ fn expect_time(val: &Value) -> Result<u32> {
 }
 
 /// Decodifica uma linha do stream a partir dos metadados das colunas de saída.
-pub async fn decode_row(stream: &mut FbStream, columns: &[ColumnMeta]) -> Result<Vec<Value>> {
+/// `charset` é o charset da conexão, usado para decodificar CHAR/VARCHAR.
+pub async fn decode_row(
+    stream: &mut FbStream,
+    columns: &[ColumnMeta],
+    charset: Charset,
+) -> Result<Vec<Value>> {
     let bitmap = stream.read_raw(null_bitmap_len(columns.len())).await?;
     let mut values = Vec::with_capacity(columns.len());
     for (i, col) in columns.iter().enumerate() {
@@ -186,13 +192,13 @@ pub async fn decode_row(stream: &mut FbStream, columns: &[ColumnMeta]) -> Result
         if is_null {
             values.push(Value::Null);
         } else {
-            values.push(decode_value(stream, col).await?);
+            values.push(decode_value(stream, col, charset).await?);
         }
     }
     Ok(values)
 }
 
-async fn decode_value(stream: &mut FbStream, col: &ColumnMeta) -> Result<Value> {
+async fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset) -> Result<Value> {
     Ok(match sql_type::base(col.sql_type) {
         sql_type::SHORT => Value::Short(stream.read_i32().await? as i16),
         sql_type::LONG => Value::Int(stream.read_i32().await?),
@@ -207,11 +213,11 @@ async fn decode_value(stream: &mut FbStream, col: &ColumnMeta) -> Result<Value> 
             let n = col.length as usize;
             let raw = stream.read_raw(n).await?;
             stream.read_pad(n).await?;
-            text_or_bytes(col, raw)
+            text_or_bytes(col, raw, charset)
         }
         sql_type::VARYING => {
             let raw = stream.read_bytes().await?; // prefixado por comprimento + com padding
-            text_or_bytes(col, raw)
+            text_or_bytes(col, raw, charset)
         }
         sql_type::TYPE_DATE => Value::Date(stream.read_i32().await?),
         sql_type::TYPE_TIME => Value::Time(stream.read_i32().await? as u32),
@@ -234,20 +240,22 @@ async fn decode_value(stream: &mut FbStream, col: &ColumnMeta) -> Result<Value> 
     })
 }
 
-/// Charset OCTETS (sub_type 1 para texto) permanece binário; todo o resto é texto.
-fn text_or_bytes(col: &ColumnMeta, raw: Vec<u8>) -> Value {
+/// Charset OCTETS (sub_type 1 para texto) permanece binário; todo o resto é
+/// decodificado conforme o charset da conexão (o servidor translitera o texto
+/// para esse charset antes de enviar).
+fn text_or_bytes(col: &ColumnMeta, raw: Vec<u8>, charset: Charset) -> Value {
     const CS_OCTETS: i32 = 1;
     if col.sub_type == CS_OCTETS {
         Value::Bytes(raw)
     } else {
-        // Remove o preenchimento (padding) à direita do CHAR; VARCHAR já carrega seus bytes exatos.
-        let s = String::from_utf8_lossy(&raw);
-        let trimmed = if sql_type::base(col.sql_type) == sql_type::TEXT {
-            s.trim_end_matches(' ')
+        let s = charset.decode(&raw);
+        // Remove o preenchimento (padding) à direita do CHAR; VARCHAR já carrega
+        // seus bytes exatos.
+        if sql_type::base(col.sql_type) == sql_type::TEXT {
+            Value::Text(s.trim_end_matches(' ').to_string())
         } else {
-            &s
-        };
-        Value::Text(trimmed.to_string())
+            Value::Text(s)
+        }
     }
 }
 
