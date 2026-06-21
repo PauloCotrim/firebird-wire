@@ -57,8 +57,15 @@ preciso emitir `blr_blob2` (17) para colunas BLOB no `message_blr` (antes era
 **`op_batch_regblob` (104)** — ✓ FEITO. `Batch::register_blob(id_existente) ->
 id_batch` mapeia um BLOB já gravado (via `write_blob`/`create_blob`) para um id
 local do batch, sem reenviar os dados. Layout `stmt | quad existente | quad
-batch`. 1 teste ao vivo (`batch_register_blob`). Falta só `op_batch_set_bpb`
-(106), para BLOBs segmentados/com BPB.
+batch`. 1 teste ao vivo (`batch_register_blob`).
+
+**`op_batch_set_bpb` (106) + BLOBs segmentados** — ✓ FEITO.
+`Batch::set_default_bpb(bpb)` define o BPB padrão dos blobs do batch;
+`Batch::set_segmented(true)` é o atalho que liga o modo segmentado. Em modo
+segmentado, `add_blob` enquadra cada blob como um segmento (`u32` BE de
+comprimento + bytes no wire; `size = align2(2 + len)` na contabilidade do
+buffer). Layout capturado da Parte 3 do `11.batch.cpp`. 1 teste ao vivo
+(`batch_segmented_blob`). **Todos os op codes de batch (99–106) implementados.**
 
 ## 2. ~~Escrita de BLOBs~~ ✓ FEITO
 

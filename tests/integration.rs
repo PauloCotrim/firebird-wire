@@ -517,6 +517,55 @@ async fn charset_iso8859_1_decode() -> Result<()> {
 }
 
 #[tokio::test]
+async fn batch_segmented_blob() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    conn.exec_immediate(None, "RECREATE TABLE fdb_batch_s (id INTEGER, dados BLOB SUB_TYPE 0)")
+        .await?;
+
+    let conteudos: [&[u8]; 2] = [b"segmento unico via op_batch_set_bpb", b"outro blob segmentado"];
+
+    let tx = conn.begin().await?;
+    let mut batch = conn
+        .create_batch(&tx, "INSERT INTO fdb_batch_s (id, dados) VALUES (?, ?)")
+        .await?;
+    // Marca os blobs do batch como segmentados (op_batch_set_bpb).
+    batch.set_segmented(true)?;
+
+    for (i, dados) in conteudos.iter().enumerate() {
+        let blob_id = batch.add_blob(dados)?;
+        batch.add(&[Value::Int(i as i32 + 1), Value::Blob(blob_id)])?;
+    }
+    let result = batch.execute(&mut conn, &tx).await?;
+    assert_eq!(result.total, 2);
+    assert!(result.all_succeeded());
+    batch.close(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    // Lê de volta: ao concatenar os segmentos, o conteúdo deve bater.
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT id, dados FROM fdb_batch_s ORDER BY id").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), 2);
+    for (i, row) in rows.iter().enumerate() {
+        let blob_id = match row[1] {
+            Value::Blob(id) => id,
+            ref other => panic!("esperava Value::Blob, veio {other:?}"),
+        };
+        let bytes = conn.read_blob(&tx, blob_id).await?;
+        assert_eq!(bytes, conteudos[i], "blob segmentado {i} difere");
+    }
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_s").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn batch_register_blob() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg).await?;

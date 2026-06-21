@@ -351,9 +351,25 @@ Confirmado pela fonte do FB (`src/plugins/crypt/chacha/ChaCha.cpp`) + driver Go
   `WireCrypt = Disabled` e não anuncia plugins (logo o Arc4 também nunca rodou ao
   vivo aqui). Validar com um servidor `WireCrypt = Required`.
 
-### Ops restantes a capturar quando necessário
-- `op_batch_regblob` (104): `op | stmt | existing_id(quad) | batch_id(quad)` —
-  mapeia um BLOB já criado (via `create_blob`/IBlob) a um id do batch. Confirmado
-  no `protocol.cpp` (P_BATCH_REGBLOB = stmt short + 2 quads). Parte 4 do
-  `11.batch.cpp`; menos comum, ainda não implementado.
-- `op_batch_set_bpb` (106) — para BLOBs segmentados/com BPB no batch.
+### BLOBs segmentados em batch (`op_batch_set_bpb`, 106) — RESOLVIDO
+
+`op_batch_set_bpb` (106): `op | stmt | bpb(cstring)`. O servidor lê o
+`isc_bpb_type` do BPB e liga/desliga a flag `FLAG_DEFAULT_SEGMENTED` do batch.
+O BPB do fbclient para segmentado = `01 03 04 00000000` = versão1, tag
+`isc_bpb_type`(3), len=4, valor `isc_bpb_type_segmented`(0). Enviado antes do
+stream de blobs.
+
+Com a flag segmentada ligada, os blobs no `op_batch_blob_stream` têm os dados
+enquadrados em segmentos. **No wire**, cada segmento é `u32` big-endian
+(comprimento, ex.: `00 00 00 13` = 19) + os bytes, concatenados SEM padding
+(confirmado na Parte 3 do `11.batch.cpp`: segmentos d1/\\n/d2/\\n/d3). **Mas** o
+campo `size` do blob e o comprimento do stream seguem a contabilidade do *buffer*
+do servidor (`xdr_blob_stream`), que usa cabeçalho de 2 bytes alinhado a
+`BLOB_SEGHDR_ALIGN`=2: `size = bpb_len + Σ align2(seg_len + 2)`. O `xdr_u_short`
+do header de segmento ocupa 4 bytes no wire mas só 2 na contabilidade do buffer —
+por isso wire e `size`/`length` divergem (mesmo padrão do stream de blobs). Ver
+`Batch::add_blob`/`set_segmented` em `batch.rs`. 1 teste ao vivo
+(`batch_segmented_blob`).
+
+Todos os op codes de batch (99–106) estão implementados e testados ao vivo:
+create/msg/exec/rls/cs, blob_stream (105), regblob (104) e set_bpb (106).

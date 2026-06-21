@@ -437,6 +437,10 @@ pub mod bpb {
     pub const TARGET_TYPE: u8 = 2;
     pub const TYPE: u8 = 3;
     pub const STORAGE: u8 = 7;
+
+    /// Valores do clumplet [`TYPE`] (`isc_bpb_type_*`).
+    pub const TYPE_SEGMENTED: u8 = 0;
+    pub const TYPE_STREAM: u8 = 1;
 }
 
 /// Subtipos de blob.

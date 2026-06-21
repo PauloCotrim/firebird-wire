@@ -52,6 +52,14 @@
 //! `op_batch_regblob` (104): `stmt | id_existente(quad 8B BE) | id_batch(quad)`.
 //! Mapeia um BLOB já gravado fora do batch ([`Connection::write_blob`]) a um id
 //! local, evitando reenviar os dados. Ver [`Batch::register_blob`].
+//!
+//! `op_batch_set_bpb` (106): `stmt | bpb(cstring)`. Define o BPB padrão dos
+//! blobs do batch; o servidor lê o `isc_bpb_type` para marcar os blobs como
+//! segmentados ou stream. Ver [`Batch::set_default_bpb`] / [`Batch::set_segmented`].
+//! Em modo segmentado, cada segmento no stream é `u32` big-endian (comprimento)
+//! + bytes, SEM padding; já o campo `size` do blob segue a contabilidade do
+//! buffer do servidor (cabeçalho de 2 bytes alinhado a 2): `size = align2(2 +
+//! len)`. Capturado da Parte 3 do `11.batch.cpp`.
 
 use crate::blr::message_blr;
 use crate::connection::Connection;
@@ -96,7 +104,42 @@ pub struct Batch {
     /// Verdadeiro se a instrução tem ao menos uma coluna BLOB (política STREAM
     /// ativada na criação).
     blob_stream: bool,
+    /// BPB padrão a aplicar aos blobs do batch (`op_batch_set_bpb`), se definido.
+    /// Enviado em [`Batch::execute`] antes do stream de blobs.
+    default_bpb: Option<Vec<u8>>,
+    /// Verdadeiro quando o BPB padrão marca os blobs como segmentados; nesse caso
+    /// [`Batch::add_blob`] enquadra os dados em segmentos.
+    blob_segmented: bool,
     closed: bool,
+}
+
+/// Alinhamento do cabeçalho de segmento em um blob segmentado
+/// (`IBatch::BLOB_SEGHDR_ALIGN`). Como cada `add_blob` segmentado começa numa
+/// fronteira de 4 bytes (já múltiplo de 2), não há padding a inserir.
+const BLOB_SEGHDR_ALIGN: usize = 2;
+const _: () = assert!(BLOB_ALIGN.is_multiple_of(BLOB_SEGHDR_ALIGN));
+
+/// Arredonda `n` para cima até um múltiplo de `align` (potência de 2).
+#[inline]
+fn align_up(n: usize, align: usize) -> usize {
+    (n + align - 1) & !(align - 1)
+}
+
+/// Verdadeiro se o BPB marca o blob como segmentado: clumplet `isc_bpb_type`(3)
+/// com valor `isc_bpb_type_segmented`(0). Formato do BPB: byte de versão seguido
+/// de clumplets `tag(1) | len(1) | valor(len)`.
+fn bpb_is_segmented(bpb: &[u8]) -> bool {
+    let mut i = 1; // pula o byte de versão
+    while i + 1 < bpb.len() {
+        let tag = bpb[i];
+        let len = bpb[i + 1] as usize;
+        let val = &bpb[i + 2..(i + 2 + len).min(bpb.len())];
+        if tag == bpb::TYPE {
+            return val.first() == Some(&bpb::TYPE_SEGMENTED);
+        }
+        i += 2 + len;
+    }
+    false
 }
 
 /// Alinhamento (em bytes) de cada blob dentro do stream de `op_batch_blob_stream`.
@@ -141,19 +184,63 @@ impl Batch {
         }
         let id = self.next_blob_id;
         self.next_blob_id += 1;
-        // Cabeçalho + dados do blob, no wire e tudo big-endian (como o resto do
-        // protocolo): id(quad 8B) | size(4B) | bpb_size(4B = 0) | dados. Sem BPB
-        // e SEM padding — os blobs vão concatenados crus; o servidor avança o
-        // ponteiro do buffer dele com alinhamento de 4 ao percorrer o stream.
+        // Cabeçalho do blob, tudo big-endian: id(quad 8B) | size(4B) | bpb_size(4B
+        // = 0, pois o BPB é do batch). Os blobs vão concatenados SEM padding; o
+        // servidor reconstrói o alinhamento no buffer dele.
         self.pending_blobs.extend_from_slice(&id.to_be_bytes());
-        self.pending_blobs.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        self.pending_blobs.extend_from_slice(&0u32.to_be_bytes());
-        self.pending_blobs.extend_from_slice(data);
-        // O campo de comprimento conta o tamanho ALINHADO (16 do cabeçalho +
-        // dados, arredondado para múltiplo de BLOB_ALIGN) de cada blob.
-        let content = 16 + data.len();
-        self.blob_stream_len += content.div_ceil(BLOB_ALIGN) * BLOB_ALIGN;
+        if self.blob_segmented {
+            // Blob segmentado (um único segmento aqui). NO WIRE: cada segmento é
+            // `u32` big-endian com o comprimento + os bytes, sem padding. Mas o
+            // campo `size` (e o comprimento do stream) seguem a contabilidade do
+            // *buffer* do servidor, que usa cabeçalho de 2 bytes alinhado a
+            // `BLOB_SEGHDR_ALIGN`: `size = align2(2 + len)`. Ver `xdr_blob_stream`.
+            let size_field = align_up(2 + data.len(), BLOB_SEGHDR_ALIGN);
+            self.pending_blobs.extend_from_slice(&(size_field as u32).to_be_bytes());
+            self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
+            self.pending_blobs.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            self.pending_blobs.extend_from_slice(data);
+            self.blob_stream_len += align_up(16 + size_field, BLOB_ALIGN);
+        } else {
+            // Blob de stream (não segmentado): dados crus.
+            self.pending_blobs.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
+            self.pending_blobs.extend_from_slice(data);
+            self.blob_stream_len += align_up(16 + data.len(), BLOB_ALIGN);
+        }
         Ok(id)
+    }
+
+    /// Define o BPB (blob parameter buffer) padrão dos blobs do batch
+    /// (`op_batch_set_bpb`). O uso típico é marcar os blobs como **segmentados**
+    /// (`isc_bpb_type = isc_bpb_type_segmented`): nesse caso [`Self::add_blob`]
+    /// passa a enquadrar cada blob como um segmento. Deve ser chamado antes de
+    /// [`Self::add_blob`]; o BPB vai à rede em [`Self::execute`], antes dos blobs.
+    ///
+    /// Conveniência: [`Self::set_segmented`] monta o BPB segmentado para você.
+    pub fn set_default_bpb(&mut self, bpb: Vec<u8>) -> Result<()> {
+        if !self.blob_stream {
+            return Err(Error::protocol(
+                "set_default_bpb exige uma coluna BLOB na instrução do batch",
+            ));
+        }
+        // Detecta o tipo segmentado: clumplet `isc_bpb_type`(3) com valor
+        // `isc_bpb_type_segmented`(0). BPB usa comprimento de 1 byte por clumplet.
+        self.blob_segmented = bpb_is_segmented(&bpb);
+        self.default_bpb = Some(bpb);
+        Ok(())
+    }
+
+    /// Atalho para [`Self::set_default_bpb`] com um BPB que marca os blobs como
+    /// segmentados (`segmentado = true`) ou stream (`false`, o padrão).
+    pub fn set_segmented(&mut self, segmented: bool) -> Result<()> {
+        let kind = if segmented {
+            bpb::TYPE_SEGMENTED
+        } else {
+            bpb::TYPE_STREAM
+        };
+        // BPB no formato que o fbclient envia: versão(1) | tag isc_bpb_type(3) |
+        // len(1) = 4 | valor(4 bytes LE). Capturado do `11.batch.cpp` Parte 3.
+        self.set_default_bpb(vec![BPB_VERSION1, bpb::TYPE, 4, kind, 0, 0, 0])
     }
 
     /// Mapeia um BLOB **já existente** (criado fora do batch, p.ex. via
@@ -193,7 +280,15 @@ impl Batch {
         if self.closed {
             return Err(Error::protocol("batch já foi fechado"));
         }
-        // 0. Envia os BLOBs pendentes (op_batch_blob_stream) ANTES das mensagens,
+        // 0a. Define o BPB padrão (op_batch_set_bpb), se houver, antes dos blobs.
+        if let Some(bpb) = self.default_bpb.take() {
+            let mut w = op_packet(op::BATCH_SET_BPB);
+            w.put_i32(self.handle);
+            w.put_bytes(&bpb); // cstring: len(4) + bpb + pad
+            conn.io().send(&w).await?;
+            read_response(conn.io()).await?;
+        }
+        // 0b. Envia os BLOBs pendentes (op_batch_blob_stream) ANTES das mensagens,
         //    pois cada mensagem referencia um id de blob já registrado.
         if !self.pending_blobs.is_empty() {
             let mut w = op_packet(op::BATCH_BLOB_STREAM);
@@ -335,6 +430,8 @@ impl Connection {
             pending_regblobs: Vec::new(),
             next_blob_id: 1,
             blob_stream,
+            default_bpb: None,
+            blob_segmented: false,
             closed: false,
         })
     }
