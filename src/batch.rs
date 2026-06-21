@@ -56,10 +56,10 @@
 //! `op_batch_set_bpb` (106): `stmt | bpb(cstring)`. Define o BPB padrão dos
 //! blobs do batch; o servidor lê o `isc_bpb_type` para marcar os blobs como
 //! segmentados ou stream. Ver [`Batch::set_default_bpb`] / [`Batch::set_segmented`].
-//! Em modo segmentado, cada segmento no stream é `u32` big-endian (comprimento)
-//! + bytes, SEM padding; já o campo `size` do blob segue a contabilidade do
-//! buffer do servidor (cabeçalho de 2 bytes alinhado a 2): `size = align2(2 +
-//! len)`. Capturado da Parte 3 do `11.batch.cpp`.
+//! Em modo segmentado, cada segmento no stream é um `u32` big-endian com o
+//! comprimento seguido dos bytes, SEM padding; já o campo `size` do blob segue a
+//! contabilidade do buffer do servidor (cabeçalho de 2 bytes alinhado a 2), ou
+//! seja `align2(2 + len)`. Capturado da Parte 3 do `11.batch.cpp`.
 
 use crate::blr::message_blr;
 use crate::connection::Connection;
