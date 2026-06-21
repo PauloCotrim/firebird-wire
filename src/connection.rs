@@ -327,27 +327,41 @@ async fn negotiate_crypt(
         }
     };
 
-    // O servidor anuncia seus plugins de wire-crypt como nomes legíveis dentro do
-    // buffer de troca de chaves. Atualmente implementamos apenas Arc4.
-    let arc4_available = contains_subslice(keys, b"Arc4");
-    if !arc4_available {
+    // O servidor anuncia seus plugins de wire-crypt no buffer de troca de chaves
+    // (`keys`). Para ChaCha/ChaCha64 o nome vem seguido de `\0` e do nonce (12 ou
+    // 8 bytes); Arc4 não tem nonce. Preferimos a cifra mais forte disponível.
+    let (plugin, nonce) = if let Some(n) = find_after(keys, b"ChaCha\x00", 12) {
+        (WireCryptPlugin::ChaCha, n)
+    } else if let Some(n) = find_after(keys, b"ChaCha64\x00", 8) {
+        (WireCryptPlugin::ChaCha64, n)
+    } else if contains_subslice(keys, b"Arc4") {
+        (WireCryptPlugin::Arc4, Vec::new())
+    } else {
         if config.wire_crypt == WireCrypt::Required {
-            return Err(Error::auth("server does not offer the Arc4 wire-crypt plugin"));
+            return Err(Error::auth("server offers no supported wire-crypt plugin"));
         }
         return Ok(()); // continua em texto puro
-    }
+    };
 
     let mut w = op_packet(op::CRYPT);
-    w.put_str(WireCryptPlugin::Arc4.name()); // plugin
+    w.put_str(plugin.name()); // plugin
     w.put_str("Symmetric"); // tipo de chave
     stream.send(&w).await?;
 
     // A partir daqui a comunicação (wire) está criptografada em ambas as direções.
-    let (rd, wr) = make_ciphers(WireCryptPlugin::Arc4, key);
+    let (rd, wr) = make_ciphers(plugin, key, &nonce);
     stream.enable_encryption(rd, wr);
 
     read_response(stream).await?;
     Ok(())
+}
+
+/// Procura `marker` em `keys` e devolve os `n` bytes seguintes (o nonce do
+/// plugin de wire-crypt), se houver espaço.
+fn find_after(keys: &[u8], marker: &[u8], n: usize) -> Option<Vec<u8>> {
+    let i = keys.windows(marker.len()).position(|w| w == marker)?;
+    let start = i + marker.len();
+    keys.get(start..start + n).map(|s| s.to_vec())
 }
 
 // ---------------------------------------------------------------------------

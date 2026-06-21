@@ -334,6 +334,23 @@ batch statement"). A linha referencia o blob pelo id (quad) no campo BLOB.
 Ver `Batch::add_blob` / `execute` em `batch.rs`. 1 teste ao vivo
 (`batch_blob_stream`, 3 blobs de tamanhos diferentes, lidos de volta e conferidos).
 
+## Wire-crypt ChaCha (`op_crypt`, 96) — implementado, sem validação ao vivo
+
+Confirmado pela fonte do FB (`src/plugins/crypt/chacha/ChaCha.cpp`) + driver Go
+(`nakagami/firebirdsql`):
+- **Chave** = `SHA-256(K)` (32 bytes), onde `K` é a chave de sessão SRP. O Arc4,
+  por contraste, usa `K` direto.
+- **Nonce**: NÃO é trocado via callback. O servidor anuncia cada plugin no buffer
+  `keys` do handshake (o mesmo `accept.keys` que já varremos por `"Arc4"`); para
+  ChaCha o nome vem seguido de `\0` e do nonce: `"ChaCha\0"` + 12 bytes (IETF,
+  contador de 32 bits) ou `"ChaCha64\0"` + 8 bytes (contador de 64 bits).
+- **op_crypt** (96): `plugin(cstring) | "Symmetric"(cstring)` — idêntico ao Arc4,
+  só muda o nome. Contador inicial 0; mesma chave+nonce nas DUAS direções.
+- A cifra ChaCha20 está em `wirecrypt.rs` e passa o vetor da RFC 8439 §2.3.2.
+- **Ressalva:** ponta a ponta não testado — o servidor de teste está
+  `WireCrypt = Disabled` e não anuncia plugins (logo o Arc4 também nunca rodou ao
+  vivo aqui). Validar com um servidor `WireCrypt = Required`.
+
 ### Ops restantes a capturar quando necessário
 - `op_batch_regblob` (104): `op | stmt | existing_id(quad) | batch_id(quad)` —
   mapeia um BLOB já criado (via `create_blob`/IBlob) a um id do batch. Confirmado
