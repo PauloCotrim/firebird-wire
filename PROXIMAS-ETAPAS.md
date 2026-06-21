@@ -99,9 +99,12 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
   prefere ChaCha > ChaCha64 > Arc4. Foi preciso implementar o handshake completo
   de `op_cont_auth` (o driver antes embutia a prova no DPB e nunca recebia as
   chaves — então o wire-crypt NUNCA tinha funcionado de fato). Validado contra um
-  servidor `WireCrypt=Required` (ChaCha confirmado no `op_crypt`): a cifra passa
-  o vetor da RFC 8439 §2.3.2 e o teste `wire_crypt_chacha` (gated por
-  `FB_CRYPT_DB`) conecta criptografado e roda uma query.
+  servidor `WireCrypt=Required`. **Ambos os plugins validados ao vivo:** ChaCha
+  (`WireCryptPlugin = ChaCha`) e Arc4/RC4 (`WireCryptPlugin = Arc4`), com o
+  `op_crypt` confirmado enviando o nome certo em cada caso. A cifra ChaCha passa
+  o vetor da RFC 8439 §2.3.2; o teste `wire_crypt` (gated por `FB_CRYPT_DB`)
+  conecta criptografado e roda uma query (negocia o plugin que o servidor
+  oferecer).
 - ~~**Tamanho do fetch**~~ ✓ FEITO — o prefetch deixou de ser fixo: agora é por
   statement via `Statement::set_fetch_size(n)` (padrão 200; mínimo 1). Maior =
   menos idas ao servidor; menor = menor latência da 1ª linha. 1 teste ao vivo

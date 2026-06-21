@@ -37,26 +37,27 @@ macro_rules! require_server {
     };
 }
 
-/// Validação ponta a ponta da criptografia de comunicação (ChaCha20). Roda só
-/// quando `FB_CRYPT_DB` aponta para um banco num servidor com
-/// `WireCrypt=Required` (o servidor de exemplo padrão tem crypt desabilitado).
-/// Exemplo: subir uma instância privada e exportar
+/// Validação ponta a ponta da criptografia de comunicação. O plugin usado depende
+/// do que o servidor oferece: ChaCha (preferido) ou Arc4 — ambos validados ao vivo
+/// (com `WireCryptPlugin = ChaCha`/`Arc4` na instância privada). Roda só quando
+/// `FB_CRYPT_DB` aponta para um banco num servidor com `WireCrypt=Required` (o
+/// servidor de exemplo padrão tem crypt desabilitado). Exemplo:
 /// `FB_CRYPT_PORT=3556 FB_CRYPT_DB=/caminho/test.fdb`.
 #[tokio::test]
-async fn wire_crypt_chacha() -> Result<()> {
+async fn wire_crypt() -> Result<()> {
     let Some(base) = config() else {
         eprintln!("skipping: set FB_PASSWORD to run live integration tests");
         return Ok(());
     };
     let Ok(db) = std::env::var("FB_CRYPT_DB") else {
-        eprintln!("skipping wire_crypt_chacha: set FB_CRYPT_DB (server with WireCrypt=Required)");
+        eprintln!("skipping wire_crypt: set FB_CRYPT_DB (server with WireCrypt=Required)");
         return Ok(());
     };
     let port = std::env::var("FB_CRYPT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3556);
     let cfg = base.clone().port(port).database(db).wire_crypt(WireCrypt::Required);
 
     let mut conn = Connection::connect(&cfg).await?;
-    assert!(conn.is_encrypted(), "a conexão deveria estar criptografada (ChaCha)");
+    assert!(conn.is_encrypted(), "a conexão deveria estar criptografada (ChaCha ou Arc4)");
 
     // A criptografia cobre todo o tráfego: roda uma query que retorna linhas.
     let tx = conn.begin().await?;
