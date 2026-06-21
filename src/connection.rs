@@ -98,11 +98,29 @@ impl Connection {
         dbg_log(&format!("auth computed; have_proof={}", auth.is_some()));
 
         // --- criptografia de comunicação (wire) ---------------------------
-        negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+        // Quando o servidor pede continuação (`op_cond_accept`, típico de
+        // `WireCrypt=Required`), concluímos a autenticação por `op_cont_auth`: a
+        // resposta traz as chaves da cifra (incl. o nonce do ChaCha). Caso
+        // contrário, usamos a prova embutida no DPB e as chaves do accept.
+        let dpb_auth = match (&auth, accept.cond, config.wire_crypt != WireCrypt::Disabled) {
+            (Some(a), true, true) => {
+                let keys = continue_auth(&mut stream, a).await?;
+                negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys).await?;
+                DpbAuth::Done
+            }
+            (Some(a), _, _) => {
+                negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+                DpbAuth::Proof(a)
+            }
+            (None, _, _) => {
+                negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+                DpbAuth::Legacy
+            }
+        };
         dbg_log(&format!("crypt negotiated; encrypted={}", stream.is_encrypted()));
 
         // --- attach / create ----------------------------------------------
-        let dpb = build_dpb(config, create, auth.as_ref());
+        let dpb = build_dpb(config, create, dpb_auth);
         let mut w = op_packet(if create { op::CREATE } else { op::ATTACH });
         w.put_i32(0); // id do objeto de banco de dados
         w.put_str(&config.database);
@@ -221,6 +239,10 @@ struct Accept {
     authenticated: bool,
     /// Buffer de troca de chaves de cifra (lista os plugins de wire-crypt disponíveis).
     keys: Vec<u8>,
+    /// Verdadeiro para `op_cond_accept` (98): o servidor pede que a autenticação
+    /// continue via `op_cont_auth` (é o que servidores com `WireCrypt=Required`
+    /// fazem, pois as chaves da cifra vêm na resposta do cont_auth).
+    cond: bool,
 }
 
 async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
@@ -230,7 +252,7 @@ async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
             let version = stream.read_i32().await?;
             let _arch = stream.read_i32().await?;
             let _ptype = stream.read_i32().await?;
-            Ok(Accept { version, data: Vec::new(), plugin: String::new(), authenticated: true, keys: Vec::new() })
+            Ok(Accept { version, data: Vec::new(), plugin: String::new(), authenticated: true, keys: Vec::new(), cond: false })
         }
         // op_accept_data e op_cond_accept compartilham um layout de comunicação
         // (wire) idêntico; a única diferença é se o cliente ainda precisa
@@ -243,7 +265,7 @@ async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
             let plugin = String::from_utf8_lossy(&stream.read_bytes().await?).trim().to_string();
             let authenticated = stream.read_i32().await? != 0;
             let keys = stream.read_bytes().await?;
-            Ok(Accept { version, data, plugin, authenticated, keys })
+            Ok(Accept { version, data, plugin, authenticated, keys, cond: c == op::COND_ACCEPT })
         }
         c if c == op::REJECT => Err(Error::auth("server rejected the connection")),
         c if c == op::RESPONSE => {
@@ -292,6 +314,22 @@ fn compute_auth(
         proof_hex: crate::auth::srp::to_hex(&proof),
         session_key: key,
     }))
+}
+
+/// Conclui a autenticação SRP via `op_cont_auth` e devolve o buffer de chaves de
+/// cifra que vem na resposta (`p_resp_data`). É o caminho que o fbclient usa com
+/// servidores `WireCrypt=Required`: as chaves (com o nonce dos plugins ChaCha)
+/// só chegam após esta rodada. Layout do `op_cont_auth`:
+/// `data(prova, cstring) | name(plugin) | list(plugins) | keys(cstring vazia)`.
+async fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>> {
+    let mut w = op_packet(op::CONT_AUTH);
+    w.put_str(&auth.proof_hex);
+    w.put_str(&auth.plugin);
+    w.put_str("Srp256,Srp,Legacy_Auth");
+    w.put_bytes(&[]);
+    stream.send(&w).await?;
+    let resp = read_response(stream).await?;
+    Ok(resp.data)
 }
 
 /// Lê a resposta para `op_attach`/`op_create`. Com a autenticação carregada no DPB
@@ -432,8 +470,18 @@ fn push_cnct(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
+/// Como a autenticação é apresentada no DPB de attach.
+enum DpbAuth<'a> {
+    /// Embute a prova SRP no DPB (`isc_dpb_specific_auth_data`).
+    Proof(&'a AuthData),
+    /// Sem sessão SRP: recorre a senha legada.
+    Legacy,
+    /// Já autenticado por `op_cont_auth` (a prova não vai no DPB).
+    Done,
+}
+
 /// Constrói o Database Parameter Buffer (DPB) para attach/create.
-fn build_dpb(config: &ConnectConfig, create: bool, auth: Option<&AuthData>) -> Vec<u8> {
+fn build_dpb(config: &ConnectConfig, create: bool, auth: DpbAuth<'_>) -> Vec<u8> {
     let mut pb = ParameterBuffer::new(DPB_VERSION1);
 
     pb.int(dpb::SQL_DIALECT, config.dialect);
@@ -441,15 +489,17 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: Option<&AuthData>) -> V
     pb.string(dpb::USER_NAME, &config.normalized_user());
 
     match auth {
-        Some(a) => {
+        DpbAuth::Proof(a) => {
             pb.string(dpb::AUTH_PLUGIN_NAME, &a.plugin);
             pb.string(dpb::AUTH_PLUGIN_LIST, "Srp256,Srp");
             pb.string(dpb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
-        None => {
+        DpbAuth::Legacy => {
             // Nenhuma sessão SRP negociada: recorre a uma senha legada.
             pb.string(dpb::PASSWORD, &config.password);
         }
+        // Já autenticado via cont_auth: nada de prova/senha no DPB.
+        DpbAuth::Done => {}
     }
 
     if let Some(role) = &config.role {
@@ -565,7 +615,7 @@ mod tests {
     #[test]
     fn dpb_has_dialect_and_charset() {
         let cfg = ConnectConfig::new().charset("UTF8").dialect(3);
-        let dpb = build_dpb(&cfg, false, None);
+        let dpb = build_dpb(&cfg, false, DpbAuth::Legacy);
         assert_eq!(dpb[0], DPB_VERSION1);
         // clumplet de dialect presente.
         assert!(dpb.windows(1).any(|w| w[0] == dpb::SQL_DIALECT));

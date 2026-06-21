@@ -91,16 +91,17 @@ Semáforo limita `max_size`; timeout configurável. Dois testes de integração.
   frações de 1/10000 s) em `CivilDate`/`CivilTime`/`CivilTimestamp` (algoritmo de
   Hinnant, sem dependência externa). Construtores `Value::date/time/timestamp`
   fazem o caminho inverso. 3 testes unitários + 1 ao vivo (`date_time_civil_conversion`).
-- ~~**Criptografia ChaCha20**~~ ✓ FEITO (cifra) — `WireCryptPlugin::ChaCha`
+- ~~**Criptografia ChaCha20**~~ ✓ FEITO E VALIDADO AO VIVO — `WireCryptPlugin::ChaCha`
   (nonce 96 bits + contador 32 bits, IETF) e `ChaCha64` (nonce 64 bits +
-  contador 64 bits) em `wirecrypt.rs`. Chave = `SHA-256(K)`; o nonce vem no
-  buffer `keys` do handshake (`"ChaCha\0"` + 12B / `"ChaCha64\0"` + 8B);
-  `negotiate_crypt` prefere ChaCha > ChaCha64 > Arc4. A cifra é validada pelo
-  vetor de resposta conhecida da RFC 8439 (§2.3.2). **Ressalva:** a negociação
-  ponta a ponta NÃO foi validada ao vivo — o servidor de teste está com
-  `WireCrypt = Disabled` e não anuncia plugin algum no handshake (o mesmo vale
-  para o Arc4 já existente). Para validar, subir um servidor com `WireCrypt =
-  Enabled/Required` e capturar/rodar contra ele.
+  contador 64 bits) em `wirecrypt.rs`. Chave = `SHA-256(K)`; o nonce vem nas
+  chaves de cifra que chegam na resposta do `op_cont_auth` (clumplets
+  `tag 03 = "ChaCha\0"` + IV de 16 B, os 12 primeiros = nonce). `negotiate_crypt`
+  prefere ChaCha > ChaCha64 > Arc4. Foi preciso implementar o handshake completo
+  de `op_cont_auth` (o driver antes embutia a prova no DPB e nunca recebia as
+  chaves — então o wire-crypt NUNCA tinha funcionado de fato). Validado contra um
+  servidor `WireCrypt=Required` (ChaCha confirmado no `op_crypt`): a cifra passa
+  o vetor da RFC 8439 §2.3.2 e o teste `wire_crypt_chacha` (gated por
+  `FB_CRYPT_DB`) conecta criptografado e roda uma query.
 - ~~**Tamanho do fetch**~~ ✓ FEITO — o prefetch deixou de ser fixo: agora é por
   statement via `Statement::set_fetch_size(n)` (padrão 200; mínimo 1). Maior =
   menos idas ao servidor; menor = menor latência da 1ª linha. 1 teste ao vivo

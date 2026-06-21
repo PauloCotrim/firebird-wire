@@ -334,7 +334,34 @@ batch statement"). A linha referencia o blob pelo id (quad) no campo BLOB.
 Ver `Batch::add_blob` / `execute` em `batch.rs`. 1 teste ao vivo
 (`batch_blob_stream`, 3 blobs de tamanhos diferentes, lidos de volta e conferidos).
 
-## Wire-crypt ChaCha (`op_crypt`, 96) — implementado, sem validação ao vivo
+## Wire-crypt ChaCha (`op_crypt`, 96 + `op_cont_auth`, 92) — VALIDADO AO VIVO
+
+**Fluxo real (capturado do isql contra um servidor `WireCrypt=Required`):**
+1. `op_connect` → `op_cond_accept` (98): o accept condicional vem com o buffer de
+   chaves **vazio** (a auth precisa continuar). O driver antes parava aqui e
+   embutia a prova SRP no DPB do attach — por isso NUNCA recebia o nonce e o
+   wire-crypt jamais funcionava.
+2. `op_cont_auth` (92): `data(prova hex, cstring) | name(plugin) | list(plugins) |
+   keys(cstring vazia)`. → resposta `op_response` cujo `p_resp_data` é o buffer de
+   chaves de cifra.
+3. **Buffer de chaves** = clumplets `tag(1) | len(1) | dados`:
+   - `tag 00` = tipo da chave (`"Symmetric"`).
+   - `tag 01` = lista de plugins (`"ChaCha ChaCha64 Arc4"`, separada por espaço).
+   - `tag 03` = dados específicos do plugin: `"<plugin>\0"` + IV. Para ChaCha:
+     `"ChaCha\0"` + 16 bytes (os 12 primeiros = nonce, os 4 últimos = contador 0).
+     Para ChaCha64: `"ChaCha64\0"` + 8 bytes.
+   - `find_after(keys, b"ChaCha\0", 12)` já extrai o nonce direto desse buffer.
+4. `op_crypt` (96): `plugin(cstring) | "Symmetric"(cstring)`. Logo após enviá-lo,
+   habilita a cifra; a resposta do op_crypt já vem CRIPTOGRAFADA.
+5. `op_attach` (criptografado) — sem prova no DPB (já autenticado por cont_auth).
+
+Servidores `WireCrypt=Disabled` mandam `op_accept_data` (94, não cond): aí o driver
+segue o atalho antigo (prova no DPB, sem crypt). O caminho cont_auth só dispara em
+`op_cond_accept` com `wire_crypt != Disabled`. Ver `continue_auth`/`negotiate_crypt`
+em `connection.rs`. Validar com instância privada: copiar `security5.fdb`, conf com
+`WireCrypt=Required` + `RemoteServicePort=3556`, e rodar com `FB_CRYPT_DB`.
+
+### (histórico) detalhes da cifra
 
 Confirmado pela fonte do FB (`src/plugins/crypt/chacha/ChaCha.cpp`) + driver Go
 (`nakagami/firebirdsql`):

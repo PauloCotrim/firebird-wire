@@ -37,6 +37,40 @@ macro_rules! require_server {
     };
 }
 
+/// Validação ponta a ponta da criptografia de comunicação (ChaCha20). Roda só
+/// quando `FB_CRYPT_DB` aponta para um banco num servidor com
+/// `WireCrypt=Required` (o servidor de exemplo padrão tem crypt desabilitado).
+/// Exemplo: subir uma instância privada e exportar
+/// `FB_CRYPT_PORT=3556 FB_CRYPT_DB=/caminho/test.fdb`.
+#[tokio::test]
+async fn wire_crypt_chacha() -> Result<()> {
+    let Some(base) = config() else {
+        eprintln!("skipping: set FB_PASSWORD to run live integration tests");
+        return Ok(());
+    };
+    let Ok(db) = std::env::var("FB_CRYPT_DB") else {
+        eprintln!("skipping wire_crypt_chacha: set FB_CRYPT_DB (server with WireCrypt=Required)");
+        return Ok(());
+    };
+    let port = std::env::var("FB_CRYPT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3556);
+    let cfg = base.clone().port(port).database(db).wire_crypt(WireCrypt::Required);
+
+    let mut conn = Connection::connect(&cfg).await?;
+    assert!(conn.is_encrypted(), "a conexão deveria estar criptografada (ChaCha)");
+
+    // A criptografia cobre todo o tráfego: roda uma query que retorna linhas.
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT 1 FROM RDB$DATABASE").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0][0], Value::Int(1)));
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn connect_and_ping() -> Result<()> {
     let cfg = require_server!();
