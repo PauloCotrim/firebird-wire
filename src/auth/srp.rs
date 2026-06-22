@@ -7,7 +7,9 @@
 //! mesmo que `Firebird::BigInteger::getText`/`getBytes`.
 
 use num_bigint::BigUint;
-use num_traits::Num;
+use num_traits::{Num, Zero};
+
+use crate::error::{Error, Result};
 use rand::RngCore;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -146,8 +148,24 @@ impl SrpClient {
     ///
     /// Retorna `(proof, session_key)`. `proof` é enviada (codificada em hex) em
     /// `op_cont_auth`; `session_key` chaveia a cifra do wire.
-    pub fn proof(&self, user: &str, password: &str, salt: &[u8], b_pub: &BigUint) -> (Vec<u8>, Vec<u8>) {
+    ///
+    /// Aborta (conforme o SRP-6a) se o efêmero do servidor for inválido —
+    /// `B mod N == 0` ou o parâmetro de embaralhamento `u == 0` — situações que
+    /// um servidor malicioso/MITM poderia forçar para degenerar o segredo.
+    pub fn proof(
+        &self,
+        user: &str,
+        password: &str,
+        salt: &[u8],
+        b_pub: &BigUint,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         let n = n();
+        if (b_pub % &n).is_zero() {
+            return Err(Error::auth("invalid SRP server ephemeral: B mod N == 0"));
+        }
+        if scramble(&self.a_pub, b_pub).is_zero() {
+            return Err(Error::auth("invalid SRP scrambling parameter: u == 0"));
+        }
         let x = user_hash(user, password, salt);
         let key = self.session_key(b_pub, &x);
 
@@ -168,7 +186,7 @@ impl SrpClient {
             &to_bytes(b_pub),
             &key,
         ]);
-        (proof, key)
+        Ok((proof, key))
     }
 }
 
@@ -238,7 +256,7 @@ mod tests {
 
         // Cliente.
         let client = SrpClient::with_secret(SrpHash::Sha256, &[0x37u8; 32]);
-        let (_proof, client_key) = client.proof(user, password, &salt, &b_pub);
+        let (_proof, client_key) = client.proof(user, password, &salt, &b_pub).unwrap();
 
         // O servidor deriva sua chave de forma independente:
         // u = H(A,B); S = (A * v^u) ^ b mod N; K = H(S).

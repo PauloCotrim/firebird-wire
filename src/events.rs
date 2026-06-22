@@ -52,6 +52,13 @@ impl Connection {
         if names.is_empty() {
             return Err(Error::protocol("listen_events exige ao menos um evento"));
         }
+        // O nome de cada evento vai num clumplet de comprimento de 1 byte no EPB.
+        if let Some(long) = names.iter().find(|n| n.len() > u8::MAX as usize) {
+            return Err(Error::conversion(format!(
+                "nome de evento excede 255 bytes: {:.32}…",
+                long
+            )));
+        }
         // 1. Pede o canal auxiliar (op_connect_request, tipo async = 1).
         let mut w = op_packet(op::CONNECT_REQUEST);
         w.put_i32(1); // p_req_type = async events

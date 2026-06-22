@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::error::{Error, Result};
+
 /// Postura desejada de criptografia da conexão (wire-encryption).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WireCrypt {
@@ -135,5 +137,57 @@ impl ConnectConfig {
     /// (identificadores sem aspas são convertidos para maiúsculas).
     pub(crate) fn normalized_user(&self) -> String {
         self.user.to_uppercase()
+    }
+
+    /// Valida campos que vão para clumplets de 1 byte de comprimento (DPB/cnct),
+    /// onde um valor acima de 255 bytes corromperia silenciosamente o buffer.
+    /// Chamado no início do handshake. O `database` não entra aqui: vai num campo
+    /// XDR de comprimento de 4 bytes, sem esse limite.
+    pub(crate) fn validate(&self) -> Result<()> {
+        // O usuário é enviado em maiúsculas (pode mudar o nº de bytes em multibyte).
+        check_clumplet_len("user", &self.normalized_user())?;
+        check_clumplet_len("password", &self.password)?;
+        check_clumplet_len("charset", &self.charset)?;
+        if let Some(role) = &self.role {
+            check_clumplet_len("role", role)?;
+        }
+        if let Some(tz) = &self.timezone {
+            check_clumplet_len("timezone", tz)?;
+        }
+        Ok(())
+    }
+}
+
+/// Garante que um valor cabe num clumplet de comprimento de 1 byte (≤ 255 bytes).
+fn check_clumplet_len(field: &str, value: &str) -> Result<()> {
+    if value.len() > u8::MAX as usize {
+        return Err(Error::conversion(format!(
+            "{field} excede 255 bytes ({}); não cabe num parâmetro de conexão",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(ConnectConfig::new().user("SYSDBA").validate().is_ok());
+    }
+
+    #[test]
+    fn over_long_password_is_rejected() {
+        let cfg = ConnectConfig::new().password("x".repeat(256));
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, Error::Conversion(_)), "esperava erro de conversão, veio {err:?}");
+    }
+
+    #[test]
+    fn max_length_fields_pass() {
+        let cfg = ConnectConfig::new().role("r".repeat(255)).charset("c".repeat(255));
+        assert!(cfg.validate().is_ok());
     }
 }

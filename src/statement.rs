@@ -13,7 +13,7 @@
 //! 4. [`Statement::close`] / [`Statement::drop_statement`] liberam o estado no
 //!    servidor.
 //!
-//! Assim como [`Transaction`](crate::transaction::Transaction), um `Statement` é
+//! Assim como [`Transaction`], um `Statement` é
 //! um handle cujos métodos de I/O emprestam a [`Connection`] dona, então apenas
 //! um empréstimo mutável fica ativo por vez.
 

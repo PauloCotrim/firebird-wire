@@ -8,9 +8,6 @@
 
 use std::fmt;
 
-use crate::wire::consts::arg;
-use crate::wire::xdr::XdrReader;
-
 /// Alias de conveniência usado em toda a crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -108,46 +105,6 @@ pub struct StatusVector {
 }
 
 impl StatusVector {
-    /// Parseia um status vector a partir de um stream XDR (como o transportado por `op_response`).
-    ///
-    /// Argumentos que carregam strings (`isc_arg_string`, `isc_arg_interpreted`,
-    /// `isc_arg_sql_state`) são transmitidos como buffers prefixados por
-    /// comprimento e alinhados em 4 bytes. Argumentos numéricos são palavras XDR
-    /// únicas.
-    pub fn read(r: &mut XdrReader) -> Result<Self> {
-        let mut args = Vec::new();
-        let mut sql_state = None;
-
-        loop {
-            let tag = r.get_i32()?;
-            match tag {
-                t if t == arg::END => break,
-                t if t == arg::GDS => args.push(StatusArg::Gds(r.get_i32()?)),
-                t if t == arg::WARNING => args.push(StatusArg::Warning(r.get_i32()?)),
-                t if t == arg::NUMBER => args.push(StatusArg::Number(r.get_i32()?)),
-                t if t == arg::STRING || t == arg::CSTRING => {
-                    let s = String::from_utf8_lossy(r.get_bytes()?).into_owned();
-                    args.push(StatusArg::Str(s));
-                }
-                t if t == arg::INTERPRETED => {
-                    let s = String::from_utf8_lossy(r.get_bytes()?).into_owned();
-                    args.push(StatusArg::Interpreted(s));
-                }
-                t if t == arg::SQL_STATE => {
-                    sql_state = Some(String::from_utf8_lossy(r.get_bytes()?).into_owned());
-                }
-                other => {
-                    // Tags desconhecidas carregam uma única palavra numérica na
-                    // codificação legada; consumimos para nos mantermos em sincronia.
-                    let _ = r.get_i32()?;
-                    args.push(StatusArg::Number(other));
-                }
-            }
-        }
-
-        Ok(StatusVector { args, sql_state })
-    }
-
     /// Verdadeiro quando o vetor não carrega nenhum código de erro.
     pub fn is_empty(&self) -> bool {
         !self
@@ -170,28 +127,115 @@ impl StatusVector {
         })
     }
 
-    /// Constrói uma mensagem com melhor esforço. Nós não incluímos o catálogo
-    /// `firebird.msg`, então juntamos qualquer texto interpretado pelo servidor e
-    /// argumentos de string, recorrendo ao código GDS bruto.
+    /// Constrói uma mensagem com melhor esforço. Não embutimos o catálogo
+    /// `firebird.msg` completo, mas temos um mapa dos códigos GDS mais comuns
+    /// ([`gds_template`]) cujos placeholders `@N` preenchemos com os argumentos do
+    /// status vector. A ordem de preferência é: (1) texto já interpretado pelo
+    /// servidor; (2) templates conhecidos formatados; (3) argumentos crus; (4) o
+    /// código GDS bruto.
     fn message(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        for a in &self.args {
-            match a {
-                StatusArg::Interpreted(s) | StatusArg::Str(s) if !s.is_empty() => {
-                    parts.push(s.clone())
-                }
-                _ => {}
-            }
+        // (1) O servidor às vezes já manda o texto pronto.
+        let interpreted: Vec<String> = self
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                StatusArg::Interpreted(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if !interpreted.is_empty() {
+            return interpreted.join("; ");
         }
-        if parts.is_empty() {
-            match self.gds_code() {
-                Some(c) => format!("Firebird error (gds code {c})"),
-                None => "unknown Firebird error".to_string(),
-            }
-        } else {
-            parts.join("; ")
+
+        // Valores que preenchem @1, @2, … na ordem em que aparecem.
+        let fill: Vec<String> = self
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                StatusArg::Number(n) => Some(n.to_string()),
+                StatusArg::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // (2) Formata cada código GDS com template conhecido.
+        let templated: Vec<String> = self
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                StatusArg::Gds(c) if *c != 0 => gds_template(*c).map(|t| fill_template(t, &fill)),
+                _ => None,
+            })
+            .collect();
+        if !templated.is_empty() {
+            return templated.join("; ");
+        }
+
+        // (3)/(4) Argumentos crus, senão o código.
+        if !fill.is_empty() {
+            return fill.join("; ");
+        }
+        match self.gds_code() {
+            Some(c) => format!("Firebird error (gds code {c})"),
+            None => "unknown Firebird error".to_string(),
         }
     }
+}
+
+/// Substitui os marcadores `@1`..`@9` de um template do Firebird pelos valores em
+/// `fill` (na ordem). Marcadores sem valor correspondente ficam como estão.
+fn fill_template(template: &str, fill: &[String]) -> String {
+    let mut out = template.to_string();
+    // Em ordem decrescente para que `@1` não case dentro de um `@10` (inexistente
+    // nos templates atuais, mas a ordem é barata e à prova de futuro).
+    for i in (1..=fill.len().min(9)).rev() {
+        out = out.replace(&format!("@{i}"), &fill[i - 1]);
+    }
+    out
+}
+
+/// Texto dos códigos de erro GDS mais comuns (extraído do `firebird.msg` do FB5
+/// via `fb_interpret`). Os `@N` são preenchidos por [`fill_template`]. Cobre os
+/// erros que aplicações realmente encontram; o resto recai no código bruto.
+fn gds_template(code: i32) -> Option<&'static str> {
+    Some(match code {
+        335544321 => "arithmetic exception, numeric overflow, or string truncation",
+        335544324 => "invalid database handle (no active connection)",
+        335544328 => "invalid BLOB handle",
+        335544329 => "invalid BLOB ID",
+        335544333 => "internal Firebird consistency check (@1)",
+        335544334 => "conversion error from string \"@1\"",
+        335544336 => "deadlock",
+        335544344 => "I/O error during \"@1\" operation for file \"@2\"",
+        335544345 => "lock conflict on no wait transaction",
+        335544347 => "validation error for column @1, value \"@2\"",
+        335544348 => "no current record for fetch operation",
+        335544349 => {
+            "attempt to store duplicate value (visible to active transactions) in unique index \"@1\""
+        }
+        335544351 => "unsuccessful metadata update",
+        335544352 => "no permission for @1 access to @2 @3",
+        335544359 => "attempted update of read-only column @1",
+        335544361 => "attempted update during read-only transaction",
+        335544380 => "wrong number of arguments on call",
+        335544395 => "table @1 is not defined",
+        335544396 => "column @1 is not defined in table @2",
+        335544421 => "connection rejected by remote interface",
+        335544451 => "update conflicts with concurrent update",
+        335544466 => "violation of FOREIGN KEY constraint \"@1\" on table \"@2\"",
+        335544472 => {
+            "Your user name and password are not defined. Ask your database administrator to set up a Firebird login."
+        }
+        335544510 => "lock time-out on wait transaction",
+        335544558 => "Operation violates CHECK constraint @1 on view or table @2",
+        335544569 => "Dynamic SQL Error",
+        335544578 => "Column unknown",
+        335544580 => "Table unknown",
+        335544606 => "expression evaluation not supported",
+        335544634 => "Token unknown - line @1, column @2",
+        335544665 => "violation of PRIMARY or UNIQUE KEY constraint \"@1\" on table \"@2\"",
+        _ => return None,
+    })
 }
 
 impl fmt::Display for StatusVector {
@@ -237,5 +281,61 @@ impl std::error::Error for DatabaseError {}
 impl From<StatusVector> for Error {
     fn from(status: StatusVector) -> Self {
         Error::Database(DatabaseError::new(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sv(args: Vec<StatusArg>) -> StatusVector {
+        StatusVector { args, sql_state: None }
+    }
+
+    #[test]
+    fn templated_message_fills_placeholders() {
+        // FK: violation of FOREIGN KEY constraint "@1" on table "@2".
+        let v = sv(vec![
+            StatusArg::Gds(335544466),
+            StatusArg::Str("FK_PEDIDO_CLIENTE".into()),
+            StatusArg::Str("PEDIDO".into()),
+        ]);
+        assert_eq!(
+            v.message(),
+            "violation of FOREIGN KEY constraint \"FK_PEDIDO_CLIENTE\" on table \"PEDIDO\""
+        );
+    }
+
+    #[test]
+    fn chained_gds_codes_are_joined() {
+        // Dynamic SQL Error (sem args) + Token unknown - line @1, column @2.
+        let v = sv(vec![
+            StatusArg::Gds(335544569),
+            StatusArg::Gds(335544634),
+            StatusArg::Number(1),
+            StatusArg::Number(42),
+        ]);
+        assert_eq!(v.message(), "Dynamic SQL Error; Token unknown - line 1, column 42");
+    }
+
+    #[test]
+    fn interpreted_text_wins() {
+        let v = sv(vec![
+            StatusArg::Gds(335544321),
+            StatusArg::Interpreted("texto do servidor".into()),
+        ]);
+        assert_eq!(v.message(), "texto do servidor");
+    }
+
+    #[test]
+    fn unknown_code_falls_back_to_number() {
+        let v = sv(vec![StatusArg::Gds(999999)]);
+        assert_eq!(v.message(), "Firebird error (gds code 999999)");
+        assert!(v.is_error());
+    }
+
+    #[test]
+    fn deadlock_has_no_placeholders() {
+        assert_eq!(sv(vec![StatusArg::Gds(335544336)]).message(), "deadlock");
     }
 }

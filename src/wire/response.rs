@@ -87,6 +87,9 @@ pub async fn read_response_body(stream: &mut FbStream) -> Result<Response> {
 pub async fn read_response(stream: &mut FbStream) -> Result<Response> {
     let code = read_op(stream).await?;
     if code != op::RESPONSE {
+        // Recebemos um pacote que não esperávamos: o stream está fora de sincronia
+        // e não pode ser reutilizado com segurança.
+        stream.mark_broken();
         return Err(Error::protocol(format!(
             "expected op_response, got {} ({code})",
             op_name(code)

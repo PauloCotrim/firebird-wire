@@ -21,7 +21,7 @@
 //! 1. [`Connection::create_blob`] envia `op_create_blob2` (transação) e recebe
 //!    um handle + o blob_id atribuído pelo servidor.
 //! 2. [`BlobWriter::write`] envia `op_put_segment` em partes de no máximo
-//!    [`MAX_SEGMENT`] bytes. Cada segmento vai empacotado como `[len_lo, len_hi,
+//!    `MAX_SEGMENT` bytes. Cada segmento vai empacotado como `[len_lo, len_hi,
 //!    bytes...]` dentro de uma cstring XDR.
 //! 3. [`BlobWriter::close`] envia `op_close_blob` e devolve o blob_id para usar
 //!    como [`Value::Blob`] em INSERT/UPDATE.
@@ -151,7 +151,7 @@ impl BlobWriter {
         self.blob_id
     }
 
-    /// Envia `data` para o servidor em segmentos de no máximo [`MAX_SEGMENT`]
+    /// Envia `data` para o servidor em segmentos de no máximo `MAX_SEGMENT`
     /// bytes, usando `op_put_segment`. Pode ser chamado várias vezes.
     pub async fn write(&self, conn: &mut Connection, data: &[u8]) -> Result<()> {
         for chunk in data.chunks(MAX_SEGMENT) {

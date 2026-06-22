@@ -97,6 +97,11 @@ impl Pool {
 
     // Devolve uma conexão à fila de ociosas. Chamado pelo Drop de PooledConnection.
     fn return_conn(&self, conn: Connection) {
+        // Não recicla conexões com erro de I/O ou desync: seriam veneno para o
+        // próximo usuário. Descarta-as (o socket fecha ao soltar a Connection).
+        if !conn.is_healthy() {
+            return;
+        }
         if let Ok(mut idle) = self.0.idle.lock() {
             idle.push_back(conn);
         }
@@ -120,11 +125,11 @@ impl Pool {
 }
 
 /// Verifica superficialmente se uma conexão ainda parece viva (sem ida ao servidor).
-/// Detecta conexões com socket fechado mas não travamentos silenciosos.
-fn conn_is_alive(_conn: &Connection) -> bool {
-    // Por ora considera sempre viva; a primeira operação que falhar revelará a conexão morta.
-    // Uma verificação com op_ping exigiria await e tornaria a lógica mais complexa.
-    true
+/// Filtra conexões já marcadas com erro de I/O ou desync; não detecta o servidor
+/// ter derrubado o socket de forma silenciosa (a primeira operação revelará isso,
+/// e aí a conexão é marcada e descartada na devolução).
+fn conn_is_alive(conn: &Connection) -> bool {
+    conn.is_healthy()
 }
 
 /// Guard que representa uma conexão retirada do pool.

@@ -34,6 +34,10 @@ pub struct FbStream {
     wbuf: Vec<u8>,
     read_cipher: Option<Box<dyn Cipher>>,
     write_cipher: Option<Box<dyn Cipher>>,
+    /// Verdadeiro após um erro de I/O ou um desync de protocolo: o stream pode
+    /// ter bytes pendentes em estado desconhecido e não deve ser reutilizado (o
+    /// pool descarta conexões assim marcadas em vez de devolvê-las).
+    broken: bool,
 }
 
 impl FbStream {
@@ -46,7 +50,18 @@ impl FbStream {
             wbuf: Vec::with_capacity(1024),
             read_cipher: None,
             write_cipher: None,
+            broken: false,
         }
+    }
+
+    /// Marca o stream como inutilizável (erro de I/O ou desync de protocolo).
+    pub fn mark_broken(&mut self) {
+        self.broken = true;
+    }
+
+    /// Se o stream sofreu um erro de I/O ou desync e não deve ser reutilizado.
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// Instala as cifras de wire negociadas. Chamado uma vez, logo após o handshake
@@ -82,8 +97,14 @@ impl FbStream {
         if let Some(c) = self.write_cipher.as_mut() {
             c.process(&mut self.wbuf);
         }
-        self.sock.write_all(&self.wbuf).await?;
-        self.sock.flush().await?;
+        if let Err(e) = self.sock.write_all(&self.wbuf).await {
+            self.broken = true;
+            return Err(e.into());
+        }
+        if let Err(e) = self.sock.flush().await {
+            self.broken = true;
+            return Err(e.into());
+        }
         self.wbuf.clear();
         Ok(())
     }
@@ -110,8 +131,15 @@ impl FbStream {
 
         while self.rbuf.len() - self.rpos < n {
             let mut chunk = [0u8; 8192];
-            let got = self.sock.read(&mut chunk).await?;
+            let got = match self.sock.read(&mut chunk).await {
+                Ok(n) => n,
+                Err(e) => {
+                    self.broken = true;
+                    return Err(e.into());
+                }
+            };
             if got == 0 {
+                self.broken = true;
                 return Err(Error::Closed);
             }
             let slice = &mut chunk[..got];

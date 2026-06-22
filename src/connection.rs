@@ -179,6 +179,13 @@ impl Connection {
         self.stream.is_encrypted()
     }
 
+    /// Se a conexão ainda está sã (sem erro de I/O nem desync de protocolo). O
+    /// [`crate::Pool`] usa isto para descartar conexões com falha em vez de
+    /// devolvê-las ao conjunto de ociosas.
+    pub fn is_healthy(&self) -> bool {
+        !self.stream.is_broken()
+    }
+
     // -- acessores internos para módulos irmãos ----------------------------
 
     pub(crate) fn io(&mut self) -> &mut FbStream {
@@ -277,6 +284,7 @@ pub(crate) async fn handshake(
     connect_op: i32,
     target: &str,
 ) -> Result<Handshake> {
+    config.validate()?;
     let addr = (config.host.as_str(), config.port);
     let sock = TcpStream::connect(addr).await?;
     let mut stream = FbStream::new(sock);
@@ -369,7 +377,7 @@ fn compute_auth(
 
     let (salt, b_pub) = parse_server_data(&accept.data)?;
     let user = config.normalized_user();
-    let (proof, key) = srp.proof(&user, &config.password, &salt, &b_pub);
+    let (proof, key) = srp.proof(&user, &config.password, &salt, &b_pub)?;
 
     Ok(Some(AuthData {
         plugin: accept.plugin.clone(),
