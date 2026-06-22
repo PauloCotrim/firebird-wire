@@ -24,6 +24,9 @@ pub enum Value {
     Bytes(Vec<u8>),
     /// Identificador de blob (busque o conteúdo separadamente).
     Blob(u64),
+    /// Identificador de ARRAY (um quad, como o blob). Leia os elementos com
+    /// [`crate::Connection::read_array`] usando o [`crate::ArrayDesc`] da coluna.
+    Array(u64),
     /// Dias desde 1858-11-17 (a época Firebird/Modified-Julian).
     Date(i32),
     /// Hora em décimos de milésimo de segundo desde a meia-noite.
@@ -324,7 +327,7 @@ impl ColumnMeta {
             sql_type::DOUBLE | sql_type::D_FLOAT => 8,
             sql_type::TYPE_DATE | sql_type::TYPE_TIME => 4,
             sql_type::TIMESTAMP => 8,
-            sql_type::BLOB | sql_type::QUAD => 8,
+            sql_type::BLOB | sql_type::QUAD | sql_type::ARRAY => 8,
             sql_type::BOOLEAN => 4,
             sql_type::DEC16 => 8,
             sql_type::DEC34 => 16,

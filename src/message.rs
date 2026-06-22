@@ -54,7 +54,7 @@ fn type_size_align(col: &ColumnMeta) -> (usize, usize) {
         sql_type::INT64 => (8, 8),
         sql_type::DOUBLE | sql_type::D_FLOAT => (8, 8),
         sql_type::TIMESTAMP => (8, 4),
-        sql_type::BLOB | sql_type::QUAD => (8, 4),
+        sql_type::BLOB | sql_type::QUAD | sql_type::ARRAY => (8, 4),
         sql_type::INT128 => (16, 8),
         sql_type::BOOLEAN => (1, 1),
         sql_type::DEC16 => (8, 8),
@@ -158,6 +158,11 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
         },
         sql_type::BLOB | sql_type::QUAD => match val {
             Value::Blob(id) => out.extend_from_slice(&id.to_be_bytes()),
+            _ => return Err(mismatch()),
+        },
+        // Coluna ARRAY como parâmetro: passa um id de array existente (quad 8 B).
+        sql_type::ARRAY => match val {
+            Value::Array(id) => out.extend_from_slice(&id.to_be_bytes()),
             _ => return Err(mismatch()),
         },
         // WITH TIME ZONE como parâmetro: o BLR de entrada usa o formato base
@@ -281,6 +286,9 @@ async fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset)
             Value::TimestampTz(crate::value::TimestampTz { utc_date, utc_time, zone, offset })
         }
         sql_type::BLOB | sql_type::QUAD => Value::Blob(stream.read_quad().await?),
+        // Coluna ARRAY: chega como um id de 8 bytes (quad), igual ao blob; os
+        // elementos são buscados à parte via op_get_slice (ver [`crate::array`]).
+        sql_type::ARRAY => Value::Array(stream.read_quad().await?),
         sql_type::BOOLEAN => {
             let b = stream.read_raw(1).await?;
             stream.read_pad(1).await?;

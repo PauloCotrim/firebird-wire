@@ -52,6 +52,9 @@ pub mod op {
     pub const INFO_BLOB: i32 = 43;
     pub const OPEN_BLOB2: i32 = 56;
     pub const CREATE_BLOB2: i32 = 57;
+    pub const GET_SLICE: i32 = 58;
+    pub const PUT_SLICE: i32 = 59;
+    pub const SLICE: i32 = 60;
     pub const SEEK_BLOB: i32 = 61;
 
     pub const ALLOCATE_STATEMENT: i32 = 62;
@@ -664,6 +667,28 @@ pub mod blr {
     pub const TIMESTAMP_TZ: u8 = 29;
     pub const EX_TIME_TZ: u8 = 30; // formato estendido: inclui o offset resolvido
     pub const EX_TIMESTAMP_TZ: u8 = 31;
+}
+
+// ---------------------------------------------------------------------------
+// SDL (Slice Description Language): o bytecode que descreve a fatia de um ARRAY
+// pedida em op_get_slice/op_put_slice. Verbos de `isc_sdl_*` (consts_pub.h).
+// O descritor do elemento dentro de `struct` usa códigos BLR (módulo `blr`).
+// ---------------------------------------------------------------------------
+
+pub mod sdl {
+    pub const VERSION1: u8 = 1;
+    pub const EOC: u8 = 255; // fim da cláusula
+    pub const RELATION: u8 = 2; // + len(1) + nome
+    pub const FIELD: u8 = 4; // + len(1) + nome
+    pub const STRUCT: u8 = 6; // + count(1) + (descritor BLR do elemento)×count
+    pub const VARIABLE: u8 = 7; // + n(1): referência à variável de laço n
+    pub const SCALAR: u8 = 8; // + elem(1) + ndims(1) + (subscrito)×ndims
+    pub const TINY_INTEGER: u8 = 9; // + valor(1)
+    pub const SHORT_INTEGER: u8 = 10; // + valor(2 LE)
+    pub const LONG_INTEGER: u8 = 11; // + valor(4 LE)
+    pub const DO2: u8 = 34; // + var(1) + limite_inf(literal) + limite_sup(literal)
+    pub const DO1: u8 = 35; // + var(1) + limite_sup(literal); limite_inf implícito = 1
+    pub const ELEMENT: u8 = 36; // + n(1): nº de elementos do struct atribuídos
 }
 
 // ---------------------------------------------------------------------------

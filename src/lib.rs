@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod array;
 pub mod auth;
 pub mod batch;
 pub mod blob;
@@ -37,6 +38,7 @@ pub mod tz;
 pub mod value;
 pub mod wire;
 
+pub use array::{ArrayDesc, Dimension};
 pub use batch::{Batch, BatchError, BatchResult};
 pub use blob::{Blob, BlobWriter};
 pub use charset::Charset;

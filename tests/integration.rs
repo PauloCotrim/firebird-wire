@@ -263,6 +263,100 @@ async fn write_blob_multipart() -> Result<()> {
 }
 
 #[tokio::test]
+async fn read_array_from_employee() -> Result<()> {
+    // JOB.LANGUAGE_REQ está em CHARACTER SET NONE. A fatia de array é
+    // transliterada para o charset da conexão; conectar com NONE evita a
+    // conversão (que estouraria a largura nativa do elemento — o próprio
+    // fbclient falha ao ler este array sobre uma conexão UTF8).
+    let cfg = require_server!().charset("NONE");
+    let mut conn = Connection::connect(&cfg).await?;
+    let tx = conn.begin().await?;
+
+    // JOB.LANGUAGE_REQ é uma coluna VARCHAR(15)[1:5] já populada no employee.fdb.
+    let desc = conn.array_desc(&tx, "JOB", "LANGUAGE_REQ").await?;
+    assert_eq!(desc.blr_type, 37, "VARYING"); // RDB$FIELD_TYPE de VARCHAR
+    assert_eq!(desc.length, 15);
+    assert_eq!(desc.element_count(), 5);
+    assert_eq!(desc.dimensions, vec![fdb_driver::Dimension { lower: 1, upper: 5 }]);
+
+    let mut stmt = conn
+        .prepare(&tx, "SELECT LANGUAGE_REQ FROM JOB WHERE LANGUAGE_REQ IS NOT NULL ROWS 1")
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let rows = stmt.fetch_all(&mut conn).await?;
+    stmt.drop_statement(&mut conn).await?;
+
+    let Value::Array(id) = rows[0][0] else {
+        panic!("esperava Value::Array, recebi {:?}", rows[0][0]);
+    };
+    let elems = conn.read_array(&tx, id, &desc).await?;
+    assert_eq!(elems.len(), 5);
+    // Junta o texto de todos os elementos; o employee inclui "English" em todas
+    // as linhas de LANGUAGE_REQ (os valores trazem um '\n' ao final).
+    let joined: String = elems.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("|");
+    println!("LANGUAGE_REQ = {joined:?}");
+    assert!(joined.contains("English"), "esperava 'English' em {joined:?}");
+
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn array_roundtrip() -> Result<()> {
+    // Conexão NONE: a fatia de array não é transliterada, então os bytes UTF-8 de
+    // WORDS são gravados e relidos verbatim (round-trip exato sem conversão).
+    let cfg = require_server!().charset("NONE");
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // DDL com autocommit (tx implícita). Limpa um resto de execução anterior.
+    let _ = conn.exec_immediate(None, "DROP TABLE ARR_RT_TEST").await;
+    conn.exec_immediate(
+        None,
+        "CREATE TABLE ARR_RT_TEST (ID INTEGER, NUMS INTEGER[1:4], WORDS VARCHAR(10)[1:3])",
+    )
+    .await?;
+
+    let tx = conn.begin().await?;
+    let nums_desc = conn.array_desc(&tx, "ARR_RT_TEST", "NUMS").await?;
+    let words_desc = conn.array_desc(&tx, "ARR_RT_TEST", "WORDS").await?;
+    assert_eq!(nums_desc.blr_type, 8); // LONG
+    assert_eq!(nums_desc.element_count(), 4);
+    assert_eq!(words_desc.blr_type, 37); // VARYING
+    assert_eq!(words_desc.element_count(), 3);
+
+    // Cria os dois arrays e insere a linha referenciando seus ids.
+    let nums = [Value::Int(10), Value::Int(-20), Value::Int(30), Value::Int(40)];
+    let words = [Value::Text("um".into()), Value::Text("dois".into()), Value::Text("três".into())];
+    let nums_id = conn.write_array(&tx, &nums_desc, &nums).await?;
+    let words_id = conn.write_array(&tx, &words_desc, &words).await?;
+
+    let mut ins = conn.prepare(&tx, "INSERT INTO ARR_RT_TEST (ID, NUMS, WORDS) VALUES (1, ?, ?)").await?;
+    ins.execute(&mut conn, &tx, &[Value::Array(nums_id), Value::Array(words_id)]).await?;
+    ins.drop_statement(&mut conn).await?;
+
+    // Relê os arrays a partir dos ids armazenados na linha.
+    let mut sel = conn.prepare(&tx, "SELECT NUMS, WORDS FROM ARR_RT_TEST WHERE ID = 1").await?;
+    sel.execute(&mut conn, &tx, &[]).await?;
+    let row = sel.fetch_all(&mut conn).await?.remove(0);
+    sel.drop_statement(&mut conn).await?;
+
+    let (Value::Array(nid), Value::Array(wid)) = (row[0].clone(), row[1].clone()) else {
+        panic!("esperava duas colunas ARRAY, recebi {row:?}");
+    };
+    let got_nums = conn.read_array(&tx, nid, &nums_desc).await?;
+    let got_words = conn.read_array(&tx, wid, &words_desc).await?;
+    assert_eq!(got_nums, nums, "round-trip de INTEGER[1:4] falhou");
+    assert_eq!(got_words, words, "round-trip de VARCHAR(10)[1:3] falhou (inclui UTF-8)");
+    println!("array round-trip: nums={got_nums:?} words={got_words:?}");
+
+    tx.commit(&mut conn).await?;
+    conn.exec_immediate(None, "DROP TABLE ARR_RT_TEST").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn pool_basic() -> Result<()> {
     let cfg = require_server!();
     let pool = Pool::new(cfg, PoolConfig { max_size: 3, ..Default::default() });
