@@ -1189,6 +1189,58 @@ async fn service_backup_restore() -> Result<()> {
     Ok(())
 }
 
+/// Ações de manutenção: validação online, nbackup, propriedades (sweep), repair
+/// e trace_list. Monta um banco descartável por backup+restore para não mexer no
+/// `employee` compartilhado.
+#[tokio::test]
+async fn service_maintenance_actions() -> Result<()> {
+    use fdb_driver::wire::consts::svc_rpr;
+    let cfg = require_server!();
+    let db = std::env::var("FB_DB").unwrap_or_else(|_| "employee".into());
+
+    let dir = std::env::temp_dir().join(format!("fdb_maint_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+    }
+    let fbk = dir.join("seed.fbk");
+    let test_db = dir.join("maint.fdb");
+    let nbk = dir.join("maint.nbk0");
+
+    let mut svc = fdb_driver::ServiceManager::attach(&cfg).await?;
+    svc.backup(&db, fbk.to_str().unwrap(), 0).await?;
+    svc.restore(fbk.to_str().unwrap(), test_db.to_str().unwrap(), 0).await?;
+    let target = test_db.to_str().unwrap();
+
+    // Validação online (somente diagnóstico).
+    let val = svc.validate(target, None, None).await?;
+    println!("validate: {} bytes", val.len());
+
+    // Propriedades: ajusta o intervalo de sweep (reversível, sem saída).
+    svc.set_sweep_interval(target, 12345).await?;
+    println!("set_sweep_interval ok");
+
+    // Repair em modo de checagem (somente validação, não escreve).
+    let rep = svc.repair(target, svc_rpr::VALIDATE_DB).await?;
+    println!("repair(validate): {} bytes", rep.len());
+
+    // nbackup nível 0 → cria o arquivo de backup incremental.
+    let nb = svc.nbackup(target, nbk.to_str().unwrap(), 0, 0).await?;
+    println!("nbackup: {} bytes", nb.len());
+    assert!(nbk.exists(), "nbackup deveria ter criado o arquivo");
+
+    // Lista de sessões de trace (deve ter sucesso, mesmo que vazia).
+    let traces = svc.trace_list().await?;
+    println!("trace_list: {} bytes", traces.len());
+
+    svc.close().await?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// Gestão de usuários: cria, lista, altera e remove um usuário descartável no
 /// banco de segurança (`isc_action_svc_add/modify/delete_user` +
 /// `isc_info_svc_get_users`). Usa um nome único e remove no fim para não deixar

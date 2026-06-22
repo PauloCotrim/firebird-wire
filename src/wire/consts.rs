@@ -262,7 +262,98 @@ pub mod svc_action {
     pub const NREST: u8 = 21;
     pub const TRACE_START: u8 = 22;
     pub const TRACE_STOP: u8 = 23;
+    pub const TRACE_SUSPEND: u8 = 24;
+    pub const TRACE_RESUME: u8 = 25;
+    pub const TRACE_LIST: u8 = 26;
     pub const VALIDATE: u8 = 30;
+}
+
+/// Argumentos de SPB para `isc_action_svc_nbak`/`nrest` (`isc_spb_nbk_*`).
+pub mod svc_nbk {
+    pub const LEVEL: u8 = 5; // inteiro: nível do backup incremental
+    pub const FILE: u8 = 6; // string: arquivo de backup
+    pub const DIRECT: u8 = 7; // string: "ON"/"OFF" (I/O direto)
+    pub const GUID: u8 = 8; // string: GUID em vez de nível
+    pub const CLEAN_HISTORY: u8 = 9;
+    pub const KEEP_DAYS: u8 = 10;
+    pub const KEEP_ROWS: u8 = 11;
+
+    // Bits de opção em `isc_spb_options` (108).
+    pub const NO_TRIGGERS: u32 = 0x01;
+    pub const IN_PLACE: u32 = 0x02;
+    pub const SEQUENCE: u32 = 0x04;
+}
+
+/// Argumentos de SPB para as ações de trace (`isc_spb_trc_*`).
+pub mod svc_trc {
+    pub const ID: u8 = 1; // inteiro: id da sessão (stop/suspend/resume)
+    pub const NAME: u8 = 2; // string: nome da sessão
+    pub const CFG: u8 = 3; // string: texto de configuração do trace
+}
+
+/// Argumentos de SPB para `isc_action_svc_validate` (`isc_spb_val_*`).
+pub mod svc_val {
+    pub const TAB_INCL: u8 = 1; // string: regex de tabelas a validar
+    pub const TAB_EXCL: u8 = 2; // string: regex de tabelas a excluir
+    pub const IDX_INCL: u8 = 3; // string: regex de índices a validar
+    pub const IDX_EXCL: u8 = 4; // string: regex de índices a excluir
+    pub const LOCK_TIMEOUT: u8 = 5; // inteiro: espera pelo lock da tabela (s)
+}
+
+/// Bits de opção (em `isc_spb_options`) para `isc_action_svc_repair`
+/// (`isc_spb_rpr_*`), combináveis com `|`.
+pub mod svc_rpr {
+    pub const VALIDATE_DB: u32 = 0x01;
+    pub const SWEEP_DB: u32 = 0x02;
+    pub const MEND_DB: u32 = 0x04;
+    pub const LIST_LIMBO_TRANS: u32 = 0x08;
+    pub const CHECK_DB: u32 = 0x10;
+    pub const IGNORE_CHECKSUM: u32 = 0x20;
+    pub const KILL_SHADOWS: u32 = 0x40;
+    pub const FULL: u32 = 0x80;
+    pub const ICU: u32 = 0x0800;
+    pub const UPGRADE_DB: u32 = 0x1000;
+}
+
+/// Argumentos e valores de SPB para `isc_action_svc_properties` (`isc_spb_prp_*`).
+pub mod svc_prp {
+    pub const PAGE_BUFFERS: u8 = 5; // inteiro
+    pub const SWEEP_INTERVAL: u8 = 6; // inteiro
+    pub const SHUTDOWN_DB: u8 = 7; // inteiro: timeout (legado)
+    pub const DENY_NEW_ATTACHMENTS: u8 = 9; // inteiro: timeout (legado)
+    pub const DENY_NEW_TRANSACTIONS: u8 = 10; // inteiro: timeout (legado)
+    pub const RESERVE_SPACE: u8 = 11; // byte: RES_USE_FULL / RES
+    pub const WRITE_MODE: u8 = 12; // byte: WM_ASYNC / WM_SYNC
+    pub const ACCESS_MODE: u8 = 13; // byte: AM_READONLY / AM_READWRITE
+    pub const SET_SQL_DIALECT: u8 = 14; // inteiro
+    pub const FORCE_SHUTDOWN: u8 = 41; // inteiro: timeout
+    pub const ATTACHMENTS_SHUTDOWN: u8 = 42; // inteiro: timeout
+    pub const TRANSACTIONS_SHUTDOWN: u8 = 43; // inteiro: timeout
+    pub const SHUTDOWN_MODE: u8 = 44; // byte: SM_*
+    pub const ONLINE_MODE: u8 = 45; // byte: SM_*
+
+    // Bits de opção em `isc_spb_options` (108).
+    pub const ACTIVATE: u32 = 0x0100;
+    pub const DB_ONLINE: u32 = 0x0200;
+    pub const NOLINGER: u32 = 0x0400;
+
+    // Valores para SHUTDOWN_MODE / ONLINE_MODE.
+    pub const SM_NORMAL: u8 = 0;
+    pub const SM_MULTI: u8 = 1;
+    pub const SM_SINGLE: u8 = 2;
+    pub const SM_FULL: u8 = 3;
+
+    // Valores para RESERVE_SPACE.
+    pub const RES_USE_FULL: u8 = 35;
+    pub const RES: u8 = 36;
+
+    // Valores para WRITE_MODE.
+    pub const WM_ASYNC: u8 = 37;
+    pub const WM_SYNC: u8 = 38;
+
+    // Valores para ACCESS_MODE.
+    pub const AM_READONLY: u8 = 39;
+    pub const AM_READWRITE: u8 = 40;
 }
 
 /// Itens de info de serviço para `op_service_info` (`isc_info_svc_*`).

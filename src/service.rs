@@ -244,6 +244,199 @@ impl ServiceManager {
         self.run(&spb.into_vec()).await
     }
 
+    // -- nbackup (backup incremental) ---------------------------------------
+
+    /// Backup incremental (`nbackup`) de `database` para `backup_file` (caminho
+    /// **no servidor**) no `level` dado (0 = base de uma cadeia incremental).
+    /// `options` é um bitmask de `svc_nbk::*` (use `0` para o padrão). Devolve a
+    /// saída textual.
+    pub async fn nbackup(
+        &mut self,
+        database: &str,
+        backup_file: &str,
+        level: u32,
+        options: u32,
+    ) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::NBAK);
+        spb.string(spb::DBNAME, database);
+        spb.string(svc_nbk::FILE, backup_file);
+        spb.int(svc_nbk::LEVEL, level);
+        if options != 0 {
+            spb.int(spb::OPTIONS, options);
+        }
+        self.run(&spb.into_vec()).await
+    }
+
+    /// Restauração incremental (`nrestore`): reconstrói `database` (caminho **no
+    /// servidor**) aplicando `backup_files` em ordem (nível 0 primeiro).
+    pub async fn nrestore(
+        &mut self,
+        database: &str,
+        backup_files: &[&str],
+        options: u32,
+    ) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::NREST);
+        spb.string(spb::DBNAME, database);
+        for file in backup_files {
+            spb.string(svc_nbk::FILE, file);
+        }
+        if options != 0 {
+            spb.int(spb::OPTIONS, options);
+        }
+        self.run(&spb.into_vec()).await
+    }
+
+    // -- validação online ---------------------------------------------------
+
+    /// Validação ONLINE de `database` (`isc_action_svc_validate`). `tables` e
+    /// `indices` são expressões regulares opcionais (None = tudo). Devolve o
+    /// relatório textual.
+    pub async fn validate(
+        &mut self,
+        database: &str,
+        tables: Option<&str>,
+        indices: Option<&str>,
+    ) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::VALIDATE);
+        spb.string(spb::DBNAME, database);
+        if let Some(t) = tables {
+            spb.string(svc_val::TAB_INCL, t);
+        }
+        if let Some(i) = indices {
+            spb.string(svc_val::IDX_INCL, i);
+        }
+        self.run(&spb.into_vec()).await
+    }
+
+    // -- repair / gfix ------------------------------------------------------
+
+    /// Manutenção/reparo de `database` via `gfix` (`isc_action_svc_repair`).
+    /// `options` é um bitmask de `svc_rpr::*` (ex.: `MEND_DB | FULL`, ou
+    /// `VALIDATE_DB` para checagem). Devolve a saída textual.
+    pub async fn repair(&mut self, database: &str, options: u32) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::REPAIR);
+        spb.string(spb::DBNAME, database);
+        spb.int(spb::OPTIONS, options);
+        self.run(&spb.into_vec()).await
+    }
+
+    /// Atalho de [`repair`](Self::repair) que dispara um sweep manual.
+    pub async fn sweep(&mut self, database: &str) -> Result<String> {
+        self.repair(database, svc_rpr::SWEEP_DB).await
+    }
+
+    // -- propriedades (gfix) ------------------------------------------------
+
+    /// Define o intervalo de sweep automático em transações (`gfix -h`).
+    pub async fn set_sweep_interval(&mut self, database: &str, interval: u32) -> Result<()> {
+        self.properties(database, |s| {
+            s.int(svc_prp::SWEEP_INTERVAL, interval);
+        })
+        .await
+    }
+
+    /// Define o tamanho do cache do banco em páginas (`gfix -buffers`).
+    pub async fn set_page_buffers(&mut self, database: &str, buffers: u32) -> Result<()> {
+        self.properties(database, |s| {
+            s.int(svc_prp::PAGE_BUFFERS, buffers);
+        })
+        .await
+    }
+
+    /// Liga/desliga a escrita síncrona (forced writes) do banco (`gfix -write`).
+    pub async fn set_forced_writes(&mut self, database: &str, sync: bool) -> Result<()> {
+        let mode = if sync { svc_prp::WM_SYNC } else { svc_prp::WM_ASYNC };
+        self.properties(database, |s| {
+            s.byte(svc_prp::WRITE_MODE, mode);
+        })
+        .await
+    }
+
+    /// Define o modo de acesso do banco: somente leitura ou leitura/escrita
+    /// (`gfix -mode`).
+    pub async fn set_read_only(&mut self, database: &str, read_only: bool) -> Result<()> {
+        let mode = if read_only { svc_prp::AM_READONLY } else { svc_prp::AM_READWRITE };
+        self.properties(database, |s| {
+            s.byte(svc_prp::ACCESS_MODE, mode);
+        })
+        .await
+    }
+
+    /// Coloca o banco OFFLINE (shutdown) no `mode` dado (`svc_prp::SM_*`),
+    /// aguardando até `timeout` segundos pelo término das conexões ativas.
+    pub async fn shutdown(&mut self, database: &str, mode: u8, timeout: u32) -> Result<()> {
+        self.properties(database, |s| {
+            s.byte(svc_prp::SHUTDOWN_MODE, mode);
+            s.int(svc_prp::ATTACHMENTS_SHUTDOWN, timeout);
+        })
+        .await
+    }
+
+    /// Traz o banco de volta ONLINE no `mode` dado (`svc_prp::SM_*`).
+    pub async fn bring_online(&mut self, database: &str, mode: u8) -> Result<()> {
+        self.properties(database, |s| {
+            s.byte(svc_prp::ONLINE_MODE, mode);
+        })
+        .await
+    }
+
+    /// Helper interno: dispara `isc_action_svc_properties` sobre `database` com os
+    /// argumentos montados por `build`, descartando a saída.
+    async fn properties<F>(&mut self, database: &str, build: F) -> Result<()>
+    where
+        F: FnOnce(&mut ActionSpb),
+    {
+        let mut spb = ActionSpb::new(svc_action::PROPERTIES);
+        spb.string(spb::DBNAME, database);
+        build(&mut spb);
+        self.run(&spb.into_vec()).await?;
+        Ok(())
+    }
+
+    // -- trace --------------------------------------------------------------
+
+    /// Inicia uma sessão de trace com o texto de configuração `config` (formato
+    /// `fbtrace.conf`); `name` rotula a sessão. Devolve a saída inicial (que
+    /// inclui a linha "Trace session ID N started"). A sessão continua no servidor
+    /// após o retorno — pare-a com [`trace_stop`](Self::trace_stop). Para drenar o
+    /// fluxo contínuo de eventos use uma conexão de serviço DEDICADA, pois esta
+    /// chamada lê apenas a saída já disponível.
+    pub async fn trace_start(&mut self, name: &str, config: &str) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::TRACE_START);
+        if !name.is_empty() {
+            spb.string(svc_trc::NAME, name);
+        }
+        spb.string(svc_trc::CFG, config);
+        self.run(&spb.into_vec()).await
+    }
+
+    /// Para a sessão de trace de id `session_id`.
+    pub async fn trace_stop(&mut self, session_id: u32) -> Result<String> {
+        self.trace_action(svc_action::TRACE_STOP, session_id).await
+    }
+
+    /// Suspende a sessão de trace de id `session_id`.
+    pub async fn trace_suspend(&mut self, session_id: u32) -> Result<String> {
+        self.trace_action(svc_action::TRACE_SUSPEND, session_id).await
+    }
+
+    /// Retoma a sessão de trace de id `session_id`.
+    pub async fn trace_resume(&mut self, session_id: u32) -> Result<String> {
+        self.trace_action(svc_action::TRACE_RESUME, session_id).await
+    }
+
+    /// Lista as sessões de trace ativas no servidor.
+    pub async fn trace_list(&mut self) -> Result<String> {
+        let spb = ActionSpb::new(svc_action::TRACE_LIST);
+        self.run(&spb.into_vec()).await
+    }
+
+    async fn trace_action(&mut self, action: u8, session_id: u32) -> Result<String> {
+        let mut spb = ActionSpb::new(action);
+        spb.int(svc_trc::ID, session_id);
+        self.run(&spb.into_vec()).await
+    }
+
     // -- gestão de usuários (banco de segurança) ----------------------------
 
     /// Cria um usuário no banco de segurança (`isc_action_svc_add_user`).
@@ -358,6 +551,14 @@ impl ActionSpb {
     fn int(&mut self, tag: u8, value: u32) -> &mut Self {
         self.buf.push(tag);
         self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// Argumento de um único byte: `tag | valor(1)`. Usado pelos parâmetros de
+    /// modo de `isc_action_svc_properties` (write/access/shutdown mode).
+    fn byte(&mut self, tag: u8, value: u8) -> &mut Self {
+        self.buf.push(tag);
+        self.buf.push(value);
         self
     }
 
@@ -602,6 +803,38 @@ mod tests {
         assert!(spb.windows(6).any(|w| w == b"SYSDBA"));
         // sem sessão SRP -> senha legada presente como clumplet.
         assert!(spb.contains(&spb::PASSWORD));
+    }
+
+    #[test]
+    fn action_spb_byte_and_int_layout() {
+        // properties: dbname (string, len 2 LE) + write_mode (byte) + sweep (int 4 LE).
+        let mut spb = ActionSpb::new(svc_action::PROPERTIES);
+        spb.string(spb::DBNAME, "db");
+        spb.byte(svc_prp::WRITE_MODE, svc_prp::WM_SYNC);
+        spb.int(svc_prp::SWEEP_INTERVAL, 5000);
+        let v = spb.into_vec();
+        assert_eq!(
+            v,
+            vec![
+                svc_action::PROPERTIES,
+                spb::DBNAME, 2, 0, b'd', b'b',
+                svc_prp::WRITE_MODE, svc_prp::WM_SYNC,
+                svc_prp::SWEEP_INTERVAL, 0x88, 0x13, 0, 0, // 5000 LE
+            ]
+        );
+    }
+
+    #[test]
+    fn nbackup_spb_has_level_as_int() {
+        let mut spb = ActionSpb::new(svc_action::NBAK);
+        spb.string(spb::DBNAME, "d");
+        spb.string(svc_nbk::FILE, "f");
+        spb.int(svc_nbk::LEVEL, 0);
+        let v = spb.into_vec();
+        assert_eq!(v[0], svc_action::NBAK);
+        // ...dbname "d"... então nbk_file "f"... então nbk_level 0 (4 LE).
+        assert!(v.windows(4).any(|w| w == [svc_nbk::FILE, 1, 0, b'f']));
+        assert!(v.ends_with(&[svc_nbk::LEVEL, 0, 0, 0, 0]));
     }
 
     #[test]
