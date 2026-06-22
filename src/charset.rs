@@ -26,6 +26,9 @@ pub enum Charset {
     /// multibyte (SJIS/EUC/GBK/Big5/…) e single-byte adicionais.
     #[cfg(feature = "charset-full")]
     Encoding(&'static encoding_rs::Encoding),
+    /// Code page DOS/OEM single-byte (CP437/850/852/860/…): bytes `< 0x80` são
+    /// ASCII; `0x80..=0xFF` seguem a tabela embutida. Sempre disponível.
+    Dos(&'static [char; 128]),
     /// Charset não reconhecido: decodifica como UTF-8 com perdas.
     Unknown,
 }
@@ -46,7 +49,10 @@ impl Charset {
             "UTF8" | "UNICODEFSS" => Charset::Utf8,
             "ISO88591" | "LATIN1" => Charset::Latin1,
             "WIN1252" | "WINDOWS1252" => Charset::Win1252,
-            other => Self::resolve_extra(other),
+            other => match dos_table(other) {
+                Some(table) => Charset::Dos(table),
+                None => Self::resolve_extra(other),
+            },
         }
     }
 
@@ -76,6 +82,10 @@ impl Charset {
             Charset::Win1252 => raw.iter().map(|&b| win1252_char(b)).collect(),
             #[cfg(feature = "charset-full")]
             Charset::Encoding(enc) => enc.decode(raw).0.into_owned(),
+            Charset::Dos(table) => raw
+                .iter()
+                .map(|&b| if b < 0x80 { b as char } else { table[(b - 0x80) as usize] })
+                .collect(),
         }
     }
 
@@ -94,8 +104,47 @@ impl Charset {
             Charset::Win1252 => s.chars().map(win1252_byte).collect(),
             #[cfg(feature = "charset-full")]
             Charset::Encoding(enc) => enc.encode(s).0.into_owned(),
+            Charset::Dos(table) => s
+                .chars()
+                .map(|c| {
+                    if (c as u32) < 0x80 {
+                        c as u8
+                    } else {
+                        // Busca reversa na tabela de 128 entradas (alta).
+                        table
+                            .iter()
+                            .position(|&t| t == c)
+                            .map_or(b'?', |i| (i + 0x80) as u8)
+                    }
+                })
+                .collect(),
         }
     }
+}
+
+/// Resolve um nome de charset DOS/OEM do Firebird (já normalizado) para a tabela
+/// de code page embutida. `None` para nomes não-DOS.
+fn dos_table(n: &str) -> Option<&'static [char; 128]> {
+    use crate::dos::*;
+    Some(match n {
+        "DOS437" => &CP437,
+        "DOS737" => &CP737,
+        "DOS775" => &CP775,
+        "DOS850" => &CP850,
+        "DOS852" => &CP852,
+        "DOS855" => &CP855,
+        "DOS857" => &CP857,
+        "DOS858" => &CP858,
+        "DOS860" => &CP860,
+        "DOS861" => &CP861,
+        "DOS862" => &CP862,
+        "DOS863" => &CP863,
+        "DOS864" => &CP864,
+        "DOS865" => &CP865,
+        "DOS866" => &CP866,
+        "DOS869" => &CP869,
+        _ => return None,
+    })
 }
 
 /// Mapeia um nome de charset do Firebird (já normalizado: alfanumérico,
@@ -280,6 +329,23 @@ mod tests {
         assert_eq!(Charset::Latin1.encode("a€b"), b"a?b");
         // CJK fora de Win-1252.
         assert_eq!(Charset::Win1252.encode("x\u{4E00}y"), b"x?y");
+    }
+
+    #[test]
+    fn dos_code_pages_resolve_and_roundtrip() {
+        // Disponíveis SEM a feature charset-full (são tabelas embutidas).
+        assert!(matches!(Charset::from_name("DOS850"), Charset::Dos(_)));
+        assert!(matches!(Charset::from_name("DOS437"), Charset::Dos(_)));
+        // CP850: 0x82 = 'é', 0xA5 = 'Ñ'; ASCII passa direto.
+        let cp850 = Charset::from_name("DOS850");
+        assert_eq!(cp850.decode(&[0x41, 0x82, 0xA5]), "Aé\u{D1}");
+        assert_eq!(cp850.encode("Aé\u{D1}"), vec![0x41, 0x82, 0xA5]);
+        // CP860 (português): 0x84 = 'ã', 0x85 = 'à', 0x94 = 'õ'.
+        let cp860 = Charset::from_name("DOS860");
+        assert_eq!(cp860.decode(&[0x84, 0x85, 0x94]), "ãàõ");
+        assert_eq!(cp860.encode("ãàõ"), vec![0x84, 0x85, 0x94]);
+        // Caractere fora da code page vira '?'.
+        assert_eq!(cp850.encode("€"), b"?");
     }
 
     #[cfg(not(feature = "charset-full"))]
