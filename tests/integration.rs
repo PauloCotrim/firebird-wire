@@ -1112,6 +1112,15 @@ async fn service_manager() -> Result<()> {
     println!("security_database = {secdb}");
     assert!(!secdb.is_empty());
 
+    // Itens de info INTEIROS.
+    let mver = svc.manager_version().await?;
+    println!("manager_version = {mver}");
+    assert!(mver >= 2);
+    // Sem ação em curso, não há nada rodando nesta conexão.
+    let running = svc.is_running().await?;
+    println!("is_running = {running}");
+    assert!(!running);
+
     // Uma ação sem argumentos: lê o firebird.log do servidor.
     let log = svc.get_fb_log().await?;
     println!("fb_log: {} bytes", log.len());

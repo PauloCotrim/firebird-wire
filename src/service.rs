@@ -168,6 +168,19 @@ impl ServiceManager {
         self.query_string(svc_info::GET_ENV).await
     }
 
+    /// A versão do protocolo do Service Manager (`isc_info_svc_version`; um
+    /// inteiro, p.ex. `2` no Firebird 5).
+    pub async fn manager_version(&mut self) -> Result<i32> {
+        self.query_int(svc_info::VERSION).await
+    }
+
+    /// Indica se uma ação ainda está em execução nesta conexão de serviço
+    /// (`isc_info_svc_running`). Útil para sondar o andamento entre leituras de
+    /// saída de uma ação longa (backup, restore, etc.).
+    pub async fn is_running(&mut self) -> Result<bool> {
+        Ok(self.query_int(svc_info::RUNNING).await? != 0)
+    }
+
     // -- ações de alto nível ------------------------------------------------
 
     /// Lê o log do servidor (`firebird.log`) via `isc_action_svc_get_fb_log`.
@@ -283,6 +296,12 @@ impl ServiceManager {
         let data = self.info(&[], &[item], DEFAULT_INFO_BUF).await?;
         let value = parse_svc_string(&data, item)?;
         Ok(String::from_utf8_lossy(&value).into_owned())
+    }
+
+    /// Consulta um único item de info que devolve um inteiro.
+    async fn query_int(&mut self, item: u8) -> Result<i32> {
+        let data = self.info(&[], &[item], DEFAULT_INFO_BUF).await?;
+        parse_svc_int(&data, item)
     }
 }
 
@@ -548,6 +567,26 @@ fn parse_svc_string(data: &[u8], expected: u8) -> Result<Vec<u8>> {
     Ok(value.to_vec())
 }
 
+/// Extrai um item de info de serviço INTEIRO (`tag(1) | valor(4 LE)`, sem prefixo
+/// de comprimento — confirmado por strace de `fbsvcmgr info_version`: o item 54
+/// chega como `36 02 00 00 00 01`, valor 2 seguido de `isc_info_end`).
+fn parse_svc_int(data: &[u8], expected: u8) -> Result<i32> {
+    let payload = info_payload(data)?;
+    if payload.is_empty() {
+        return Err(Error::protocol("buffer de info de serviço vazio"));
+    }
+    if payload[0] != expected {
+        return Err(Error::protocol(format!(
+            "esperava item de serviço {expected}, veio {}",
+            payload[0]
+        )));
+    }
+    let v = payload
+        .get(1..5)
+        .ok_or_else(|| Error::protocol("item inteiro de info de serviço truncado"))?;
+    Ok(i32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +602,15 @@ mod tests {
         assert!(spb.windows(6).any(|w| w == b"SYSDBA"));
         // sem sessão SRP -> senha legada presente como clumplet.
         assert!(spb.contains(&spb::PASSWORD));
+    }
+
+    #[test]
+    fn parse_int_item_from_strace() {
+        // isc_info_svc_version capturado ao vivo: tag 54, valor 2 (4 LE), isc_info_end.
+        let buf = [svc_info::VERSION, 2, 0, 0, 0, INFO_END];
+        assert_eq!(parse_svc_int(&buf, svc_info::VERSION).unwrap(), 2);
+        // Tag inesperado é erro.
+        assert!(parse_svc_int(&buf, svc_info::RUNNING).is_err());
     }
 
     #[test]
