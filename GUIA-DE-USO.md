@@ -751,8 +751,7 @@ assíncrono.)
 - ⬜ Itens de info **inteiros** do serviço (`svc_version`, `svc_running`)
 - ⬜ Adaptador `futures::Stream` (hoje o streaming é *lending iterator*)
 
-Veja `PROXIMAS-ETAPAS.md` para o roadmap detalhado e `PROTOCOL-NOTES.md` para os
-layouts de wire já decodificados.
+Veja `PROTOCOL-NOTES.md` para os layouts de wire já decodificados.
 
 ---
 
