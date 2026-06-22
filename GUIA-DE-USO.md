@@ -17,21 +17,23 @@ Construído sobre [Tokio](https://tokio.rs).
 5. [Consultas (prepared statements)](#consultas-prepared-statements)
 6. [Streaming de linhas](#streaming-de-linhas)
 7. [Parâmetros e o tipo `Value`](#parâmetros-e-o-tipo-value)
-8. [Datas e horas](#datas-e-horas)
-9. [INSERT/UPDATE/DELETE e linhas afetadas](#insertupdatedelete-e-linhas-afetadas)
-10. [Cursores roláveis](#cursores-roláveis)
-11. [BLOBs](#blobs)
-12. [DML em lote (batch)](#dml-em-lote-batch)
-13. [BLOBs em lote](#blobs-em-lote)
-14. [Eventos do banco](#eventos-do-banco)
-15. [Pool de conexões](#pool-de-conexões)
-15. [Charsets](#charsets)
-16. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
-17. [Tratamento de erros](#tratamento-de-erros)
-18. [Boas práticas de fechamento](#boas-práticas-de-fechamento)
-19. [Recursos implementados](#recursos-implementados)
-20. [O que falta implementar](#o-que-falta-implementar)
-21. [Rodando os testes ao vivo](#rodando-os-testes-ao-vivo)
+8. [Tipos numéricos amplos (DECFLOAT / INT128)](#tipos-numéricos-amplos-decfloat--int128)
+9. [Datas e horas](#datas-e-horas)
+10. [INSERT/UPDATE/DELETE e linhas afetadas](#insertupdatedelete-e-linhas-afetadas)
+11. [Cursores roláveis](#cursores-roláveis)
+12. [BLOBs](#blobs)
+13. [DML em lote (batch)](#dml-em-lote-batch)
+14. [BLOBs em lote](#blobs-em-lote)
+15. [Eventos do banco](#eventos-do-banco)
+16. [Pool de conexões](#pool-de-conexões)
+17. [Charsets](#charsets)
+18. [Gerenciador de serviços (backup/restore/usuários)](#gerenciador-de-serviços-backuprestoreusuários)
+19. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
+20. [Tratamento de erros](#tratamento-de-erros)
+21. [Boas práticas de fechamento](#boas-práticas-de-fechamento)
+22. [Recursos implementados](#recursos-implementados)
+23. [O que falta implementar](#o-que-falta-implementar)
+24. [Rodando os testes ao vivo](#rodando-os-testes-ao-vivo)
 
 ---
 
@@ -251,7 +253,8 @@ pub enum Value {
     Date(i32),       // dias desde 1858-11-17 (cru)
     Time(u32),       // frações de 1/10000 s (cru)
     Timestamp(i32, u32),
-    Int128(i128),    // INT128
+    Int128(i128),    // INT128 (e NUMERIC/DECIMAL amplo, mantissa crua)
+    DecFloat(DecFloat),  // DECFLOAT(16)/DECFLOAT(34)
 }
 ```
 
@@ -264,6 +267,45 @@ let nulo: bool = row[2].is_null();
 ```
 
 Ou faça *pattern matching* direto nos variantes para ter o tipo exato.
+
+---
+
+## Tipos numéricos amplos (DECFLOAT / INT128)
+
+`INT128` e `NUMERIC`/`DECIMAL` com precisão > 18 chegam como `Value::Int128`
+(a mantissa crua; aplique a escala da coluna — `ColumnMeta::scale` — para pôr a
+vírgula). `DECFLOAT(16)` e `DECFLOAT(34)` são decodificados (formatos decimais
+IEEE 754 *decimal64*/*decimal128*) num `Value::DecFloat`:
+
+```rust
+use fdb_driver::{Value, DecFloat};
+
+if let Value::DecFloat(d) = &row[0] {
+    println!("{d}");                 // string decimal exata, ex.: "123.45"
+    if let Some((neg, coef, exp)) = d.to_parts() {
+        // valor = (se neg, -) coef * 10^exp
+    }
+    let _ = (d.is_finite(), d.is_nan(), d.is_infinite());
+}
+
+// INT128 / NUMERIC amplo:
+if let Value::Int128(v) = row[1] {
+    println!("mantissa = {v}");      // divida por 10^(-scale) para o valor real
+}
+```
+
+> **Atenção — `DataTypeCompatibility`.** Se o servidor estiver configurado com
+> `DataTypeCompatibility = 2.5`/`3.0` no `firebird.conf`, ele **coage** INT128 e
+> DECFLOAT para tipos legados (e chega a estourar ao ler um INT128 largo). Para
+> receber os tipos nativos, peça-os na sessão antes da consulta:
+>
+> ```rust
+> conn.exec_immediate(None, "SET BIND OF INT128 TO NATIVE").await?;
+> conn.exec_immediate(None, "SET BIND OF DECFLOAT TO NATIVE").await?;
+> ```
+
+DECFLOAT por enquanto é só **leitura**: passar um `Value::DecFloat` como
+parâmetro ainda não é suportado no *encode*.
 
 ---
 
@@ -519,6 +561,94 @@ Tanto a leitura (`Value::Text`) quanto a escrita de parâmetros de texto são
 transcodificadas. Caracteres não representáveis no charset alvo viram `?` na
 escrita.
 
+### Charsets multibyte (feature `charset-full`)
+
+A feature opcional **`charset-full`** traz o `encoding_rs` e habilita os charsets
+multibyte e single-byte adicionais: **SJIS, EUC-JP, EUC-KR, GBK, GB18030, Big5,
+KOI8-R/U, ISO-8859-2..16, Windows-1250..1258, TIS620**. Sem a feature, esses
+nomes recaem em UTF-8 com perdas (igual a antes).
+
+```toml
+[dependencies]
+fdb_driver = { path = "../fdb_driver", features = ["charset-full"] }
+```
+
+```rust
+let cfg = ConnectConfig::new()
+    /* ... */
+    .charset("WIN1251");          // ou SJIS_0208, EUCJ_0208, GBK, BIG_5, ...
+```
+
+Nesses charsets, caracteres não representáveis no *encode* viram referências
+numéricas HTML (`&#N;`), conforme o `encoding_rs`.
+
+---
+
+## Gerenciador de serviços (backup/restore/usuários)
+
+O `ServiceManager` fala com o *Service Manager* do Firebird (o mesmo handshake de
+uma conexão, mas no "banco" especial `service_mgr`). Serve para backup/restore
+(`gbak`), estatísticas (`gstat`), leitura do log e gestão de usuários. O campo
+`database` do `ConnectConfig` é ignorado.
+
+```rust
+use fdb_driver::ServiceManager;
+
+let mut svc = ServiceManager::attach(&cfg).await?;
+
+// Consultas de info:
+println!("{}", svc.server_version().await?);
+println!("{}", svc.implementation().await?);
+println!("{}", svc.security_database().await?);
+let log = svc.get_fb_log().await?;          // firebird.log
+
+svc.close().await?;
+```
+
+### Backup, restore e estatísticas
+
+Os caminhos de arquivo são **no servidor**. As saídas (modo verbose do gbak/gstat)
+voltam como `String`. As opções são bitmasks em `svc_bkp::*` / `svc_res::*` /
+`svc_sts::*` (use `0` para o padrão).
+
+```rust
+// Backup: (banco, arquivo .fbk, opções)
+let out = svc.backup("employee", "/srv/bkp/emp.fbk", 0).await?;
+
+// Restore: (arquivo .fbk, banco destino, opções) — CREATE é o padrão.
+use fdb_driver::wire::consts::svc_res;
+let out = svc.restore("/srv/bkp/emp.fbk", "/srv/db/emp2.fdb", svc_res::REPLACE).await?;
+
+// Estatísticas (gstat): (banco, opções)
+let stats = svc.statistics("employee", 0).await?;
+```
+
+### Gestão de usuários
+
+```rust
+use fdb_driver::{UserParams};
+
+// Criar:
+svc.add_user(&UserParams::new("MARIA")
+    .password("s3nh4")
+    .first_name("Maria").last_name("Silva")).await?;
+
+// Alterar (só os campos presentes mudam):
+svc.modify_user(&UserParams::new("MARIA").last_name("Souza")).await?;
+
+// Listar / consultar:
+for u in svc.display_users().await? {
+    println!("{} ({} {})", u.username, u.first_name, u.last_name);
+}
+let um = svc.display_user("MARIA").await?;    // Option<UserInfo>
+
+// Remover:
+svc.delete_user("MARIA").await?;
+```
+
+Para ações de baixo nível há `svc.start(spb)` / `svc.run(spb)` (dispara + drena a
+saída) e `svc.info(send, recv, buf_len)`.
+
 ---
 
 ## Criptografia de comunicação (wire crypt)
@@ -604,17 +734,21 @@ assíncrono.)
 - ✅ **DML em lote (batch)** com contagens e erros por linha
 - ✅ **BLOBs em batch**: stream, `register_blob`, segmentados (`set_segmented`)
 - ✅ Datas/horas civis (`CivilDate`/`CivilTime`/`CivilTimestamp`)
-- ✅ **Charsets** UTF-8 / Latin-1 / Windows-1252 (leitura e escrita)
+- ✅ **Numéricos amplos**: INT128 / NUMERIC amplo e **DECFLOAT(16/34)** (leitura)
+- ✅ **Charsets** UTF-8 / Latin-1 / Windows-1252 nativos + multibyte
+  (SJIS/EUC/GBK/Big5/…) via feature `charset-full`
 - ✅ **Pool de conexões** (`Pool`/`PoolConfig`/`PooledConnection`)
 - ✅ **Eventos do banco** (`listen_events`/`EventListener`, canal auxiliar)
+- ✅ **Gerenciador de serviços**: backup/restore, estatísticas, log e
+  gestão de usuários (`ServiceManager`)
 - ✅ Guards de `Drop` (aviso de vazamento em debug)
 
 ## O que falta implementar
 
-- ⬜ **Service API** (`op_service_*`: backup/restore, estatísticas, gfix)
-- ⬜ **Charsets multibyte** além de UTF-8 (ex.: SJIS, EUC-JP)
-- ⬜ Conferir **DECFLOAT** (DEC16/DEC34) e **INT128 com escala** contra dados reais
-- ⬜ Caminho de *encode* para charsets além de UTF-8/Latin-1/Win-1252
+- ⬜ **TIME/TIMESTAMP WITH TIME ZONE** (hoje chegam como `Value::Bytes`)
+- ⬜ *Encode* de **DECFLOAT** como parâmetro (só a leitura está pronta)
+- ⬜ Tipo **ARRAY** SQL (`op_get_slice`/`op_put_slice`)
+- ⬜ Itens de info **inteiros** do serviço (`svc_version`, `svc_running`)
 - ⬜ Adaptador `futures::Stream` (hoje o streaming é *lending iterator*)
 
 Veja `PROXIMAS-ETAPAS.md` para o roadmap detalhado e `PROTOCOL-NOTES.md` para os
