@@ -209,6 +209,14 @@ async fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset)
             let b = stream.read_raw(16).await?;
             Value::Int128(i128::from_be_bytes(b.try_into().unwrap()))
         }
+        sql_type::DEC16 => {
+            let b = stream.read_raw(8).await?;
+            Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(b.try_into().unwrap()))
+        }
+        sql_type::DEC34 => {
+            let b = stream.read_raw(16).await?;
+            Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(b.try_into().unwrap()))
+        }
         sql_type::FLOAT => Value::Float(f32::from_bits(stream.read_i32().await? as u32)),
         sql_type::DOUBLE | sql_type::D_FLOAT => Value::Double(stream.read_f64().await?),
         sql_type::TEXT => {

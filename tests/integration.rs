@@ -700,6 +700,65 @@ async fn charset_win1251_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/// Verifica DECFLOAT(16)/DECFLOAT(34), INT128 e NUMERIC amplo (escalonado,
+/// lastreado em INT128) contra dados reais inseridos por literais SQL.
+#[tokio::test]
+async fn decfloat_and_int128() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // O servidor de exemplo tem `DataTypeCompatibility = 2.5`, que coage INT128 e
+    // DECFLOAT para tipos legados (e estoura para INT128 grande). Pedimos os tipos
+    // nativos nesta sessão (FB5 `SET BIND`).
+    conn.exec_immediate(None, "SET BIND OF INT128 TO NATIVE").await?;
+    conn.exec_immediate(None, "SET BIND OF DECFLOAT TO NATIVE").await?;
+
+    conn.exec_immediate(
+        None,
+        "RECREATE TABLE fdb_dec (id INT, d34 DECFLOAT(34), d16 DECFLOAT(16), \
+         i128 INT128, num NUMERIC(20,4))",
+    )
+    .await?;
+
+    // CASTs explícitos para controlar a representação exata (sem normalização).
+    conn.exec_immediate(
+        None,
+        "INSERT INTO fdb_dec VALUES (1, \
+         CAST('123.45' AS DECFLOAT(34)), \
+         CAST('-3.14159' AS DECFLOAT(16)), \
+         123456789012345678901234567890, \
+         CAST('12345.6789' AS NUMERIC(20,4)))",
+    )
+    .await?;
+
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT d34, d16, i128, num FROM fdb_dec").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    println!("decfloat/int128: {row:?}");
+
+    // DECFLOAT decodificado para a string decimal exata.
+    match &row[0] {
+        Value::DecFloat(d) => assert_eq!(d.to_string(), "123.45"),
+        other => panic!("d34: esperava DecFloat, veio {other:?}"),
+    }
+    match &row[1] {
+        Value::DecFloat(d) => assert_eq!(d.to_string(), "-3.14159"),
+        other => panic!("d16: esperava DecFloat, veio {other:?}"),
+    }
+    // INT128 com um valor de 30 dígitos (dentro da precisão 38 do INT128).
+    assert_eq!(row[2], Value::Int128(123_456_789_012_345_678_901_234_567_890));
+    // NUMERIC(20,4) é lastreado em INT128: a mantissa bruta de 12345.6789 (escala
+    // -4) é 123456789.
+    assert_eq!(row[3], Value::Int128(123_456_789));
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.exec_immediate(None, "DROP TABLE fdb_dec").await?;
+    conn.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn batch_segmented_blob() -> Result<()> {
     let cfg = require_server!();

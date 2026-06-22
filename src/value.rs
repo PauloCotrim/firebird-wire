@@ -32,6 +32,8 @@ pub enum Value {
     Timestamp(i32, u32),
     /// Inteiro de 128 bits (INT128 / NUMERIC amplo).
     Int128(i128),
+    /// `DECFLOAT(16)`/`DECFLOAT(34)` decodificado (ponto flutuante decimal IEEE).
+    DecFloat(crate::decfloat::DecFloat),
 }
 
 /// Diferença em dias entre a época do Firebird (1858-11-17, a época do Dia
