@@ -9,8 +9,22 @@
 use crate::value::ColumnMeta;
 use crate::wire::consts::{blr, sql_type};
 
-/// Constrói o BLR que descreve uma mensagem com as colunas informadas.
+/// Constrói o BLR que descreve uma mensagem de SAÍDA (colunas selecionadas).
+/// Para os tipos WITH TIME ZONE, pede o formato ESTENDIDO (`_EX`) para que o
+/// servidor já inclua o offset resolvido (com horário de verão) — assim o driver
+/// consegue a hora local mesmo sem uma base de dados de zonas.
 pub fn message_blr(columns: &[ColumnMeta]) -> Vec<u8> {
+    message_blr_impl(columns, true)
+}
+
+/// Igual a [`message_blr`], mas para a mensagem de ENTRADA (parâmetros). Usa o
+/// formato base (não-`_EX`) das zonas: na entrada o offset é informativo e o
+/// servidor o recalcula a partir da zona.
+pub fn input_blr(columns: &[ColumnMeta]) -> Vec<u8> {
+    message_blr_impl(columns, false)
+}
+
+fn message_blr_impl(columns: &[ColumnMeta], for_output: bool) -> Vec<u8> {
     let mut b = Vec::with_capacity(16 + columns.len() * 6);
     b.push(blr::VERSION5);
     b.push(blr::BEGIN);
@@ -20,7 +34,7 @@ pub fn message_blr(columns: &[ColumnMeta]) -> Vec<u8> {
     b.extend_from_slice(&field_count.to_le_bytes());
 
     for col in columns {
-        push_type(&mut b, col);
+        push_type(&mut b, col, for_output);
         // indicador de nulo
         b.push(blr::SHORT);
         b.push(0);
@@ -31,7 +45,7 @@ pub fn message_blr(columns: &[ColumnMeta]) -> Vec<u8> {
     b
 }
 
-fn push_type(b: &mut Vec<u8>, col: &ColumnMeta) {
+fn push_type(b: &mut Vec<u8>, col: &ColumnMeta, for_output: bool) {
     let scale = col.scale as i8 as u8;
     match sql_type::base(col.sql_type) {
         sql_type::TEXT => {
@@ -79,6 +93,12 @@ fn push_type(b: &mut Vec<u8>, col: &ColumnMeta) {
         sql_type::BOOLEAN => b.push(blr::BOOL),
         sql_type::DEC16 => b.push(blr::DEC64),
         sql_type::DEC34 => b.push(blr::DEC128),
+        sql_type::TIME_TZ | sql_type::TIME_TZ_EX => {
+            b.push(if for_output { blr::EX_TIME_TZ } else { blr::SQL_TIME_TZ });
+        }
+        sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => {
+            b.push(if for_output { blr::EX_TIMESTAMP_TZ } else { blr::TIMESTAMP_TZ });
+        }
         other => {
             // Recorre a um quad para que a mensagem continue parseável; o
             // decodificador de valor o tratará como bytes brutos.

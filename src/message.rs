@@ -59,6 +59,9 @@ fn type_size_align(col: &ColumnMeta) -> (usize, usize) {
         sql_type::BOOLEAN => (1, 1),
         sql_type::DEC16 => (8, 8),
         sql_type::DEC34 => (16, 8),
+        // Representação em memória (não-`_EX`): ISC_TIME_TZ = 6 B, ISC_TIMESTAMP_TZ = 10 B.
+        sql_type::TIME_TZ | sql_type::TIME_TZ_EX => (6, 4),
+        sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => (10, 4),
         _ => (8, 8),
     }
 }
@@ -149,6 +152,23 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
             Value::Blob(id) => out.extend_from_slice(&id.to_be_bytes()),
             _ => return Err(mismatch()),
         },
+        // WITH TIME ZONE como parâmetro: o BLR de entrada usa o formato base
+        // (não-`_EX`), então enviamos UTC + zona; o servidor recalcula o offset.
+        sql_type::TIME_TZ | sql_type::TIME_TZ_EX => match val {
+            Value::TimeTz(t) => {
+                put_i32_be(out, t.utc_time as i32);
+                put_i32_be(out, i32::from(t.zone));
+            }
+            _ => return Err(mismatch()),
+        },
+        sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => match val {
+            Value::TimestampTz(t) => {
+                put_i32_be(out, t.utc_date);
+                put_i32_be(out, t.utc_time as i32);
+                put_i32_be(out, i32::from(t.zone));
+            }
+            _ => return Err(mismatch()),
+        },
         _ => return Err(Error::protocol(format!("unsupported parameter type {}", col.sql_type))),
     }
     Ok(())
@@ -235,6 +255,22 @@ async fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset)
             let date = stream.read_i32().await?;
             let time = stream.read_i32().await? as u32;
             Value::Timestamp(date, time)
+        }
+        // Tipos WITH TIME ZONE: pedimos o formato ESTENDIDO (`_EX`) no BLR de
+        // saída, então o servidor envia, além de UTC + zona, o offset resolvido.
+        // Cada componente é um inteiro XDR de 4 bytes (USHORT/SSHORT inclusive).
+        sql_type::TIME_TZ | sql_type::TIME_TZ_EX => {
+            let utc_time = stream.read_i32().await? as u32;
+            let zone = stream.read_i32().await? as u16;
+            let offset = stream.read_i32().await? as i16;
+            Value::TimeTz(crate::value::TimeTz { utc_time, zone, offset })
+        }
+        sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => {
+            let utc_date = stream.read_i32().await?;
+            let utc_time = stream.read_i32().await? as u32;
+            let zone = stream.read_i32().await? as u16;
+            let offset = stream.read_i32().await? as i16;
+            Value::TimestampTz(crate::value::TimestampTz { utc_date, utc_time, zone, offset })
         }
         sql_type::BLOB | sql_type::QUAD => Value::Blob(stream.read_quad().await?),
         sql_type::BOOLEAN => {

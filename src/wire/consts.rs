@@ -571,6 +571,8 @@ pub mod blr {
     pub const INT128: u8 = 26; // + scale(1)
     pub const SQL_TIME_TZ: u8 = 28;
     pub const TIMESTAMP_TZ: u8 = 29;
+    pub const EX_TIME_TZ: u8 = 30; // formato estendido: inclui o offset resolvido
+    pub const EX_TIMESTAMP_TZ: u8 = 31;
 }
 
 // ---------------------------------------------------------------------------

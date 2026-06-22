@@ -759,6 +759,102 @@ async fn decfloat_and_int128() -> Result<()> {
     Ok(())
 }
 
+/// Verifica TIME/TIMESTAMP WITH TIME ZONE: o servidor armazena UTC + zona e (no
+/// formato estendido que pedimos) o offset resolvido; o driver reconstrói a hora
+/// local e o nome da zona.
+#[tokio::test]
+async fn time_zone_types() -> Result<()> {
+    use fdb_driver::Value;
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // O servidor de exemplo tem `DataTypeCompatibility = 2.5`, que coage os tipos
+    // WITH TIME ZONE para TIME/TIMESTAMP simples na sessão; pedimos o tipo nativo.
+    conn.exec_immediate(None, "SET BIND OF TIME ZONE TO NATIVE").await?;
+
+    let tx = conn.begin().await?;
+    let mut stmt = conn
+        .prepare(
+            &tx,
+            "SELECT \
+             CAST('2026-06-22 11:22:33.4444 America/Sao_Paulo' AS TIMESTAMP WITH TIME ZONE), \
+             CAST('11:22:33 America/Sao_Paulo' AS TIME WITH TIME ZONE), \
+             CAST('08:15:00 +05:30' AS TIME WITH TIME ZONE) \
+             FROM RDB$DATABASE",
+        )
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    println!("tz: {row:?}");
+
+    // TIMESTAMP WITH TIME ZONE em zona nomeada (São Paulo, -03:00 em junho).
+    match &row[0] {
+        Value::TimestampTz(ts) => {
+            assert_eq!(ts.zone_name(), Some("America/Sao_Paulo"));
+            assert_eq!(ts.offset, -180);
+            let local = ts.local();
+            assert_eq!((local.date.year, local.date.month, local.date.day), (2026, 6, 22));
+            assert_eq!((local.time.hour, local.time.minute, local.time.second), (11, 22, 33));
+            assert_eq!(local.time.frac, 4444);
+        }
+        other => panic!("col0: esperava TimestampTz, veio {other:?}"),
+    }
+    // TIME WITH TIME ZONE em zona nomeada.
+    match &row[1] {
+        Value::TimeTz(t) => {
+            assert_eq!(t.zone_name(), Some("America/Sao_Paulo"));
+            assert_eq!(t.offset, -180);
+            let local = t.local();
+            assert_eq!((local.hour, local.minute, local.second), (11, 22, 33));
+        }
+        other => panic!("col1: esperava TimeTz, veio {other:?}"),
+    }
+    // TIME WITH TIME ZONE em zona por offset (+05:30).
+    match &row[2] {
+        Value::TimeTz(t) => {
+            assert_eq!(t.zone_name(), None);
+            assert_eq!(t.zone_label(), "+05:30");
+            assert_eq!(t.offset, 330);
+            let local = t.local();
+            assert_eq!((local.hour, local.minute, local.second), (8, 15, 0));
+        }
+        other => panic!("col2: esperava TimeTz, veio {other:?}"),
+    }
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    // Caminho de ENTRADA: insere um TimeTz como parâmetro (UTC + zona) e relê.
+    use fdb_driver::tz::offset_zone_id;
+    conn.exec_immediate(None, "RECREATE TABLE fdb_tz (id INT, t TIME WITH TIME ZONE)").await?;
+    let param = fdb_driver::TimeTz {
+        utc_time: 8 * 3600 * 10_000, // 08:00:00 UTC
+        zone: offset_zone_id(120),   // +02:00 → hora local 10:00
+        offset: 120,
+    };
+    let tx = conn.begin().await?;
+    let mut ins = conn.prepare(&tx, "INSERT INTO fdb_tz VALUES (?, ?)").await?;
+    ins.execute(&mut conn, &tx, &[Value::Int(1), Value::TimeTz(param)]).await?;
+    ins.drop_statement(&mut conn).await?;
+    let mut sel = conn.prepare(&tx, "SELECT t FROM fdb_tz WHERE id = 1").await?;
+    sel.execute(&mut conn, &tx, &[]).await?;
+    let back = sel.fetch(&mut conn).await?.expect("uma linha");
+    match &back[0] {
+        Value::TimeTz(t) => {
+            assert_eq!(t.utc_time, param.utc_time);
+            assert_eq!(t.offset, 120);
+            let local = t.local();
+            assert_eq!((local.hour, local.minute, local.second), (10, 0, 0));
+        }
+        other => panic!("relê: esperava TimeTz, veio {other:?}"),
+    }
+    sel.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.exec_immediate(None, "DROP TABLE fdb_tz").await?;
+    conn.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn batch_segmented_blob() -> Result<()> {
     let cfg = require_server!();

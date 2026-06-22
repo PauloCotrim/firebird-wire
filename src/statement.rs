@@ -17,7 +17,7 @@
 //! um handle cujos métodos de I/O emprestam a [`Connection`] dona, então apenas
 //! um empréstimo mutável fica ativo por vez.
 
-use crate::blr::{message_blr, prepare_info_items};
+use crate::blr::{input_blr, message_blr, prepare_info_items};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::message::{decode_row, encode_row};
@@ -147,7 +147,7 @@ impl Statement {
         params: &[Value],
     ) -> Result<()> {
         let has_params = !self.params.is_empty();
-        let in_blr = if has_params { message_blr(&self.params) } else { Vec::new() };
+        let in_blr = if has_params { input_blr(&self.params) } else { Vec::new() };
         let message = if has_params {
             encode_row(&self.params, params, conn.charset())?
         } else {

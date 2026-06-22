@@ -32,6 +32,7 @@ pub mod pool;
 pub mod service;
 pub mod statement;
 pub mod transaction;
+pub mod tz;
 pub mod value;
 pub mod wire;
 
@@ -47,7 +48,7 @@ pub use pool::{Pool, PoolConfig, PooledConnection};
 pub use service::{ServiceManager, UserInfo, UserParams};
 pub use statement::{RowStream, RowsAffected, Statement};
 pub use transaction::{AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder};
-pub use value::{CivilDate, CivilTime, CivilTimestamp, ColumnMeta, Value};
+pub use value::{CivilDate, CivilTime, CivilTimestamp, ColumnMeta, TimeTz, TimestampTz, Value};
 
 /// Emite um aviso (apenas em builds de debug) quando um recurso com estado no
 /// servidor (`Statement`, `Transaction`, `Blob`, `BlobWriter`) é solto sem ser

@@ -1,0 +1,227 @@
+//! Tabela de zonas e tipos para TIME/TIMESTAMP WITH TIME ZONE (FB4+).
+//!
+//! As zonas NOMEADAS recebem ids de [`MAX_NAMED_ZONE`] (65535 = "GMT")
+//! decrescendo; a tabela [`ZONE_NAMES`] é indexada por `MAX_NAMED_ZONE - id`.
+//! As zonas baseadas em OFFSET usam `id = offset_em_minutos + 1439`
+//! (gerado de `/opt/firebird/include/firebird/TimeZones.h`; NÃO editar à mão).
+
+/// Maior id de zona nomeada (corresponde a `GMT`).
+pub const MAX_NAMED_ZONE: u16 = 65535;
+
+/// Ponto-base do código de zonas por offset: `id = offset_minutos + OFFSET_BASE`
+/// (confirmado ao vivo: a zona `+05:30` chega como id 1769 = 330 + 1439).
+pub const OFFSET_BASE: i32 = 1439;
+
+/// Nomes IANA das zonas nomeadas, do id mais alto (65535) ao mais baixo.
+pub static ZONE_NAMES: [&str; 638] = [
+    "GMT", "ACT", "AET", "AGT", "ART", "AST", "Africa/Abidjan", "Africa/Accra",
+    "Africa/Addis_Ababa", "Africa/Algiers", "Africa/Asmara", "Africa/Asmera", "Africa/Bamako",
+    "Africa/Bangui", "Africa/Banjul", "Africa/Bissau", "Africa/Blantyre", "Africa/Brazzaville",
+    "Africa/Bujumbura", "Africa/Cairo", "Africa/Casablanca", "Africa/Ceuta", "Africa/Conakry",
+    "Africa/Dakar", "Africa/Dar_es_Salaam", "Africa/Djibouti", "Africa/Douala",
+    "Africa/El_Aaiun", "Africa/Freetown", "Africa/Gaborone", "Africa/Harare",
+    "Africa/Johannesburg", "Africa/Juba", "Africa/Kampala", "Africa/Khartoum", "Africa/Kigali",
+    "Africa/Kinshasa", "Africa/Lagos", "Africa/Libreville", "Africa/Lome", "Africa/Luanda",
+    "Africa/Lubumbashi", "Africa/Lusaka", "Africa/Malabo", "Africa/Maputo", "Africa/Maseru",
+    "Africa/Mbabane", "Africa/Mogadishu", "Africa/Monrovia", "Africa/Nairobi",
+    "Africa/Ndjamena", "Africa/Niamey", "Africa/Nouakchott", "Africa/Ouagadougou",
+    "Africa/Porto-Novo", "Africa/Sao_Tome", "Africa/Timbuktu", "Africa/Tripoli",
+    "Africa/Tunis", "Africa/Windhoek", "America/Adak", "America/Anchorage", "America/Anguilla",
+    "America/Antigua", "America/Araguaina", "America/Argentina/Buenos_Aires",
+    "America/Argentina/Catamarca", "America/Argentina/ComodRivadavia",
+    "America/Argentina/Cordoba", "America/Argentina/Jujuy", "America/Argentina/La_Rioja",
+    "America/Argentina/Mendoza", "America/Argentina/Rio_Gallegos", "America/Argentina/Salta",
+    "America/Argentina/San_Juan", "America/Argentina/San_Luis", "America/Argentina/Tucuman",
+    "America/Argentina/Ushuaia", "America/Aruba", "America/Asuncion", "America/Atikokan",
+    "America/Atka", "America/Bahia", "America/Bahia_Banderas", "America/Barbados",
+    "America/Belem", "America/Belize", "America/Blanc-Sablon", "America/Boa_Vista",
+    "America/Bogota", "America/Boise", "America/Buenos_Aires", "America/Cambridge_Bay",
+    "America/Campo_Grande", "America/Cancun", "America/Caracas", "America/Catamarca",
+    "America/Cayenne", "America/Cayman", "America/Chicago", "America/Chihuahua",
+    "America/Coral_Harbour", "America/Cordoba", "America/Costa_Rica", "America/Creston",
+    "America/Cuiaba", "America/Curacao", "America/Danmarkshavn", "America/Dawson",
+    "America/Dawson_Creek", "America/Denver", "America/Detroit", "America/Dominica",
+    "America/Edmonton", "America/Eirunepe", "America/El_Salvador", "America/Ensenada",
+    "America/Fort_Nelson", "America/Fort_Wayne", "America/Fortaleza", "America/Glace_Bay",
+    "America/Godthab", "America/Goose_Bay", "America/Grand_Turk", "America/Grenada",
+    "America/Guadeloupe", "America/Guatemala", "America/Guayaquil", "America/Guyana",
+    "America/Halifax", "America/Havana", "America/Hermosillo", "America/Indiana/Indianapolis",
+    "America/Indiana/Knox", "America/Indiana/Marengo", "America/Indiana/Petersburg",
+    "America/Indiana/Tell_City", "America/Indiana/Vevay", "America/Indiana/Vincennes",
+    "America/Indiana/Winamac", "America/Indianapolis", "America/Inuvik", "America/Iqaluit",
+    "America/Jamaica", "America/Jujuy", "America/Juneau", "America/Kentucky/Louisville",
+    "America/Kentucky/Monticello", "America/Knox_IN", "America/Kralendijk", "America/La_Paz",
+    "America/Lima", "America/Los_Angeles", "America/Louisville", "America/Lower_Princes",
+    "America/Maceio", "America/Managua", "America/Manaus", "America/Marigot",
+    "America/Martinique", "America/Matamoros", "America/Mazatlan", "America/Mendoza",
+    "America/Menominee", "America/Merida", "America/Metlakatla", "America/Mexico_City",
+    "America/Miquelon", "America/Moncton", "America/Monterrey", "America/Montevideo",
+    "America/Montreal", "America/Montserrat", "America/Nassau", "America/New_York",
+    "America/Nipigon", "America/Nome", "America/Noronha", "America/North_Dakota/Beulah",
+    "America/North_Dakota/Center", "America/North_Dakota/New_Salem", "America/Ojinaga",
+    "America/Panama", "America/Pangnirtung", "America/Paramaribo", "America/Phoenix",
+    "America/Port-au-Prince", "America/Port_of_Spain", "America/Porto_Acre",
+    "America/Porto_Velho", "America/Puerto_Rico", "America/Punta_Arenas",
+    "America/Rainy_River", "America/Rankin_Inlet", "America/Recife", "America/Regina",
+    "America/Resolute", "America/Rio_Branco", "America/Rosario", "America/Santa_Isabel",
+    "America/Santarem", "America/Santiago", "America/Santo_Domingo", "America/Sao_Paulo",
+    "America/Scoresbysund", "America/Shiprock", "America/Sitka", "America/St_Barthelemy",
+    "America/St_Johns", "America/St_Kitts", "America/St_Lucia", "America/St_Thomas",
+    "America/St_Vincent", "America/Swift_Current", "America/Tegucigalpa", "America/Thule",
+    "America/Thunder_Bay", "America/Tijuana", "America/Toronto", "America/Tortola",
+    "America/Vancouver", "America/Virgin", "America/Whitehorse", "America/Winnipeg",
+    "America/Yakutat", "America/Yellowknife", "Antarctica/Casey", "Antarctica/Davis",
+    "Antarctica/DumontDUrville", "Antarctica/Macquarie", "Antarctica/Mawson",
+    "Antarctica/McMurdo", "Antarctica/Palmer", "Antarctica/Rothera", "Antarctica/South_Pole",
+    "Antarctica/Syowa", "Antarctica/Troll", "Antarctica/Vostok", "Arctic/Longyearbyen",
+    "Asia/Aden", "Asia/Almaty", "Asia/Amman", "Asia/Anadyr", "Asia/Aqtau", "Asia/Aqtobe",
+    "Asia/Ashgabat", "Asia/Ashkhabad", "Asia/Atyrau", "Asia/Baghdad", "Asia/Bahrain",
+    "Asia/Baku", "Asia/Bangkok", "Asia/Barnaul", "Asia/Beirut", "Asia/Bishkek", "Asia/Brunei",
+    "Asia/Calcutta", "Asia/Chita", "Asia/Choibalsan", "Asia/Chongqing", "Asia/Chungking",
+    "Asia/Colombo", "Asia/Dacca", "Asia/Damascus", "Asia/Dhaka", "Asia/Dili", "Asia/Dubai",
+    "Asia/Dushanbe", "Asia/Famagusta", "Asia/Gaza", "Asia/Harbin", "Asia/Hebron",
+    "Asia/Ho_Chi_Minh", "Asia/Hong_Kong", "Asia/Hovd", "Asia/Irkutsk", "Asia/Istanbul",
+    "Asia/Jakarta", "Asia/Jayapura", "Asia/Jerusalem", "Asia/Kabul", "Asia/Kamchatka",
+    "Asia/Karachi", "Asia/Kashgar", "Asia/Kathmandu", "Asia/Katmandu", "Asia/Khandyga",
+    "Asia/Kolkata", "Asia/Krasnoyarsk", "Asia/Kuala_Lumpur", "Asia/Kuching", "Asia/Kuwait",
+    "Asia/Macao", "Asia/Macau", "Asia/Magadan", "Asia/Makassar", "Asia/Manila", "Asia/Muscat",
+    "Asia/Nicosia", "Asia/Novokuznetsk", "Asia/Novosibirsk", "Asia/Omsk", "Asia/Oral",
+    "Asia/Phnom_Penh", "Asia/Pontianak", "Asia/Pyongyang", "Asia/Qatar", "Asia/Qyzylorda",
+    "Asia/Rangoon", "Asia/Riyadh", "Asia/Saigon", "Asia/Sakhalin", "Asia/Samarkand",
+    "Asia/Seoul", "Asia/Shanghai", "Asia/Singapore", "Asia/Srednekolymsk", "Asia/Taipei",
+    "Asia/Tashkent", "Asia/Tbilisi", "Asia/Tehran", "Asia/Tel_Aviv", "Asia/Thimbu",
+    "Asia/Thimphu", "Asia/Tokyo", "Asia/Tomsk", "Asia/Ujung_Pandang", "Asia/Ulaanbaatar",
+    "Asia/Ulan_Bator", "Asia/Urumqi", "Asia/Ust-Nera", "Asia/Vientiane", "Asia/Vladivostok",
+    "Asia/Yakutsk", "Asia/Yangon", "Asia/Yekaterinburg", "Asia/Yerevan", "Atlantic/Azores",
+    "Atlantic/Bermuda", "Atlantic/Canary", "Atlantic/Cape_Verde", "Atlantic/Faeroe",
+    "Atlantic/Faroe", "Atlantic/Jan_Mayen", "Atlantic/Madeira", "Atlantic/Reykjavik",
+    "Atlantic/South_Georgia", "Atlantic/St_Helena", "Atlantic/Stanley", "Australia/ACT",
+    "Australia/Adelaide", "Australia/Brisbane", "Australia/Broken_Hill", "Australia/Canberra",
+    "Australia/Currie", "Australia/Darwin", "Australia/Eucla", "Australia/Hobart",
+    "Australia/LHI", "Australia/Lindeman", "Australia/Lord_Howe", "Australia/Melbourne",
+    "Australia/NSW", "Australia/North", "Australia/Perth", "Australia/Queensland",
+    "Australia/South", "Australia/Sydney", "Australia/Tasmania", "Australia/Victoria",
+    "Australia/West", "Australia/Yancowinna", "BET", "BST", "Brazil/Acre", "Brazil/DeNoronha",
+    "Brazil/East", "Brazil/West", "CAT", "CET", "CNT", "CST", "CST6CDT", "CTT",
+    "Canada/Atlantic", "Canada/Central", "Canada/East-Saskatchewan", "Canada/Eastern",
+    "Canada/Mountain", "Canada/Newfoundland", "Canada/Pacific", "Canada/Saskatchewan",
+    "Canada/Yukon", "Chile/Continental", "Chile/EasterIsland", "Cuba", "EAT", "ECT", "EET",
+    "EST", "EST5EDT", "Egypt", "Eire", "Etc/GMT", "Etc/GMT+0", "Etc/GMT+1", "Etc/GMT+10",
+    "Etc/GMT+11", "Etc/GMT+12", "Etc/GMT+2", "Etc/GMT+3", "Etc/GMT+4", "Etc/GMT+5",
+    "Etc/GMT+6", "Etc/GMT+7", "Etc/GMT+8", "Etc/GMT+9", "Etc/GMT-0", "Etc/GMT-1", "Etc/GMT-10",
+    "Etc/GMT-11", "Etc/GMT-12", "Etc/GMT-13", "Etc/GMT-14", "Etc/GMT-2", "Etc/GMT-3",
+    "Etc/GMT-4", "Etc/GMT-5", "Etc/GMT-6", "Etc/GMT-7", "Etc/GMT-8", "Etc/GMT-9", "Etc/GMT0",
+    "Etc/Greenwich", "Etc/UCT", "Etc/UTC", "Etc/Universal", "Etc/Zulu", "Europe/Amsterdam",
+    "Europe/Andorra", "Europe/Astrakhan", "Europe/Athens", "Europe/Belfast", "Europe/Belgrade",
+    "Europe/Berlin", "Europe/Bratislava", "Europe/Brussels", "Europe/Bucharest",
+    "Europe/Budapest", "Europe/Busingen", "Europe/Chisinau", "Europe/Copenhagen",
+    "Europe/Dublin", "Europe/Gibraltar", "Europe/Guernsey", "Europe/Helsinki",
+    "Europe/Isle_of_Man", "Europe/Istanbul", "Europe/Jersey", "Europe/Kaliningrad",
+    "Europe/Kiev", "Europe/Kirov", "Europe/Lisbon", "Europe/Ljubljana", "Europe/London",
+    "Europe/Luxembourg", "Europe/Madrid", "Europe/Malta", "Europe/Mariehamn", "Europe/Minsk",
+    "Europe/Monaco", "Europe/Moscow", "Europe/Nicosia", "Europe/Oslo", "Europe/Paris",
+    "Europe/Podgorica", "Europe/Prague", "Europe/Riga", "Europe/Rome", "Europe/Samara",
+    "Europe/San_Marino", "Europe/Sarajevo", "Europe/Saratov", "Europe/Simferopol",
+    "Europe/Skopje", "Europe/Sofia", "Europe/Stockholm", "Europe/Tallinn", "Europe/Tirane",
+    "Europe/Tiraspol", "Europe/Ulyanovsk", "Europe/Uzhgorod", "Europe/Vaduz", "Europe/Vatican",
+    "Europe/Vienna", "Europe/Vilnius", "Europe/Volgograd", "Europe/Warsaw", "Europe/Zagreb",
+    "Europe/Zaporozhye", "Europe/Zurich", "Factory", "GB", "GB-Eire", "GMT+0", "GMT-0", "GMT0",
+    "Greenwich", "HST", "Hongkong", "IET", "IST", "Iceland", "Indian/Antananarivo",
+    "Indian/Chagos", "Indian/Christmas", "Indian/Cocos", "Indian/Comoro", "Indian/Kerguelen",
+    "Indian/Mahe", "Indian/Maldives", "Indian/Mauritius", "Indian/Mayotte", "Indian/Reunion",
+    "Iran", "Israel", "JST", "Jamaica", "Japan", "Kwajalein", "Libya", "MET", "MIT", "MST",
+    "MST7MDT", "Mexico/BajaNorte", "Mexico/BajaSur", "Mexico/General", "NET", "NST", "NZ",
+    "NZ-CHAT", "Navajo", "PLT", "PNT", "PRC", "PRT", "PST", "PST8PDT", "Pacific/Apia",
+    "Pacific/Auckland", "Pacific/Bougainville", "Pacific/Chatham", "Pacific/Chuuk",
+    "Pacific/Easter", "Pacific/Efate", "Pacific/Enderbury", "Pacific/Fakaofo", "Pacific/Fiji",
+    "Pacific/Funafuti", "Pacific/Galapagos", "Pacific/Gambier", "Pacific/Guadalcanal",
+    "Pacific/Guam", "Pacific/Honolulu", "Pacific/Johnston", "Pacific/Kiritimati",
+    "Pacific/Kosrae", "Pacific/Kwajalein", "Pacific/Majuro", "Pacific/Marquesas",
+    "Pacific/Midway", "Pacific/Nauru", "Pacific/Niue", "Pacific/Norfolk", "Pacific/Noumea",
+    "Pacific/Pago_Pago", "Pacific/Palau", "Pacific/Pitcairn", "Pacific/Pohnpei",
+    "Pacific/Ponape", "Pacific/Port_Moresby", "Pacific/Rarotonga", "Pacific/Saipan",
+    "Pacific/Samoa", "Pacific/Tahiti", "Pacific/Tarawa", "Pacific/Tongatapu", "Pacific/Truk",
+    "Pacific/Wake", "Pacific/Wallis", "Pacific/Yap", "Poland", "Portugal", "ROC", "ROK", "SST",
+    "Singapore", "SystemV/AST4", "SystemV/AST4ADT", "SystemV/CST6", "SystemV/CST6CDT",
+    "SystemV/EST5", "SystemV/EST5EDT", "SystemV/HST10", "SystemV/MST7", "SystemV/MST7MDT",
+    "SystemV/PST8", "SystemV/PST8PDT", "SystemV/YST9", "SystemV/YST9YDT", "Turkey", "UCT",
+    "US/Alaska", "US/Aleutian", "US/Arizona", "US/Central", "US/East-Indiana", "US/Eastern",
+    "US/Hawaii", "US/Indiana-Starke", "US/Michigan", "US/Mountain", "US/Pacific",
+    "US/Pacific-New", "US/Samoa", "UTC", "Universal", "VST", "W-SU", "WET", "Zulu",
+    "America/Nuuk", "Asia/Qostanay", "Pacific/Kanton", "Europe/Kyiv", "America/Ciudad_Juarez",
+    "America/Coyhaique",
+];
+
+// ---------------------------------------------------------------------------
+// Consultas de zona
+// ---------------------------------------------------------------------------
+
+/// Menor offset (em minutos) que uma zona baseada em offset pode representar.
+const MIN_OFFSET: i32 = -1439;
+/// Maior offset (em minutos) que uma zona baseada em offset pode representar.
+const MAX_OFFSET: i32 = 1439;
+
+/// Nome IANA de uma zona NOMEADA, ou `None` se `id` for uma zona por offset
+/// (use [`offset_minutes`]) ou um id desconhecido.
+pub fn zone_name(id: u16) -> Option<&'static str> {
+    let idx = MAX_NAMED_ZONE.checked_sub(id)? as usize;
+    ZONE_NAMES.get(idx).copied()
+}
+
+/// Offset em minutos se `id` codificar uma zona baseada em offset, senão `None`
+/// (nesse caso é uma zona nomeada — veja [`zone_name`]).
+pub fn offset_minutes(id: u16) -> Option<i16> {
+    let off = id as i32 - OFFSET_BASE;
+    (MIN_OFFSET..=MAX_OFFSET).contains(&off).then_some(off as i16)
+}
+
+/// Id de zona do Firebird para uma zona baseada em offset (minutos).
+pub fn offset_zone_id(offset_minutes: i16) -> u16 {
+    (offset_minutes as i32 + OFFSET_BASE) as u16
+}
+
+/// Rótulo legível de uma zona: o nome IANA, `±HH:MM` para zonas por offset, ou
+/// `zone <id>` quando o id não é reconhecido (uma zona mais nova que esta tabela).
+pub fn zone_label(id: u16) -> String {
+    if let Some(name) = zone_name(id) {
+        name.to_string()
+    } else if let Some(off) = offset_minutes(id) {
+        format_offset(off)
+    } else {
+        format!("zone {id}")
+    }
+}
+
+/// Formata um offset em minutos como `±HH:MM`.
+pub fn format_offset(minutes: i16) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let m = minutes.unsigned_abs() as u32;
+    format!("{sign}{:02}:{:02}", m / 60, m % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_zone_lookup() {
+        assert_eq!(zone_name(MAX_NAMED_ZONE), Some("GMT"));
+        // A última entrada da tabela.
+        let last = MAX_NAMED_ZONE - (ZONE_NAMES.len() as u16 - 1);
+        assert_eq!(zone_name(last), Some(ZONE_NAMES[ZONE_NAMES.len() - 1]));
+        // Um id de zona por offset não é nomeado.
+        assert_eq!(zone_name(OFFSET_BASE as u16), None);
+    }
+
+    #[test]
+    fn offset_zone_roundtrip() {
+        for off in [-1439i16, -180, -60, 0, 60, 330, 1439] {
+            let id = offset_zone_id(off);
+            assert_eq!(offset_minutes(id), Some(off));
+        }
+        // GMT por offset (id 1440) = +00:00.
+        assert_eq!(offset_minutes(OFFSET_BASE as u16), Some(0));
+        assert_eq!(format_offset(330), "+05:30");
+        assert_eq!(format_offset(-180), "-03:00");
+    }
+}

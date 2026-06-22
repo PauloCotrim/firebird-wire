@@ -34,6 +34,86 @@ pub enum Value {
     Int128(i128),
     /// `DECFLOAT(16)`/`DECFLOAT(34)` decodificado (ponto flutuante decimal IEEE).
     DecFloat(crate::decfloat::DecFloat),
+    /// `TIME WITH TIME ZONE` (FB4+): hora UTC + zona.
+    TimeTz(TimeTz),
+    /// `TIMESTAMP WITH TIME ZONE` (FB4+): carimbo UTC + zona.
+    TimestampTz(TimestampTz),
+}
+
+/// `TIME WITH TIME ZONE`: a hora é armazenada em UTC; a zona é um id do Firebird
+/// (veja [`crate::tz`]). O `offset` (minutos a leste de UTC) é o offset RESOLVIDO
+/// para este instante — o servidor o calcula (já aplicando horário de verão) e o
+/// envia no formato estendido (`_EX`), então vale tanto para zonas por offset
+/// quanto para zonas nomeadas. Use [`TimeTz::local`] para a hora de parede local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeTz {
+    /// Hora UTC em frações de 1/10000 s desde a meia-noite.
+    pub utc_time: u32,
+    /// Id de zona do Firebird.
+    pub zone: u16,
+    /// Offset resolvido a leste de UTC, em minutos.
+    pub offset: i16,
+}
+
+/// `TIMESTAMP WITH TIME ZONE`: data/hora em UTC + zona. Veja [`TimeTz`] para a
+/// semântica de `zone`/`offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampTz {
+    /// Dias UTC desde a época do Firebird (1858-11-17).
+    pub utc_date: i32,
+    /// Hora UTC em frações de 1/10000 s desde a meia-noite.
+    pub utc_time: u32,
+    /// Id de zona do Firebird.
+    pub zone: u16,
+    /// Offset resolvido a leste de UTC, em minutos.
+    pub offset: i16,
+}
+
+/// Unidades de tempo do Firebird em um dia inteiro (24 h × 1/10000 s).
+const FB_TIME_UNITS_PER_DAY: i64 = 24 * 3600 * FB_TIME_UNITS_PER_SEC as i64;
+
+impl TimeTz {
+    /// Nome IANA da zona, ou `None` para zonas baseadas em offset.
+    pub fn zone_name(&self) -> Option<&'static str> {
+        crate::tz::zone_name(self.zone)
+    }
+
+    /// Rótulo legível da zona (nome IANA ou `±HH:MM`).
+    pub fn zone_label(&self) -> String {
+        crate::tz::zone_label(self.zone)
+    }
+
+    /// Hora de parede LOCAL (UTC + offset), normalizada ao intervalo de um dia.
+    pub fn local(&self) -> CivilTime {
+        let units = (self.utc_time as i64 + self.offset as i64 * 60 * FB_TIME_UNITS_PER_SEC as i64)
+            .rem_euclid(FB_TIME_UNITS_PER_DAY) as u32;
+        Value::Time(units).as_civil_time().unwrap()
+    }
+}
+
+impl TimestampTz {
+    /// Nome IANA da zona, ou `None` para zonas baseadas em offset.
+    pub fn zone_name(&self) -> Option<&'static str> {
+        crate::tz::zone_name(self.zone)
+    }
+
+    /// Rótulo legível da zona (nome IANA ou `±HH:MM`).
+    pub fn zone_label(&self) -> String {
+        crate::tz::zone_label(self.zone)
+    }
+
+    /// Data + hora de parede LOCAL (UTC + offset).
+    pub fn local(&self) -> CivilTimestamp {
+        let total = self.utc_date as i64 * FB_TIME_UNITS_PER_DAY
+            + self.utc_time as i64
+            + self.offset as i64 * 60 * FB_TIME_UNITS_PER_SEC as i64;
+        let date = total.div_euclid(FB_TIME_UNITS_PER_DAY);
+        let time = total.rem_euclid(FB_TIME_UNITS_PER_DAY) as u32;
+        CivilTimestamp {
+            date: Value::Date(date as i32).as_civil_date().unwrap(),
+            time: Value::Time(time).as_civil_time().unwrap(),
+        }
+    }
 }
 
 /// Diferença em dias entre a época do Firebird (1858-11-17, a época do Dia
@@ -248,6 +328,9 @@ impl ColumnMeta {
             sql_type::BOOLEAN => 4,
             sql_type::DEC16 => 8,
             sql_type::DEC34 => 16,
+            // Formato estendido (`_EX`) pedido na saída: 3 ou 4 inteiros XDR.
+            sql_type::TIME_TZ | sql_type::TIME_TZ_EX => 12,
+            sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => 16,
             _ => 8,
         }
     }
