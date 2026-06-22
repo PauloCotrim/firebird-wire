@@ -881,3 +881,32 @@ async fn date_time_civil_conversion() -> Result<()> {
     conn.close().await?;
     Ok(())
 }
+
+/// Gerenciador de serviços: anexa via `op_service_attach`, consulta a versão do
+/// servidor / implementação / banco de segurança (`op_service_info`) e dispara
+/// `isc_action_svc_get_fb_log` para drenar a saída textual de uma ação
+/// (`op_service_start` + leituras de `op_service_info`).
+#[tokio::test]
+async fn service_manager() -> Result<()> {
+    let cfg = require_server!();
+    let mut svc = fdb_driver::ServiceManager::attach(&cfg).await?;
+
+    let ver = svc.server_version().await?;
+    println!("server_version = {ver}");
+    assert!(ver.contains("Firebird") || ver.contains("LI-") || ver.contains("WI-"));
+
+    let imp = svc.implementation().await?;
+    println!("implementation = {imp}");
+    assert!(!imp.is_empty());
+
+    let secdb = svc.security_database().await?;
+    println!("security_database = {secdb}");
+    assert!(!secdb.is_empty());
+
+    // Uma ação sem argumentos: lê o firebird.log do servidor.
+    let log = svc.get_fb_log().await?;
+    println!("fb_log: {} bytes", log.len());
+
+    svc.close().await?;
+    Ok(())
+}

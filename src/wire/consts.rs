@@ -214,6 +214,110 @@ pub mod dpb {
 }
 
 // ---------------------------------------------------------------------------
+// SPB — Buffer de Parâmetros de Serviço (`isc_spb_*`, gerenciador de serviços)
+// ---------------------------------------------------------------------------
+
+/// O cabeçalho do SPB de attach é DOIS bytes: `isc_spb_version` seguido de
+/// `isc_spb_current_version`, ambos `2` (confirmado por strace do `fbsvcmgr`).
+pub const SPB_VERSION: u8 = 2;
+pub const SPB_CURRENT_VERSION: u8 = 2;
+
+pub mod spb {
+    // Itens de autenticação / identificação no attach (espelham os do DPB).
+    pub const USER_NAME: u8 = 28; // = isc_dpb_user_name
+    pub const PASSWORD: u8 = 29; // = isc_dpb_password
+    pub const SQL_ROLE_NAME: u8 = 60;
+    pub const CONNECT_TIMEOUT: u8 = 57;
+    pub const COMMAND_LINE: u8 = 105;
+    pub const DBNAME: u8 = 106;
+    pub const VERBOSE: u8 = 107;
+    pub const OPTIONS: u8 = 108;
+    pub const PROCESS_ID: u8 = 110;
+    pub const PROCESS_NAME: u8 = 112;
+    pub const TRUSTED_AUTH: u8 = 111;
+    /// O `isc_spb_specific_auth_data` (a prova SRP) divide o tag com `trusted_auth`.
+    pub const SPECIFIC_AUTH_DATA: u8 = 111;
+    pub const AUTH_BLOCK: u8 = 115;
+    pub const AUTH_PLUGIN_NAME: u8 = 116;
+    pub const AUTH_PLUGIN_LIST: u8 = 117;
+    pub const UTF8_FILENAME: u8 = 118;
+    pub const CLIENT_VERSION: u8 = 119;
+    pub const EXPECTED_DB: u8 = 124;
+}
+
+/// Códigos de ação para `op_service_start` (`isc_action_svc_*`); o primeiro byte
+/// do SPB de start é o código da ação.
+pub mod svc_action {
+    pub const BACKUP: u8 = 1;
+    pub const RESTORE: u8 = 2;
+    pub const REPAIR: u8 = 3;
+    pub const ADD_USER: u8 = 4;
+    pub const DELETE_USER: u8 = 5;
+    pub const MODIFY_USER: u8 = 6;
+    pub const DISPLAY_USER: u8 = 7;
+    pub const PROPERTIES: u8 = 8;
+    pub const DB_STATS: u8 = 11;
+    pub const GET_FB_LOG: u8 = 12;
+    pub const NBAK: u8 = 20;
+    pub const NREST: u8 = 21;
+    pub const TRACE_START: u8 = 22;
+    pub const TRACE_STOP: u8 = 23;
+    pub const VALIDATE: u8 = 30;
+}
+
+/// Itens de info de serviço para `op_service_info` (`isc_info_svc_*`).
+pub mod svc_info {
+    pub const SVR_DB_INFO: u8 = 50;
+    pub const VERSION: u8 = 54;
+    pub const SERVER_VERSION: u8 = 55;
+    pub const IMPLEMENTATION: u8 = 56;
+    pub const CAPABILITIES: u8 = 57;
+    pub const USER_DBPATH: u8 = 58;
+    pub const GET_ENV: u8 = 59;
+    pub const GET_ENV_LOCK: u8 = 60;
+    pub const GET_ENV_MSG: u8 = 61;
+    /// Uma linha de saída do serviço por chamada.
+    pub const LINE: u8 = 62;
+    /// Tanta saída do serviço quanto couber no buffer.
+    pub const TO_EOF: u8 = 63;
+    pub const TIMEOUT: u8 = 64;
+    pub const LIMBO_TRANS: u8 = 66;
+    /// Indica se uma ação ainda está em execução nesta conexão (0/1).
+    pub const RUNNING: u8 = 67;
+    pub const GET_USERS: u8 = 68;
+    pub const STDIN: u8 = 78;
+}
+
+/// Argumentos de SPB para `isc_action_svc_backup`/`restore` (`isc_spb_bkp_*`).
+pub mod svc_bkp {
+    pub const FILE: u8 = 5;
+    pub const FACTOR: u8 = 6;
+    pub const LENGTH: u8 = 7;
+    pub const STAT: u8 = 15;
+}
+
+/// Argumentos de SPB para `isc_action_svc_restore` (`isc_spb_res_*`).
+pub mod svc_res {
+    pub const BUFFERS: u8 = 9;
+    pub const PAGE_SIZE: u8 = 10;
+    pub const LENGTH: u8 = 11;
+    pub const ACCESS_MODE: u8 = 12;
+}
+
+/// Argumentos de SPB para gestão de usuários (`isc_spb_sec_*`).
+pub mod svc_sec {
+    pub const USERID: u8 = 5;
+    pub const GROUPID: u8 = 6;
+    pub const USERNAME: u8 = 7;
+    pub const PASSWORD: u8 = 8;
+    pub const GROUPNAME: u8 = 9;
+    pub const FIRSTNAME: u8 = 10;
+    pub const MIDDLENAME: u8 = 11;
+    pub const LASTNAME: u8 = 12;
+    pub const ADMIN: u8 = 13;
+}
+
+// ---------------------------------------------------------------------------
 // TPB — Buffer de Parâmetros de Transação (`isc_tpb_*`)
 // ---------------------------------------------------------------------------
 

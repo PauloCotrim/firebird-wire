@@ -10,6 +10,7 @@
 //! - Prepared statements, cursores roláveis (FB5), transações.
 //! - **DML em lote / array** via o protocolo de batch do FB4+ (`op_batch_*`).
 //! - Pool de conexões.
+//! - **Gerenciador de serviços** (`op_service_*`): versão do servidor, log, etc.
 //!
 //! A crate é construída em camadas; veja a documentação dos módulos para detalhes.
 //! Isto é um trabalho em andamento — veja o README da crate para a superfície já implementada.
@@ -27,6 +28,7 @@ pub mod error;
 pub mod events;
 pub mod message;
 pub mod pool;
+pub mod service;
 pub mod statement;
 pub mod transaction;
 pub mod value;
@@ -40,6 +42,7 @@ pub use connection::Connection;
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 pub use events::EventListener;
 pub use pool::{Pool, PoolConfig, PooledConnection};
+pub use service::ServiceManager;
 pub use statement::{RowStream, RowsAffected, Statement};
 pub use transaction::{AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder};
 pub use value::{CivilDate, CivilTime, CivilTimestamp, ColumnMeta, Value};

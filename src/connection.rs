@@ -52,78 +52,16 @@ impl Connection {
     }
 
     async fn open_inner(config: &ConnectConfig, create: bool) -> Result<Connection> {
-        let addr = (config.host.as_str(), config.port);
-        let sock = TcpStream::connect(addr).await?;
-        let mut stream = FbStream::new(sock);
+        let connect_op = if create { op::CREATE } else { op::ATTACH };
 
-        let mut srp = SrpClient::new(SrpHash::Sha256);
-
-        // --- op_connect ----------------------------------------------------
-        let pubkey = srp.public_key_hex();
-        let cnct = build_cnct_block(config, &pubkey);
-        dbg_log(&format!("pubkey hex ({} chars)", pubkey.len()));
-        dbg_log(&format!("cnct ({} bytes): {}", cnct.len(), hexdump(&cnct)));
-        let mut w = op_packet(op::CONNECT);
-        w.put_i32(if create { op::CREATE } else { op::ATTACH }); // p_cnct_operation (operação)
-        w.put_i32(CONNECT_VERSION3);
-        w.put_i32(ARCH_GENERIC);
-        w.put_str(&config.database); // p_cnct_file
-        w.put_i32(OFFERED_PROTOCOLS.len() as i32);
-        w.put_bytes(&cnct); // p_cnct_user_id
-        for (i, &version) in OFFERED_PROTOCOLS.iter().enumerate() {
-            w.put_i32(version);
-            w.put_i32(ARCH_GENERIC);
-            w.put_i32(PTYPE_RPC); // tipo mínimo aceitável
-            w.put_i32(PTYPE_BATCH_SEND); // tipo máximo aceitável (sem lazy-send)
-            w.put_i32((i + 1) as i32); // weight (peso)
-        }
-        stream.send(&w).await?;
-        dbg_log("sent op_connect");
-
-        // --- accept / autenticação ----------------------------------------
-        let accept = read_accept(&mut stream).await?;
-        // A versão chega como um USHORT com sinal estendido (ex.: 0xffff8013);
-        // mantemos os 15 bits baixos para recuperar a versão base (flag removida).
-        let protocol_version = accept.version & 0x7fff;
-        dbg_log(&format!(
-            "accept: proto={protocol_version} plugin={:?} authenticated={} data_len={} keys_len={}",
-            accept.plugin,
-            accept.authenticated,
-            accept.data.len(),
-            accept.keys.len()
-        ));
-
-        // Calcula a prova SRP; ela viaja dentro do DPB de attach
-        // (isc_dpb_specific_auth_data), o caminho que fbclient/isql usam.
-        let auth = compute_auth(config, &mut srp, &accept)?;
-        let session_key = auth.as_ref().map(|a| a.session_key.clone());
-        dbg_log(&format!("auth computed; have_proof={}", auth.is_some()));
-
-        // --- criptografia de comunicação (wire) ---------------------------
-        // Quando o servidor pede continuação (`op_cond_accept`, típico de
-        // `WireCrypt=Required`), concluímos a autenticação por `op_cont_auth`: a
-        // resposta traz as chaves da cifra (incl. o nonce do ChaCha). Caso
-        // contrário, usamos a prova embutida no DPB e as chaves do accept.
-        let dpb_auth = match (&auth, accept.cond, config.wire_crypt != WireCrypt::Disabled) {
-            (Some(a), true, true) => {
-                let keys = continue_auth(&mut stream, a).await?;
-                negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys).await?;
-                DpbAuth::Done
-            }
-            (Some(a), _, _) => {
-                negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
-                DpbAuth::Proof(a)
-            }
-            (None, _, _) => {
-                negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
-                DpbAuth::Legacy
-            }
-        };
-        dbg_log(&format!("crypt negotiated; encrypted={}", stream.is_encrypted()));
+        // O handshake (connect + accept + SRP + wire-crypt) é idêntico ao do
+        // attach de serviço; está fatorado em [`handshake`].
+        let Handshake { mut stream, protocol_version, auth } =
+            handshake(config, connect_op, &config.database).await?;
 
         // --- attach / create ----------------------------------------------
-        let dpb = build_dpb(config, create, dpb_auth);
-        let mut w = op_packet(if create { op::CREATE } else { op::ATTACH });
+        let dpb = build_dpb(config, create, &auth);
+        let mut w = op_packet(connect_op);
         w.put_i32(0); // id do objeto de banco de dados
         w.put_str(&config.database);
         w.put_bytes(&dpb);
@@ -289,11 +227,111 @@ async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
     }
 }
 
-/// A prova SRP a embutir no DPB de attach, mais a chave de sessão derivada.
-struct AuthData {
-    plugin: String,
-    proof_hex: String,
-    session_key: Vec<u8>,
+/// A prova SRP a embutir no DPB/SPB de attach, mais a chave de sessão derivada.
+pub(crate) struct AuthData {
+    pub(crate) plugin: String,
+    pub(crate) proof_hex: String,
+    pub(crate) session_key: Vec<u8>,
+}
+
+/// Como a autenticação foi concluída no handshake, e portanto como ela deve ser
+/// apresentada no buffer de parâmetros (DPB de banco ou SPB de serviço).
+pub(crate) enum AuthState {
+    /// Embute a prova SRP no PB (`isc_dpb_specific_auth_data` / `isc_spb_specific_auth_data`).
+    Proof(AuthData),
+    /// Sem sessão SRP: recorre a senha legada.
+    Legacy,
+    /// Já autenticado por `op_cont_auth` (a prova não vai no PB).
+    Done,
+}
+
+/// O resultado do handshake: o socket (já criptografado, se negociado), a versão
+/// de protocolo negociada e como apresentar a autenticação no PB de attach.
+pub(crate) struct Handshake {
+    pub(crate) stream: FbStream,
+    pub(crate) protocol_version: i32,
+    pub(crate) auth: AuthState,
+}
+
+/// Executa o handshake comum a attach de banco e de serviço: `op_connect`, lê o
+/// accept do servidor, calcula a prova SRP e negocia a criptografia de
+/// comunicação (wire). `connect_op` é a operação anunciada no bloco connect
+/// (`op_attach`/`op_create`/`op_service_attach`); `target` é o arquivo/serviço.
+pub(crate) async fn handshake(
+    config: &ConnectConfig,
+    connect_op: i32,
+    target: &str,
+) -> Result<Handshake> {
+    let addr = (config.host.as_str(), config.port);
+    let sock = TcpStream::connect(addr).await?;
+    let mut stream = FbStream::new(sock);
+
+    let mut srp = SrpClient::new(SrpHash::Sha256);
+
+    // --- op_connect --------------------------------------------------------
+    let pubkey = srp.public_key_hex();
+    let cnct = build_cnct_block(config, &pubkey);
+    dbg_log(&format!("pubkey hex ({} chars)", pubkey.len()));
+    dbg_log(&format!("cnct ({} bytes): {}", cnct.len(), hexdump(&cnct)));
+    let mut w = op_packet(op::CONNECT);
+    w.put_i32(connect_op); // p_cnct_operation (operação)
+    w.put_i32(CONNECT_VERSION3);
+    w.put_i32(ARCH_GENERIC);
+    w.put_str(target); // p_cnct_file
+    w.put_i32(OFFERED_PROTOCOLS.len() as i32);
+    w.put_bytes(&cnct); // p_cnct_user_id
+    for (i, &version) in OFFERED_PROTOCOLS.iter().enumerate() {
+        w.put_i32(version);
+        w.put_i32(ARCH_GENERIC);
+        w.put_i32(PTYPE_RPC); // tipo mínimo aceitável
+        w.put_i32(PTYPE_BATCH_SEND); // tipo máximo aceitável (sem lazy-send)
+        w.put_i32((i + 1) as i32); // weight (peso)
+    }
+    stream.send(&w).await?;
+    dbg_log("sent op_connect");
+
+    // --- accept / autenticação ---------------------------------------------
+    let accept = read_accept(&mut stream).await?;
+    // A versão chega como um USHORT com sinal estendido (ex.: 0xffff8013);
+    // mantemos os 15 bits baixos para recuperar a versão base (flag removida).
+    let protocol_version = accept.version & 0x7fff;
+    dbg_log(&format!(
+        "accept: proto={protocol_version} plugin={:?} authenticated={} data_len={} keys_len={}",
+        accept.plugin,
+        accept.authenticated,
+        accept.data.len(),
+        accept.keys.len()
+    ));
+
+    // Calcula a prova SRP; no caminho comum ela viaja dentro do PB de attach
+    // (isc_*_specific_auth_data), o caminho que fbclient/isql usam.
+    let auth = compute_auth(config, &mut srp, &accept)?;
+    let session_key = auth.as_ref().map(|a| a.session_key.clone());
+    dbg_log(&format!("auth computed; have_proof={}", auth.is_some()));
+
+    // --- criptografia de comunicação (wire) --------------------------------
+    // Quando o servidor pede continuação (`op_cond_accept`, típico de
+    // `WireCrypt=Required`), concluímos a autenticação por `op_cont_auth`: a
+    // resposta traz as chaves da cifra (incl. o nonce do ChaCha). Caso
+    // contrário, usamos a prova embutida no PB e as chaves do accept.
+    let auth = match (auth, accept.cond, config.wire_crypt != WireCrypt::Disabled) {
+        (Some(a), true, true) => {
+            let keys = continue_auth(&mut stream, &a).await?;
+            negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys).await?;
+            AuthState::Done
+        }
+        (Some(a), _, _) => {
+            negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+            AuthState::Proof(a)
+        }
+        (None, _, _) => {
+            negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+            AuthState::Legacy
+        }
+    };
+    dbg_log(&format!("crypt negotiated; encrypted={}", stream.is_encrypted()));
+
+    Ok(Handshake { stream, protocol_version, auth })
 }
 
 /// Calcula a prova SRP a partir do salt/B do servidor. Retorna `None` para um
@@ -341,10 +379,11 @@ async fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>
     Ok(resp.data)
 }
 
-/// Lê a resposta para `op_attach`/`op_create`. Com a autenticação carregada no DPB
-/// o servidor normalmente responde `op_response` diretamente, mas pode conduzir uma
-/// ou mais rodadas de `op_cont_auth` antes; absorva-as.
-async fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response::Response> {
+/// Lê a resposta para `op_attach`/`op_create`/`op_service_attach`. Com a
+/// autenticação carregada no PB o servidor normalmente responde `op_response`
+/// diretamente, mas pode conduzir uma ou mais rodadas de `op_cont_auth` antes;
+/// absorva-as.
+pub(crate) async fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response::Response> {
     loop {
         let code = read_op(stream).await?;
         if code == op::RESPONSE {
@@ -479,18 +518,8 @@ fn push_cnct(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-/// Como a autenticação é apresentada no DPB de attach.
-enum DpbAuth<'a> {
-    /// Embute a prova SRP no DPB (`isc_dpb_specific_auth_data`).
-    Proof(&'a AuthData),
-    /// Sem sessão SRP: recorre a senha legada.
-    Legacy,
-    /// Já autenticado por `op_cont_auth` (a prova não vai no DPB).
-    Done,
-}
-
 /// Constrói o Database Parameter Buffer (DPB) para attach/create.
-fn build_dpb(config: &ConnectConfig, create: bool, auth: DpbAuth<'_>) -> Vec<u8> {
+fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> {
     let mut pb = ParameterBuffer::new(DPB_VERSION1);
 
     pb.int(dpb::SQL_DIALECT, config.dialect);
@@ -498,17 +527,17 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: DpbAuth<'_>) -> Vec<u8>
     pb.string(dpb::USER_NAME, &config.normalized_user());
 
     match auth {
-        DpbAuth::Proof(a) => {
+        AuthState::Proof(a) => {
             pb.string(dpb::AUTH_PLUGIN_NAME, &a.plugin);
             pb.string(dpb::AUTH_PLUGIN_LIST, "Srp256,Srp");
             pb.string(dpb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
-        DpbAuth::Legacy => {
+        AuthState::Legacy => {
             // Nenhuma sessão SRP negociada: recorre a uma senha legada.
             pb.string(dpb::PASSWORD, &config.password);
         }
         // Já autenticado via cont_auth: nada de prova/senha no DPB.
-        DpbAuth::Done => {}
+        AuthState::Done => {}
     }
 
     if let Some(role) = &config.role {
@@ -624,7 +653,7 @@ mod tests {
     #[test]
     fn dpb_has_dialect_and_charset() {
         let cfg = ConnectConfig::new().charset("UTF8").dialect(3);
-        let dpb = build_dpb(&cfg, false, DpbAuth::Legacy);
+        let dpb = build_dpb(&cfg, false, &AuthState::Legacy);
         assert_eq!(dpb[0], DPB_VERSION1);
         // clumplet de dialect presente.
         assert!(dpb.windows(1).any(|w| w[0] == dpb::SQL_DIALECT));

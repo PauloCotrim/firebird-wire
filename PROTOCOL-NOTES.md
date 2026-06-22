@@ -421,3 +421,41 @@ Decodificado de um cliente C (`isc_event_block` + `isc_wait_for_event`) sob
 Eventos são one-shot: re-registrar (`op_que_events`) após cada `op_event`. O
 canal auxiliar é só-leitura no cliente (o servidor empurra `op_event`); não há
 handshake nele. Ver `events.rs` (`Connection::listen_events`/`EventListener`).
+
+## Gerenciador de serviços (`op_service_*`) — VALIDADO AO VIVO
+
+Decodificado de um `strace -e trace=network` do `fbsvcmgr` contra o servidor de
+exemplo (porta 3555). O **handshake é idêntico** ao de um attach de banco
+(`op_connect` + accept + SRP + wire-crypt); só muda a operação anunciada no bloco
+connect (`op_service_attach` = 82) e o "arquivo" (`service_mgr`). Está fatorado
+em `connection::handshake`, reusado por `Connection` e `ServiceManager`.
+
+1. **`op_service_attach` (82):** `op | obj(0) | "service_mgr"(cstring) | spb(cstring)`.
+   O **SPB de attach** começa com DOIS bytes `isc_spb_version, isc_spb_current_version`
+   (ambos `2`), seguidos de clumplets de comprimento de 1 byte (forma clássica):
+   `isc_spb_user_name(28)` e a autenticação igual ao DPB —
+   `isc_spb_auth_plugin_name(116)`, `isc_spb_auth_plugin_list(117)` e a prova SRP em
+   `isc_spb_specific_auth_data(111)` (que divide o tag com `isc_spb_trusted_auth`).
+   Resposta `op_response`; o `p_resp_object` é o handle do serviço (0 no exemplo).
+   No caminho `WireCrypt=Required` a prova vai no `op_cont_auth` e o SPB não a leva
+   (igual ao DPB: estados `Proof`/`Legacy`/`Done` em `AuthState`).
+2. **`op_service_info` (84):** `op | handle | incarnation(0) | send_items(cstring) |
+   recv_items(cstring) | buffer_length(i32)`. ATENÇÃO à ordem: os itens de
+   **recepção vêm ANTES** do `buffer_length` (confirmado por strace). A resposta é
+   um `op_response` cujo `p_resp_data` é um buffer de info: itens de **string** são
+   `tag | len(2 LE) | dados`, terminados por `isc_info_end(1)`. Ex.: pedir
+   `isc_info_svc_server_version(55)` devolve `37 1b00 "LI-V5.0.3…" 01`.
+   (Itens **inteiros** como `isc_info_svc_version(54)` usam outra codificação — sem
+   o prefixo de 2 bytes — e ainda não estão decodificados; ver TODO abaixo.)
+3. **`op_service_start` (85):** `op | handle | incarnation(0) | spb(cstring)`. O
+   primeiro byte do SPB é o código da ação (`isc_action_svc_*`). Ações sem
+   argumentos (ex.: `isc_action_svc_get_fb_log(12)`) levam só esse byte. A saída
+   textual é drenada DEPOIS, com chamadas repetidas de `op_service_info` pedindo
+   `isc_info_svc_to_eof(63)` (ou `isc_info_svc_line(62)`) até vir vazio.
+4. **`op_service_detach` (83):** `op | handle`.
+
+Ver `service.rs` (`ServiceManager`). **TODO:** (a) decodificar itens de info
+INTEIROS (`svc_version`, `svc_running`, `svr_db_info`); (b) a codificação do SPB de
+**ação** com argumentos (strings com len de 2 bytes? inteiros sem len?) — precisa de
+um strace de `op_service_start` com `gbak`/`gstat` para confirmar antes de expor
+`backup`/`restore`/`statistics`.
