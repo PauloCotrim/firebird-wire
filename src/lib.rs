@@ -42,7 +42,7 @@ pub use connection::Connection;
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 pub use events::EventListener;
 pub use pool::{Pool, PoolConfig, PooledConnection};
-pub use service::ServiceManager;
+pub use service::{ServiceManager, UserInfo, UserParams};
 pub use statement::{RowStream, RowsAffected, Statement};
 pub use transaction::{AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder};
 pub use value::{CivilDate, CivilTime, CivilTimestamp, ColumnMeta, Value};

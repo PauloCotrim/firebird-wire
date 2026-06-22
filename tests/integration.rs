@@ -970,3 +970,50 @@ async fn service_backup_restore() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+/// Gestão de usuários: cria, lista, altera e remove um usuário descartável no
+/// banco de segurança (`isc_action_svc_add/modify/delete_user` +
+/// `isc_info_svc_get_users`). Usa um nome único e remove no fim para não deixar
+/// resíduo no banco de segurança compartilhado.
+#[tokio::test]
+async fn service_user_management() -> Result<()> {
+    let cfg = require_server!();
+    let mut svc = fdb_driver::ServiceManager::attach(&cfg).await?;
+
+    let name = format!("FDBT{}", std::process::id());
+
+    // Garante estado limpo caso uma execução anterior tenha falhado.
+    let _ = svc.delete_user(&name).await;
+
+    // Cria.
+    let params = fdb_driver::UserParams::new(&name)
+        .password("zaq12wsx")
+        .first_name("Integração")
+        .last_name("Teste");
+    svc.add_user(&params).await?;
+
+    // Aparece na listagem (nomes vêm em maiúsculas do banco de segurança).
+    let created = svc.display_user(&name).await?.expect("usuário recém-criado");
+    println!("criado: {created:?}");
+    assert_eq!(created.username, name);
+    assert_eq!(created.last_name, "Teste");
+
+    // Altera o sobrenome e confirma.
+    svc.modify_user(&fdb_driver::UserParams::new(&name).last_name("Alterado")).await?;
+    let modified = svc.display_user(&name).await?.expect("usuário alterado");
+    assert_eq!(modified.last_name, "Alterado");
+    // O primeiro nome não foi tocado pelo modify.
+    assert_eq!(modified.first_name, "Integração");
+
+    // A listagem completa também contém o usuário (e o SYSDBA).
+    let all = svc.display_users().await?;
+    assert!(all.iter().any(|u| u.username == name));
+    assert!(all.iter().any(|u| u.username == "SYSDBA"));
+
+    // Remove e confirma que sumiu.
+    svc.delete_user(&name).await?;
+    assert!(svc.display_user(&name).await?.is_none());
+
+    svc.close().await?;
+    Ok(())
+}

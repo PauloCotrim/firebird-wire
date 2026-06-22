@@ -231,6 +231,51 @@ impl ServiceManager {
         self.run(&spb.into_vec()).await
     }
 
+    // -- gestão de usuários (banco de segurança) ----------------------------
+
+    /// Cria um usuário no banco de segurança (`isc_action_svc_add_user`).
+    pub async fn add_user(&mut self, user: &UserParams) -> Result<()> {
+        self.run(&build_user_spb(svc_action::ADD_USER, user)).await?;
+        Ok(())
+    }
+
+    /// Altera um usuário existente (`isc_action_svc_modify_user`). Só os campos
+    /// presentes em `user` são modificados.
+    pub async fn modify_user(&mut self, user: &UserParams) -> Result<()> {
+        self.run(&build_user_spb(svc_action::MODIFY_USER, user)).await?;
+        Ok(())
+    }
+
+    /// Remove um usuário (`isc_action_svc_delete_user`).
+    pub async fn delete_user(&mut self, username: &str) -> Result<()> {
+        let mut spb = ActionSpb::new(svc_action::DELETE_USER);
+        spb.string(svc_sec::USERNAME, username);
+        self.run(&spb.into_vec()).await?;
+        Ok(())
+    }
+
+    /// Lista todos os usuários do banco de segurança
+    /// (`isc_action_svc_display_user` + `isc_info_svc_get_users`).
+    pub async fn display_users(&mut self) -> Result<Vec<UserInfo>> {
+        let spb = ActionSpb::new(svc_action::DISPLAY_USER);
+        self.fetch_users(spb.into_vec()).await
+    }
+
+    /// Consulta um único usuário pelo nome; devolve `None` se não existir.
+    pub async fn display_user(&mut self, username: &str) -> Result<Option<UserInfo>> {
+        let mut spb = ActionSpb::new(svc_action::DISPLAY_USER);
+        spb.string(svc_sec::USERNAME, username);
+        Ok(self.fetch_users(spb.into_vec()).await?.into_iter().next())
+    }
+
+    /// Dispara um `display_user` e decodifica o buffer `isc_info_svc_get_users`.
+    async fn fetch_users(&mut self, spb: Vec<u8>) -> Result<Vec<UserInfo>> {
+        self.start(&spb).await?;
+        let data = self.info(&[], &[svc_info::GET_USERS], DEFAULT_INFO_BUF).await?;
+        let payload = parse_svc_string(&data, svc_info::GET_USERS)?;
+        parse_users(&payload)
+    }
+
     // -- auxiliares ---------------------------------------------------------
 
     /// Consulta um único item de info que devolve uma string.
@@ -308,6 +353,172 @@ impl ActionSpb {
     }
 }
 
+/// Parâmetros para criar (`add_user`) ou alterar (`modify_user`) um usuário.
+/// Construa com [`UserParams::new`] e os métodos encadeáveis; só os campos
+/// definidos entram no SPB (em `modify_user`, os ausentes ficam intactos).
+#[derive(Debug, Clone, Default)]
+pub struct UserParams {
+    username: String,
+    password: Option<String>,
+    first_name: Option<String>,
+    middle_name: Option<String>,
+    last_name: Option<String>,
+    user_id: Option<u32>,
+    group_id: Option<u32>,
+    admin: Option<bool>,
+}
+
+impl UserParams {
+    /// Inicia os parâmetros para o usuário de nome `username`.
+    pub fn new(username: impl Into<String>) -> Self {
+        Self { username: username.into(), ..Default::default() }
+    }
+
+    /// Define a senha (`isc_spb_sec_password`).
+    pub fn password(mut self, v: impl Into<String>) -> Self {
+        self.password = Some(v.into());
+        self
+    }
+
+    /// Define o primeiro nome (`isc_spb_sec_firstname`).
+    pub fn first_name(mut self, v: impl Into<String>) -> Self {
+        self.first_name = Some(v.into());
+        self
+    }
+
+    /// Define o nome do meio (`isc_spb_sec_middlename`).
+    pub fn middle_name(mut self, v: impl Into<String>) -> Self {
+        self.middle_name = Some(v.into());
+        self
+    }
+
+    /// Define o sobrenome (`isc_spb_sec_lastname`).
+    pub fn last_name(mut self, v: impl Into<String>) -> Self {
+        self.last_name = Some(v.into());
+        self
+    }
+
+    /// Define o UID Unix (`isc_spb_sec_userid`).
+    pub fn user_id(mut self, v: u32) -> Self {
+        self.user_id = Some(v);
+        self
+    }
+
+    /// Define o GID Unix (`isc_spb_sec_groupid`).
+    pub fn group_id(mut self, v: u32) -> Self {
+        self.group_id = Some(v);
+        self
+    }
+
+    /// Concede ou revoga o papel de administrador (`isc_spb_sec_admin`).
+    pub fn admin(mut self, v: bool) -> Self {
+        self.admin = Some(v);
+        self
+    }
+}
+
+/// Um usuário do banco de segurança, devolvido por
+/// [`ServiceManager::display_users`]/[`display_user`](ServiceManager::display_user).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserInfo {
+    pub username: String,
+    pub first_name: String,
+    pub middle_name: String,
+    pub last_name: String,
+    pub user_id: u32,
+    pub group_id: u32,
+}
+
+/// Monta o SPB de `add_user`/`modify_user` a partir de [`UserParams`]. Campos
+/// string usam `tag | len(2 LE) | bytes`; UID/GID/admin são inteiros de 4 bytes.
+fn build_user_spb(action: u8, p: &UserParams) -> Vec<u8> {
+    let mut spb = ActionSpb::new(action);
+    spb.string(svc_sec::USERNAME, &p.username);
+    if let Some(v) = &p.password {
+        spb.string(svc_sec::PASSWORD, v);
+    }
+    if let Some(v) = &p.first_name {
+        spb.string(svc_sec::FIRSTNAME, v);
+    }
+    if let Some(v) = &p.middle_name {
+        spb.string(svc_sec::MIDDLENAME, v);
+    }
+    if let Some(v) = &p.last_name {
+        spb.string(svc_sec::LASTNAME, v);
+    }
+    if let Some(v) = p.user_id {
+        spb.int(svc_sec::USERID, v);
+    }
+    if let Some(v) = p.group_id {
+        spb.int(svc_sec::GROUPID, v);
+    }
+    if let Some(v) = p.admin {
+        spb.int(svc_sec::ADMIN, v as u32);
+    }
+    spb.into_vec()
+}
+
+/// Decodifica o buffer interno de `isc_info_svc_get_users`: uma sequência plana
+/// de sub-itens, um registro de usuário começando a cada `isc_spb_sec_username`.
+/// Strings (username/firstname/middlename/lastname/groupname) usam `tag|len(2
+/// LE)|bytes`; UID/GID (`isc_spb_sec_userid`/`groupid`) são inteiros de 4 bytes
+/// LE sem prefixo de comprimento.
+fn parse_users(payload: &[u8]) -> Result<Vec<UserInfo>> {
+    let mut users = Vec::new();
+    let mut cur: Option<UserInfo> = None;
+    let mut p = 0usize;
+    while p < payload.len() {
+        let tag = payload[p];
+        p += 1;
+        match tag {
+            svc_sec::USERNAME | svc_sec::GROUPNAME | svc_sec::FIRSTNAME
+            | svc_sec::MIDDLENAME | svc_sec::LASTNAME => {
+                let len = payload
+                    .get(p..p + 2)
+                    .ok_or_else(|| Error::protocol("get_users: comprimento truncado"))?;
+                let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+                let value = payload
+                    .get(p + 2..p + 2 + len)
+                    .ok_or_else(|| Error::protocol("get_users: valor truncado"))?;
+                let s = String::from_utf8_lossy(value).into_owned();
+                p += 2 + len;
+                if tag == svc_sec::USERNAME {
+                    if let Some(u) = cur.take() {
+                        users.push(u);
+                    }
+                    cur = Some(UserInfo { username: s, ..Default::default() });
+                } else if let Some(u) = cur.as_mut() {
+                    match tag {
+                        svc_sec::FIRSTNAME => u.first_name = s,
+                        svc_sec::MIDDLENAME => u.middle_name = s,
+                        svc_sec::LASTNAME => u.last_name = s,
+                        _ => {} // groupname: ignorado
+                    }
+                }
+            }
+            svc_sec::USERID | svc_sec::GROUPID => {
+                let v = payload
+                    .get(p..p + 4)
+                    .ok_or_else(|| Error::protocol("get_users: inteiro truncado"))?;
+                let v = u32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+                p += 4;
+                if let Some(u) = cur.as_mut() {
+                    if tag == svc_sec::USERID {
+                        u.user_id = v;
+                    } else {
+                        u.group_id = v;
+                    }
+                }
+            }
+            _ => break, // tag desconhecida (ou fim): encerra
+        }
+    }
+    if let Some(u) = cur.take() {
+        users.push(u);
+    }
+    Ok(users)
+}
+
 /// Lê o primeiro item `tag | len(2 LE) | valor` de um buffer de info de serviço.
 fn read_svc_item(payload: &[u8]) -> Result<(u8, &[u8])> {
     if payload.len() < 3 {
@@ -379,6 +590,63 @@ mod tests {
             spb.into_vec(),
             b"\x0b\x6a\x08\x00employee".to_vec(),
         );
+    }
+
+    #[test]
+    fn user_spb_add_matches_strace() {
+        // strace de `action_add_user sec_username FDBTEST sec_password secret99
+        // sec_firstname Test sec_lastname User`:
+        // 04 | 07 0700 FDBTEST | 08 0800 secret99 | 0a 0400 Test | 0c 0400 User.
+        let p = UserParams::new("FDBTEST")
+            .password("secret99")
+            .first_name("Test")
+            .last_name("User");
+        let spb = build_user_spb(svc_action::ADD_USER, &p);
+        assert_eq!(
+            spb,
+            b"\x04\x07\x07\x00FDBTEST\x08\x08\x00secret99\x0a\x04\x00Test\x0c\x04\x00User".to_vec(),
+        );
+    }
+
+    #[test]
+    fn user_spb_delete_is_just_username() {
+        let mut spb = ActionSpb::new(svc_action::DELETE_USER);
+        spb.string(svc_sec::USERNAME, "FDBTEST");
+        assert_eq!(spb.into_vec(), b"\x05\x07\x07\x00FDBTEST".to_vec());
+    }
+
+    /// Decodifica uma string hex em bytes (auxiliar de teste).
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn parse_users_from_strace_payload() {
+        // Payload interno de isc_info_svc_get_users capturado ao vivo (3 usuários),
+        // montado por campo para legibilidade.
+        let payload = hex(concat!(
+            "070600", "535953444241",       // username "SYSDBA"
+            "0a0300", "53716c",             // first "Sql"
+            "0b0600", "536572766572",       // middle "Server"
+            "0c0d00", "41646d696e6973747261746f72", // last "Administrator"
+            "05", "00000000",               // userid 0
+            "06", "00000000",               // groupid 0
+            "070800", "4653435343504938",   // username "FSCSCPI8"
+            "0a0000", "0b0000", "0c0000",   // first/middle/last vazios
+            "05", "00000000", "06", "00000000",
+            "070600", "465343534950",       // username "FSCSIP"
+            "0a0000", "0b0000", "0c0000",
+            "05", "00000000", "06", "00000000",
+        ));
+        let users = parse_users(&payload).unwrap();
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0].username, "SYSDBA");
+        assert_eq!(users[0].first_name, "Sql");
+        assert_eq!(users[0].middle_name, "Server");
+        assert_eq!(users[0].last_name, "Administrator");
+        assert_eq!(users[1].username, "FSCSCPI8");
+        assert_eq!(users[1].first_name, "");
+        assert_eq!(users[2].username, "FSCSIP");
     }
 
     #[test]
