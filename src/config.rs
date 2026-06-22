@@ -38,6 +38,11 @@ pub struct ConnectConfig {
     pub timezone: Option<String>,
     /// Número de workers paralelos para a conexão (FB5).
     pub parallel_workers: Option<i32>,
+    /// Quando `true`, emite `SET BIND OF INT128/DECFLOAT/TIME ZONE TO NATIVE`
+    /// logo após o attach (FB4+). Útil quando o servidor está com
+    /// `DataTypeCompatibility` ligado e coage esses tipos para os legados —
+    /// assim eles voltam como `Int128`/`DecFloat`/`TimeTz` em vez de aproximações.
+    pub native_data_types: bool,
 }
 
 impl Default for ConnectConfig {
@@ -56,6 +61,7 @@ impl Default for ConnectConfig {
             page_size: None,
             timezone: None,
             parallel_workers: None,
+            native_data_types: false,
         }
     }
 }
@@ -116,6 +122,12 @@ impl ConnectConfig {
     }
     pub fn parallel_workers(mut self, n: i32) -> Self {
         self.parallel_workers = Some(n);
+        self
+    }
+    /// Pede os tipos nativos (INT128/DECFLOAT/WITH TIME ZONE) após o attach.
+    /// Veja [`ConnectConfig::native_data_types`].
+    pub fn native_data_types(mut self, on: bool) -> Self {
+        self.native_data_types = on;
         self
     }
 

@@ -878,6 +878,36 @@ async fn time_zone_types() -> Result<()> {
     Ok(())
 }
 
+/// Com `native_data_types(true)`, o driver emite os `SET BIND ... TO NATIVE`
+/// automaticamente após o attach, então INT128/DECFLOAT/WITH TIME ZONE voltam
+/// como tipos nativos mesmo num servidor com DataTypeCompatibility ligado — sem
+/// nenhum SET BIND manual.
+#[tokio::test]
+async fn native_data_types_auto_bind() -> Result<()> {
+    let cfg = require_server!().native_data_types(true);
+    let mut conn = Connection::connect(&cfg).await?;
+
+    let tx = conn.begin().await?;
+    let mut stmt = conn
+        .prepare(
+            &tx,
+            "SELECT CAST('123456789012345678901234567890' AS INT128), \
+             CAST('123.45' AS DECFLOAT(34)), \
+             CAST('11:22:33 +02:00' AS TIME WITH TIME ZONE) FROM RDB$DATABASE",
+        )
+        .await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    assert!(matches!(row[0], Value::Int128(_)), "int128: {:?}", row[0]);
+    assert!(matches!(row[1], Value::DecFloat(_)), "decfloat: {:?}", row[1]);
+    assert!(matches!(row[2], Value::TimeTz(_)), "timetz: {:?}", row[2]);
+
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn batch_segmented_blob() -> Result<()> {
     let cfg = require_server!();

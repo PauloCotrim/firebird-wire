@@ -475,11 +475,24 @@ impl ServiceManager {
     }
 
     /// Dispara um `display_user` e decodifica o buffer `isc_info_svc_get_users`.
+    /// `isc_info_svc_get_users` não tem continuação incremental: se a lista não
+    /// couber no buffer, o servidor marca `isc_info_truncated` e devemos repetir
+    /// com um buffer maior. Dobramos o tamanho até caber (ou atingir o teto).
     async fn fetch_users(&mut self, spb: Vec<u8>) -> Result<Vec<UserInfo>> {
-        self.start(&spb).await?;
-        let data = self.info(&[], &[svc_info::GET_USERS], DEFAULT_INFO_BUF).await?;
-        let payload = parse_svc_string(&data, svc_info::GET_USERS)?;
-        parse_users(&payload)
+        const MAX_INFO_BUF: i32 = 16 * 1024 * 1024;
+        let mut buf_len = DEFAULT_INFO_BUF;
+        loop {
+            // Re-dispara a ação a cada tentativa para que o buffer maior receba a
+            // lista completa do zero (get_users não tem continuação incremental).
+            self.start(&spb).await?;
+            let data = self.info(&[], &[svc_info::GET_USERS], buf_len).await?;
+            if data.last() == Some(&INFO_TRUNCATED) && buf_len < MAX_INFO_BUF {
+                buf_len = buf_len.saturating_mul(2).min(MAX_INFO_BUF);
+                continue;
+            }
+            let payload = parse_svc_string(&data, svc_info::GET_USERS)?;
+            return parse_users(&payload);
+        }
     }
 
     // -- auxiliares ---------------------------------------------------------

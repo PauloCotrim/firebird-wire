@@ -68,13 +68,28 @@ impl Connection {
         stream.send(&w).await?;
         let resp = attach_response(&mut stream).await?;
 
-        Ok(Connection {
+        let mut conn = Connection {
             stream,
             db_handle: resp.handle,
             protocol_version,
             charset: crate::charset::Charset::from_name(&config.charset),
             event_seq: 0,
-        })
+        };
+
+        // Opcional: pede os tipos nativos (INT128/DECFLOAT/WITH TIME ZONE) caso o
+        // servidor esteja coagindo-os via DataTypeCompatibility. São features de
+        // FB4+ (protocolo >= 16); ignoradas em servidores mais antigos.
+        if config.native_data_types && protocol_version >= 16 {
+            for stmt in [
+                "SET BIND OF INT128 TO NATIVE",
+                "SET BIND OF DECFLOAT TO NATIVE",
+                "SET BIND OF TIME ZONE TO NATIVE",
+            ] {
+                conn.exec_immediate(None, stmt).await?;
+            }
+        }
+
+        Ok(conn)
     }
 
     /// Devolve o próximo id de registro de eventos (único nesta conexão).
