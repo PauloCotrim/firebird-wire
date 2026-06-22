@@ -294,6 +294,18 @@ pub mod svc_bkp {
     pub const FACTOR: u8 = 6;
     pub const LENGTH: u8 = 7;
     pub const STAT: u8 = 15;
+
+    // Bits de opção carregados em `isc_spb_options` (108), combináveis com `|`.
+    pub const IGNORE_CHECKSUMS: u32 = 0x01;
+    pub const IGNORE_LIMBO: u32 = 0x02;
+    pub const METADATA_ONLY: u32 = 0x04;
+    pub const NO_GARBAGE_COLLECT: u32 = 0x08;
+    pub const OLD_DESCRIPTIONS: u32 = 0x10;
+    pub const NON_TRANSPORTABLE: u32 = 0x20;
+    pub const CONVERT: u32 = 0x40;
+    pub const EXPAND: u32 = 0x80;
+    pub const NO_TRIGGERS: u32 = 0x8000;
+    pub const ZIP: u32 = 0x0001_0000;
 }
 
 /// Argumentos de SPB para `isc_action_svc_restore` (`isc_spb_res_*`).
@@ -302,6 +314,32 @@ pub mod svc_res {
     pub const PAGE_SIZE: u8 = 10;
     pub const LENGTH: u8 = 11;
     pub const ACCESS_MODE: u8 = 12;
+
+    // Bits de opção carregados em `isc_spb_options` (108), combináveis com `|`.
+    pub const METADATA_ONLY: u32 = 0x04;
+    pub const DEACTIVATE_IDX: u32 = 0x0100;
+    pub const NO_SHADOW: u32 = 0x0200;
+    pub const NO_VALIDITY: u32 = 0x0400;
+    pub const ONE_AT_A_TIME: u32 = 0x0800;
+    /// Sobrescreve um banco existente (em vez de criar do zero).
+    pub const REPLACE: u32 = 0x1000;
+    /// Cria um banco novo (falha se já existir). É o padrão do gbak.
+    pub const CREATE: u32 = 0x2000;
+    pub const USE_ALL_SPACE: u32 = 0x4000;
+    pub const NO_TRIGGERS: u32 = 0x8000;
+}
+
+/// Bits de opção (em `isc_spb_options`) para `isc_action_svc_db_stats`
+/// (`isc_spb_sts_*`), combináveis com `|`.
+pub mod svc_sts {
+    pub const DATA_PAGES: u32 = 0x01;
+    pub const HDR_PAGES: u32 = 0x04;
+    pub const IDX_PAGES: u32 = 0x08;
+    pub const SYS_RELATIONS: u32 = 0x10;
+    pub const RECORD_VERSIONS: u32 = 0x20;
+    pub const TABLE: u32 = 0x40;
+    pub const NOCREATION: u32 = 0x80;
+    pub const ENCRYPTION: u32 = 0x0100;
 }
 
 /// Argumentos de SPB para gestão de usuários (`isc_spb_sec_*`).

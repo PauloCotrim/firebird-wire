@@ -21,6 +21,20 @@
 //!    primeiro byte do SPB é o código da ação (`isc_action_svc_*`), seguido de
 //!    seus argumentos. Dispara a ação; a saída é lida depois via `op_service_info`.
 //! 4. `op_service_detach` (83): `op | handle`.
+//!
+//! **Codificação do SPB de uma ação** (decodificada de straces de
+//! `fbsvcmgr action_backup/action_db_stats`): difere tanto do SPB de attach
+//! quanto dos DPBs de banco. O primeiro byte é o código da ação; em seguida os
+//! argumentos, onde:
+//! - argumento **string** (ex.: `isc_spb_dbname` 106, `isc_spb_bkp_file` 5):
+//!   `tag(1) | comprimento(2, little-endian) | bytes` — note o prefixo de
+//!   **2 bytes**, não o de 1 byte dos clumplets de attach;
+//! - argumento **inteiro** (ex.: `isc_spb_bkp_factor` 6, `isc_spb_options` 108):
+//!   `tag(1) | valor(4, little-endian)`, **sem** prefixo de comprimento;
+//! - **flag** isolada (ex.: `isc_spb_verbose` 107): apenas `tag(1)`.
+//!
+//! As opções de backup/restore/estatísticas são um bitmask carregado em um único
+//! `isc_spb_options` (o servidor o lê como máscara de bits).
 
 use crate::config::ConnectConfig;
 use crate::connection::{handshake, AuthState, Handshake};
@@ -164,6 +178,59 @@ impl ServiceManager {
         self.run(&spb.into_vec()).await
     }
 
+    /// Faz backup de `database` (alias ou caminho no servidor) para `backup_file`
+    /// (caminho **no servidor**) via `gbak`. `options` é um bitmask de `svc_bkp::*`
+    /// (use `0` para o padrão). Devolve a saída textual do gbak (modo verbose).
+    pub async fn backup(
+        &mut self,
+        database: &str,
+        backup_file: &str,
+        options: u32,
+    ) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::BACKUP);
+        spb.string(spb::DBNAME, database);
+        spb.string(svc_bkp::FILE, backup_file);
+        if options != 0 {
+            spb.int(spb::OPTIONS, options);
+        }
+        spb.flag(spb::VERBOSE);
+        self.run(&spb.into_vec()).await
+    }
+
+    /// Restaura `backup_file` (caminho **no servidor**) para `database` via `gbak`.
+    /// `options` é um bitmask de `svc_res::*`; se nem `REPLACE` nem `CREATE`
+    /// estiverem presentes, assume `CREATE` (o padrão do gbak). Devolve a saída
+    /// textual do gbak (modo verbose).
+    pub async fn restore(
+        &mut self,
+        backup_file: &str,
+        database: &str,
+        options: u32,
+    ) -> Result<String> {
+        let mut options = options;
+        if options & (svc_res::REPLACE | svc_res::CREATE) == 0 {
+            options |= svc_res::CREATE;
+        }
+        let mut spb = ActionSpb::new(svc_action::RESTORE);
+        // Na restauração os papéis se invertem: bkp_file é a ORIGEM, dbname o DESTINO.
+        spb.string(svc_bkp::FILE, backup_file);
+        spb.string(spb::DBNAME, database);
+        spb.int(spb::OPTIONS, options);
+        spb.flag(spb::VERBOSE);
+        self.run(&spb.into_vec()).await
+    }
+
+    /// Coleta estatísticas de `database` via `gstat` (`isc_action_svc_db_stats`).
+    /// `options` é um bitmask de `svc_sts::*` (use `0` para o cabeçalho do banco).
+    pub async fn statistics(&mut self, database: &str, options: u32) -> Result<String> {
+        let mut spb = ActionSpb::new(svc_action::DB_STATS);
+        spb.string(spb::DBNAME, database);
+        if options != 0 {
+            spb.int(spb::OPTIONS, options);
+        }
+        self.run(&spb.into_vec()).await
+    }
+
     // -- auxiliares ---------------------------------------------------------
 
     /// Consulta um único item de info que devolve uma string.
@@ -199,6 +266,46 @@ fn build_attach_spb(config: &ConnectConfig, auth: &AuthState) -> Vec<u8> {
         spb.string(spb::SQL_ROLE_NAME, role);
     }
     spb.into_vec()
+}
+
+/// Construtor do SPB de uma ação `op_service_start`. O primeiro byte é o código
+/// da ação; argumentos string usam prefixo de comprimento de **2 bytes (LE)**,
+/// argumentos inteiros são **4 bytes LE sem prefixo**, e flags são só o tag.
+/// (Distinto do [`ParameterBuffer`], que usa clumplets de 1 byte.)
+struct ActionSpb {
+    buf: Vec<u8>,
+}
+
+impl ActionSpb {
+    fn new(action: u8) -> Self {
+        Self { buf: vec![action] }
+    }
+
+    /// Argumento string: `tag | comprimento(2 LE) | bytes`.
+    fn string(&mut self, tag: u8, value: &str) -> &mut Self {
+        let bytes = value.as_bytes();
+        self.buf.push(tag);
+        self.buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.buf.extend_from_slice(bytes);
+        self
+    }
+
+    /// Argumento inteiro: `tag | valor(4 LE)`, sem prefixo de comprimento.
+    fn int(&mut self, tag: u8, value: u32) -> &mut Self {
+        self.buf.push(tag);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// Flag isolada: apenas o tag.
+    fn flag(&mut self, tag: u8) -> &mut Self {
+        self.buf.push(tag);
+        self
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 /// Lê o primeiro item `tag | len(2 LE) | valor` de um buffer de info de serviço.
@@ -260,5 +367,39 @@ mod tests {
         let buf = [INFO_END];
         let v = parse_svc_string(&buf, svc_info::TO_EOF).unwrap();
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn action_spb_string_uses_2byte_le_length() {
+        // Espelha o strace de `fbsvcmgr action_db_stats dbname employee`:
+        // 0b (db_stats) | 6a (dbname) | 0800 (len 8 LE) | "employee".
+        let mut spb = ActionSpb::new(svc_action::DB_STATS);
+        spb.string(spb::DBNAME, "employee");
+        assert_eq!(
+            spb.into_vec(),
+            b"\x0b\x6a\x08\x00employee".to_vec(),
+        );
+    }
+
+    #[test]
+    fn action_spb_backup_matches_strace() {
+        // `action_backup dbname employee bkp_file /tmp/x bkp_factor não usado`,
+        // com NO_GARBAGE_COLLECT|IGNORE_CHECKSUMS e verbose:
+        // 01 | dbname | bkp_file | 6c (options) | bitmask(4 LE) | 6b (verbose).
+        let mut spb = ActionSpb::new(svc_action::BACKUP);
+        spb.string(spb::DBNAME, "db");
+        spb.string(svc_bkp::FILE, "f");
+        spb.int(spb::OPTIONS, svc_bkp::NO_GARBAGE_COLLECT | svc_bkp::IGNORE_CHECKSUMS);
+        spb.flag(spb::VERBOSE);
+        assert_eq!(
+            spb.into_vec(),
+            vec![
+                svc_action::BACKUP,
+                spb::DBNAME, 2, 0, b'd', b'b',
+                svc_bkp::FILE, 1, 0, b'f',
+                spb::OPTIONS, 0x09, 0, 0, 0, // 8 | 1 = 9, little-endian
+                spb::VERBOSE,
+            ],
+        );
     }
 }

@@ -910,3 +910,63 @@ async fn service_manager() -> Result<()> {
     svc.close().await?;
     Ok(())
 }
+
+/// Ações com argumentos: estatísticas (`gstat`), backup e restore (`gbak`) via
+/// `op_service_start`, com o SPB de ação (string com comprimento de 2 bytes,
+/// opções como bitmask). O backup/restore escrevem arquivos NO SERVIDOR; usamos
+/// um diretório temporário sem o sticky bit para que o processo do servidor
+/// (usuário `firebird`) possa escrever e o teste consiga limpar depois.
+#[tokio::test]
+async fn service_backup_restore() -> Result<()> {
+    let cfg = require_server!();
+    let db = std::env::var("FB_DB").unwrap_or_else(|_| "employee".into());
+
+    // Diretório compartilhado (0o777, sem sticky) para os artefatos do servidor.
+    let dir = std::env::temp_dir().join(format!("fdb_svc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+    }
+    let fbk = dir.join("dump.fbk");
+    let restored = dir.join("restored.fdb");
+
+    let mut svc = fdb_driver::ServiceManager::attach(&cfg).await?;
+
+    // Estatísticas (cabeçalho do banco): ação só com dbname.
+    let stats = svc.statistics(&db, 0).await?;
+    println!("gstat: {} bytes", stats.len());
+    assert!(stats.contains("Database header") || stats.contains("Database"));
+
+    // Backup verbose para o arquivo no servidor.
+    let bkp_out = svc.backup(&db, fbk.to_str().unwrap(), 0).await?;
+    println!("gbak backup: {} bytes", bkp_out.len());
+    assert!(bkp_out.contains("gbak:"));
+
+    // Restaura para um banco novo (CREATE é o padrão).
+    let res_out = svc
+        .restore(fbk.to_str().unwrap(), restored.to_str().unwrap(), 0)
+        .await?;
+    println!("gbak restore: {} bytes", res_out.len());
+    assert!(res_out.contains("gbak:"));
+
+    svc.close().await?;
+
+    // O banco restaurado deve abrir e responder a uma query.
+    let mut conn = Connection::connect(&cfg.clone().database(restored.to_str().unwrap())).await?;
+    let tx = conn.begin().await?;
+    let mut stmt = conn.prepare(&tx, "SELECT COUNT(*) FROM RDB$RELATIONS").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    println!("relations no banco restaurado: {:?}", row[0]);
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+    conn.close().await?;
+
+    // Limpeza: o diretório é nosso e sem sticky, então removemos os arquivos do
+    // servidor mesmo sendo de outro dono.
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
