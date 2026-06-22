@@ -22,18 +22,19 @@ Construído sobre [Tokio](https://tokio.rs).
 10. [INSERT/UPDATE/DELETE e linhas afetadas](#insertupdatedelete-e-linhas-afetadas)
 11. [Cursores roláveis](#cursores-roláveis)
 12. [BLOBs](#blobs)
-13. [DML em lote (batch)](#dml-em-lote-batch)
-14. [BLOBs em lote](#blobs-em-lote)
-15. [Eventos do banco](#eventos-do-banco)
-16. [Pool de conexões](#pool-de-conexões)
-17. [Charsets](#charsets)
-18. [Gerenciador de serviços (backup/restore/usuários)](#gerenciador-de-serviços-backuprestoreusuários)
-19. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
-20. [Tratamento de erros](#tratamento-de-erros)
-21. [Boas práticas de fechamento](#boas-práticas-de-fechamento)
-22. [Recursos implementados](#recursos-implementados)
-23. [O que falta implementar](#o-que-falta-implementar)
-24. [Rodando os testes ao vivo](#rodando-os-testes-ao-vivo)
+13. [Arrays (`ARRAY`)](#arrays-array)
+14. [DML em lote (batch)](#dml-em-lote-batch)
+15. [BLOBs em lote](#blobs-em-lote)
+16. [Eventos do banco](#eventos-do-banco)
+17. [Pool de conexões](#pool-de-conexões)
+18. [Charsets](#charsets)
+19. [Gerenciador de serviços (backup/restore/usuários)](#gerenciador-de-serviços-backuprestoreusuários)
+20. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
+21. [Tratamento de erros](#tratamento-de-erros)
+22. [Boas práticas de fechamento](#boas-práticas-de-fechamento)
+23. [Recursos implementados](#recursos-implementados)
+24. [O que falta implementar](#o-que-falta-implementar)
+25. [Rodando os testes ao vivo](#rodando-os-testes-ao-vivo)
 
 ---
 
@@ -413,6 +414,56 @@ blob.close(&mut conn).await?;
 
 ---
 
+## Arrays (`ARRAY`)
+
+Uma coluna `ARRAY` chega numa linha como um id de 8 bytes (`Value::Array`),
+igual a um BLOB; os elementos são lidos/escritos à parte pela API de *slice*.
+Primeiro obtenha o descritor da coluna com `array_desc` (ele consulta o catálogo
+`RDB$*` para o tipo do elemento e os limites das dimensões); depois use
+`read_array` / `write_array`.
+
+```rust
+// Tabela exemplo: CREATE TABLE t (id INTEGER, nums INTEGER[1:4])
+let desc = conn.array_desc(&tx, "T", "NUMS").await?;   // nomes como no catálogo
+assert_eq!(desc.element_count(), 4);
+
+// Escrever: cria o array e devolve um id, que vai como parâmetro no INSERT.
+let nums = [Value::Int(10), Value::Int(20), Value::Int(30), Value::Int(40)];
+let nums_id = conn.write_array(&tx, &desc, &nums).await?;
+let mut ins = conn.prepare(&tx, "INSERT INTO t (id, nums) VALUES (1, ?)").await?;
+ins.execute(&mut conn, &tx, &[Value::Array(nums_id)]).await?;
+ins.drop_statement(&mut conn).await?;
+
+// Ler: pegue o id da coluna ARRAY e leia os elementos com o mesmo descritor.
+let mut q = conn.prepare(&tx, "SELECT nums FROM t WHERE id = 1").await?;
+q.execute(&mut conn, &tx, &[]).await?;
+let row = q.fetch(&mut conn).await?.unwrap();
+q.drop_statement(&mut conn).await?;
+if let Value::Array(id) = row[0] {
+    let elems = conn.read_array(&tx, id, &desc).await?;   // Vec<Value>, em ordem
+    println!("{elems:?}");
+}
+```
+
+Arrays **multidimensionais** funcionam do mesmo jeito — `array_desc` traz uma
+`Dimension` por dimensão e os elementos vêm achatados na ordem do servidor:
+
+```rust
+// CREATE TABLE g (id INTEGER, grid INTEGER[1:2, 1:3])  → 6 elementos
+let desc = conn.array_desc(&tx, "G", "GRID").await?;
+let grid: Vec<Value> = (1..=6).map(Value::Int).collect();
+let id = conn.write_array(&tx, &desc, &grid).await?;
+// ... INSERT/SELECT e read_array como acima.
+```
+
+> **Charset:** as fatias de texto (`CHAR`/`VARCHAR`) são transliteradas para o
+> charset da conexão. Ler um array `CHARACTER SET NONE` por uma conexão `UTF8`
+> estoura a largura nativa do elemento (o próprio `fbclient` falha igual). Para
+> arrays de texto, conecte com o charset **igual ao do campo** (ou `NONE`).
+> Arrays numéricos/data/hora não têm essa restrição.
+
+---
+
 ## DML em lote (batch)
 
 O recurso "principal": insere/atualiza muitas linhas com **uma** instrução
@@ -731,10 +782,14 @@ assíncrono.)
 - ✅ Linhas afetadas (`rows_affected`)
 - ✅ **Cursores roláveis** (FB5): `fetch_scroll` e atalhos
 - ✅ **BLOBs**: leitura e escrita (simples e em partes)
+- ✅ **Arrays SQL (`ARRAY`)**: `read_array`/`write_array` via slice + SDL,
+  incluindo multidimensionais
 - ✅ **DML em lote (batch)** com contagens e erros por linha
 - ✅ **BLOBs em batch**: stream, `register_blob`, segmentados (`set_segmented`)
 - ✅ Datas/horas civis (`CivilDate`/`CivilTime`/`CivilTimestamp`)
-- ✅ **Numéricos amplos**: INT128 / NUMERIC amplo e **DECFLOAT(16/34)** (leitura)
+- ✅ **TIME/TIMESTAMP WITH TIME ZONE** (FB4+): decode e encode
+- ✅ **Numéricos amplos**: INT128 / NUMERIC amplo e **DECFLOAT(16/34)**
+  (leitura e escrita)
 - ✅ **Charsets** UTF-8 / Latin-1 / Windows-1252 nativos + multibyte
   (SJIS/EUC/GBK/Big5/…) via feature `charset-full`
 - ✅ **Pool de conexões** (`Pool`/`PoolConfig`/`PooledConnection`)
@@ -745,11 +800,11 @@ assíncrono.)
 
 ## O que falta implementar
 
-- ⬜ **TIME/TIMESTAMP WITH TIME ZONE** (hoje chegam como `Value::Bytes`)
-- ⬜ *Encode* de **DECFLOAT** como parâmetro (só a leitura está pronta)
-- ⬜ Tipo **ARRAY** SQL (`op_get_slice`/`op_put_slice`)
-- ⬜ Itens de info **inteiros** do serviço (`svc_version`, `svc_running`)
+O backlog funcional está fechado; o que resta é opcional/ergonômico:
+
 - ⬜ Adaptador `futures::Stream` (hoje o streaming é *lending iterator*)
+- ⬜ Escalar a largura do elemento de arrays de texto pelo charset da conexão
+  (para ler arrays `NONE` por conexão `UTF8` sem casar os charsets)
 
 Veja `PROTOCOL-NOTES.md` para os layouts de wire já decodificados.
 

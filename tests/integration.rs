@@ -357,6 +357,52 @@ async fn array_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn array_multidimensional() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg).await?;
+
+    // Um array 2-D: GRID INTEGER[1:2, 1:3] = 6 elementos (a SDL gera um laço
+    // do1 por dimensão).
+    let _ = conn.exec_immediate(None, "DROP TABLE ARR_MD_TEST").await;
+    conn.exec_immediate(None, "CREATE TABLE ARR_MD_TEST (ID INTEGER, GRID INTEGER[1:2, 1:3])")
+        .await?;
+
+    let tx = conn.begin().await?;
+    let desc = conn.array_desc(&tx, "ARR_MD_TEST", "GRID").await?;
+    assert_eq!(desc.blr_type, 8); // LONG
+    assert_eq!(
+        desc.dimensions,
+        vec![
+            fdb_driver::Dimension { lower: 1, upper: 2 },
+            fdb_driver::Dimension { lower: 1, upper: 3 },
+        ]
+    );
+    assert_eq!(desc.element_count(), 6); // 2 × 3
+
+    let grid: Vec<Value> = (1..=6).map(|n| Value::Int(n * 100)).collect();
+    let grid_id = conn.write_array(&tx, &desc, &grid).await?;
+
+    let mut ins = conn.prepare(&tx, "INSERT INTO ARR_MD_TEST (ID, GRID) VALUES (1, ?)").await?;
+    ins.execute(&mut conn, &tx, &[Value::Array(grid_id)]).await?;
+    ins.drop_statement(&mut conn).await?;
+
+    let mut sel = conn.prepare(&tx, "SELECT GRID FROM ARR_MD_TEST WHERE ID = 1").await?;
+    sel.execute(&mut conn, &tx, &[]).await?;
+    let row = sel.fetch_all(&mut conn).await?.remove(0);
+    sel.drop_statement(&mut conn).await?;
+    let Value::Array(id) = row[0] else { panic!("esperava Value::Array, recebi {:?}", row[0]) };
+
+    let got = conn.read_array(&tx, id, &desc).await?;
+    assert_eq!(got, grid, "round-trip de array 2-D INTEGER[1:2,1:3] falhou");
+    println!("array 2-D round-trip ok: {got:?}");
+
+    tx.commit(&mut conn).await?;
+    conn.exec_immediate(None, "DROP TABLE ARR_MD_TEST").await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn pool_basic() -> Result<()> {
     let cfg = require_server!();
     let pool = Pool::new(cfg, PoolConfig { max_size: 3, ..Default::default() });
