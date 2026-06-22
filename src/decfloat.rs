@@ -63,6 +63,144 @@ impl DecFloat {
     pub fn to_parts(&self) -> Option<(bool, u128, i32)> {
         self.is_finite().then_some((self.negative, self.coefficient, self.exponent))
     }
+
+    /// Constrói um valor finito `(-1)^negative · coefficient · 10^exponent`.
+    pub fn from_parts(negative: bool, coefficient: u128, exponent: i32) -> DecFloat {
+        DecFloat { negative, kind: DecKind::Finite, coefficient, exponent }
+    }
+
+    /// `±Infinity`.
+    pub fn infinity(negative: bool) -> DecFloat {
+        DecFloat { negative, kind: DecKind::Infinity, coefficient: 0, exponent: 0 }
+    }
+
+    /// `NaN` (quiet).
+    pub fn nan() -> DecFloat {
+        DecFloat { negative: false, kind: DecKind::NaN, coefficient: 0, exponent: 0 }
+    }
+
+    /// Codifica como `DECFLOAT(16)` (decimal64, 8 bytes big-endian, como o
+    /// Firebird espera). `None` se o valor não couber em decimal64 (mais de 16
+    /// dígitos significativos ou expoente fora de faixa).
+    pub fn to_decimal64(&self) -> Option<[u8; 8]> {
+        Some((self.encode_bits(64)? as u64).to_be_bytes())
+    }
+
+    /// Codifica como `DECFLOAT(34)` (decimal128, 16 bytes big-endian).
+    pub fn to_decimal128(&self) -> Option<[u8; 16]> {
+        Some(self.encode_bits(128)?.to_be_bytes())
+    }
+
+    fn encode_bits(&self, width: u32) -> Option<u128> {
+        match self.kind {
+            DecKind::Finite => encode(self.negative, self.coefficient, self.exponent, width),
+            DecKind::Infinity => Some(special_bits(self.negative, 0b1_1110, width)),
+            DecKind::NaN => Some(special_bits(self.negative, 0b1_1111, width)),
+        }
+    }
+}
+
+/// Erro ao analisar uma string em [`DecFloat`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDecFloatError;
+
+impl fmt::Display for ParseDecFloatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("string DECFLOAT inválida")
+    }
+}
+
+impl std::error::Error for ParseDecFloatError {}
+
+impl std::str::FromStr for DecFloat {
+    type Err = ParseDecFloatError;
+
+    /// Analisa um decimal como `-123.45`, `1.5E-3`, `Infinity`/`-Inf`/`NaN`.
+    /// Preserva os dígitos exatos (os zeros à direita são significativos).
+    fn from_str(s: &str) -> Result<DecFloat, ParseDecFloatError> {
+        let t = s.trim();
+        let (negative, body) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        match body.to_ascii_lowercase().as_str() {
+            "inf" | "infinity" => return Ok(DecFloat::infinity(negative)),
+            "nan" => return Ok(DecFloat::nan()),
+            "" => return Err(ParseDecFloatError),
+            _ => {}
+        }
+        // Separa a mantissa do expoente científico opcional.
+        let (mantissa, exp_part) = match body.split_once(['e', 'E']) {
+            Some((m, e)) => (m, e.parse::<i32>().map_err(|_| ParseDecFloatError)?),
+            None => (body, 0),
+        };
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (mantissa, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(ParseDecFloatError);
+        }
+        let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+        digits.push_str(int_part);
+        digits.push_str(frac_part);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ParseDecFloatError);
+        }
+        let coefficient: u128 = digits.parse().map_err(|_| ParseDecFloatError)?;
+        let exponent = exp_part - frac_part.len() as i32;
+        Ok(DecFloat::from_parts(negative, coefficient, exponent))
+    }
+}
+
+/// Bits de um valor especial (Infinity/NaN): só o campo de combinação e o sinal.
+fn special_bits(negative: bool, combo: u128, width: u32) -> u128 {
+    ((negative as u128) << (width - 1)) | (combo << (width - 6))
+}
+
+/// Inverso de [`decode`]: monta os bits decimal64/decimal128 de um valor finito.
+/// `None` se o coeficiente tiver dígitos demais ou o expoente sair da faixa.
+fn encode(negative: bool, coefficient: u128, exponent: i32, width: u32) -> Option<u128> {
+    let (ecbits, declets, bias) = match width {
+        64 => (8u32, 5u32, 398i32),
+        _ => (12u32, 11u32, 6176i32), // 128
+    };
+    let total_digits = (3 * declets + 1) as usize;
+    let digits = coefficient.to_string();
+    if digits.len() > total_digits {
+        return None; // coeficiente não cabe nesta largura
+    }
+    let biased = exponent.checked_add(bias)?;
+    let max_biased = (1i32 << (ecbits + 2)) - 1;
+    if !(0..=max_biased).contains(&biased) {
+        return None; // expoente fora de faixa
+    }
+    let biased = biased as u32;
+
+    // Dígitos com zeros à esquerda até a largura total (MSD + declets×3).
+    let mut padded = vec![0u8; total_digits - digits.len()];
+    padded.extend(digits.bytes().map(|b| b - b'0'));
+
+    let msd = padded[0] as u32;
+    let exp_top2 = (biased >> ecbits) & 0b11;
+    let econ = biased & ((1 << ecbits) - 1);
+    let combo = if msd <= 7 {
+        (exp_top2 << 3) | msd
+    } else {
+        0b1_1000 | (exp_top2 << 1) | (msd & 1)
+    };
+
+    let mut bits: u128 = 0;
+    bits |= (negative as u128) << (width - 1);
+    bits |= (combo as u128) << (width - 6);
+    bits |= (econ as u128) << (width - 6 - ecbits);
+    for i in 0..declets as usize {
+        let g = &padded[1 + i * 3..1 + i * 3 + 3];
+        let dpd = bcd_to_dpd(g[0] as u16, g[1] as u16, g[2] as u16) as u128;
+        let bit = ((declets as usize - 1 - i) * 10) as u32;
+        bits |= dpd << bit;
+    }
+    Some(bits)
 }
 
 impl fmt::Display for DecFloat {
@@ -215,6 +353,53 @@ mod tests {
         assert_eq!(render_finite(5, -4), "0.0005");
         assert_eq!(render_finite(5, 3), "5000");
         assert_eq!(render_finite(0, 0), "0");
+    }
+
+    #[test]
+    fn parse_and_roundtrip_encode_decode() {
+        use std::str::FromStr;
+        for s in ["0", "1", "123.45", "-3.14159", "100.00", "0.0005", "5000", "-0.0", "9999999999999999"] {
+            let d = DecFloat::from_str(s).unwrap();
+            // decimal128 sempre cabe nestes exemplos; relê o mesmo texto.
+            let back = DecFloat::from_decimal128(d.to_decimal128().unwrap());
+            assert_eq!(back.to_string(), d.to_string(), "decimal128 falhou em {s}");
+        }
+        // decimal64 (16 dígitos) com casos que cabem.
+        for s in ["123.45", "-3.14159", "0.0005", "1234567890123456"] {
+            let d = DecFloat::from_str(s).unwrap();
+            let back = DecFloat::from_decimal64(d.to_decimal64().unwrap());
+            assert_eq!(back.to_string(), d.to_string(), "decimal64 falhou em {s}");
+        }
+    }
+
+    #[test]
+    fn parse_scientific_and_specials() {
+        use std::str::FromStr;
+        assert_eq!(DecFloat::from_str("1.5E-3").unwrap().to_string(), "0.0015");
+        assert_eq!(DecFloat::from_str("12E3").unwrap().to_string(), "12000");
+        assert!(DecFloat::from_str("Infinity").unwrap().is_infinite());
+        assert!(DecFloat::from_str("-inf").unwrap().is_infinite());
+        assert!(DecFloat::from_str("NaN").unwrap().is_nan());
+        assert!(DecFloat::from_str("abc").is_err());
+    }
+
+    #[test]
+    fn encode_overflow_returns_none() {
+        // 17 dígitos não cabem em decimal64 (máx 16).
+        let d = DecFloat::from_parts(false, 12_345_678_901_234_567, 0);
+        assert!(d.to_decimal64().is_none());
+        // Mas cabem em decimal128.
+        assert!(d.to_decimal128().is_some());
+    }
+
+    #[test]
+    fn encode_specials_roundtrip() {
+        for d in [DecFloat::infinity(false), DecFloat::infinity(true), DecFloat::nan()] {
+            let back = DecFloat::from_decimal128(d.to_decimal128().unwrap());
+            assert_eq!(back.is_infinite(), d.is_infinite());
+            assert_eq!(back.is_nan(), d.is_nan());
+            assert_eq!(back.is_negative(), d.is_negative());
+        }
     }
 
     #[test]

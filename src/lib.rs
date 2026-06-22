@@ -41,7 +41,7 @@ pub use blob::{Blob, BlobWriter};
 pub use charset::Charset;
 pub use config::{ConnectConfig, WireCrypt};
 pub use connection::Connection;
-pub use decfloat::DecFloat;
+pub use decfloat::{DecFloat, ParseDecFloatError};
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 pub use events::EventListener;
 pub use pool::{Pool, PoolConfig, PooledConnection};

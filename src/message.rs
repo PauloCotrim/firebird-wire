@@ -148,6 +148,14 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
             out.push(matches!(val, Value::Bool(true)) as u8);
             put_pad(out, 1);
         }
+        sql_type::DEC16 => match val {
+            Value::DecFloat(d) => out.extend_from_slice(&d.to_decimal64().ok_or_else(mismatch)?),
+            _ => return Err(mismatch()),
+        },
+        sql_type::DEC34 => match val {
+            Value::DecFloat(d) => out.extend_from_slice(&d.to_decimal128().ok_or_else(mismatch)?),
+            _ => return Err(mismatch()),
+        },
         sql_type::BLOB | sql_type::QUAD => match val {
             Value::Blob(id) => out.extend_from_slice(&id.to_be_bytes()),
             _ => return Err(mismatch()),

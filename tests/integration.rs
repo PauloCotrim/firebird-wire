@@ -754,6 +754,29 @@ async fn decfloat_and_int128() -> Result<()> {
 
     stmt.drop_statement(&mut conn).await?;
     tx.commit(&mut conn).await?;
+
+    // Caminho de ENTRADA: insere DECFLOAT(16) e (34) como parâmetros e relê.
+    use std::str::FromStr;
+    let d34 = fdb_driver::DecFloat::from_str("987.654321").unwrap();
+    let d16 = fdb_driver::DecFloat::from_str("-0.0025").unwrap();
+    let tx = conn.begin().await?;
+    let mut ins = conn
+        .prepare(&tx, "INSERT INTO fdb_dec (id, d34, d16) VALUES (2, ?, ?)")
+        .await?;
+    ins.execute(&mut conn, &tx, &[Value::DecFloat(d34), Value::DecFloat(d16)]).await?;
+    ins.drop_statement(&mut conn).await?;
+    let mut sel = conn.prepare(&tx, "SELECT d34, d16 FROM fdb_dec WHERE id = 2").await?;
+    sel.execute(&mut conn, &tx, &[]).await?;
+    let back = sel.fetch(&mut conn).await?.expect("uma linha");
+    match (&back[0], &back[1]) {
+        (Value::DecFloat(a), Value::DecFloat(b)) => {
+            assert_eq!(a.to_string(), "987.654321");
+            assert_eq!(b.to_string(), "-0.0025");
+        }
+        other => panic!("relê decfloat: {other:?}"),
+    }
+    sel.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
     conn.exec_immediate(None, "DROP TABLE fdb_dec").await?;
     conn.close().await?;
     Ok(())
