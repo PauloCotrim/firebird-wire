@@ -669,6 +669,37 @@ async fn charset_win1252_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/// Round-trip de um charset multibyte/extra via `encoding_rs` (feature
+/// `charset-full`). Usa WIN1251 (cirílico) — single-byte, mas resolvido pelo
+/// `encoding_rs`, exercitando o mesmo caminho de decode/encode dos multibyte.
+#[cfg(feature = "charset-full")]
+#[tokio::test]
+async fn charset_win1251_roundtrip() -> Result<()> {
+    let cfg = require_server!();
+    const TXT: &str = "Привет мир"; // "Olá mundo" em russo.
+
+    let cfg_cyr = cfg.clone().charset("WIN1251");
+    let mut conn = Connection::connect(&cfg_cyr).await?;
+    conn.exec_immediate(None, "RECREATE TABLE fdb_cs3 (txt VARCHAR(40) CHARACTER SET WIN1251)")
+        .await?;
+
+    let tx = conn.begin().await?;
+    let mut ins = conn.prepare(&tx, "INSERT INTO fdb_cs3 (txt) VALUES (?)").await?;
+    ins.execute(&mut conn, &tx, &[Value::Text(TXT.into())]).await?;
+    ins.drop_statement(&mut conn).await?;
+
+    let mut stmt = conn.prepare(&tx, "SELECT txt FROM fdb_cs3").await?;
+    stmt.execute(&mut conn, &tx, &[]).await?;
+    let row = stmt.fetch(&mut conn).await?.expect("uma linha");
+    assert_eq!(row[0].as_str(), Some(TXT));
+    stmt.drop_statement(&mut conn).await?;
+    tx.commit(&mut conn).await?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_cs3").await?;
+    conn.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn batch_segmented_blob() -> Result<()> {
     let cfg = require_server!();

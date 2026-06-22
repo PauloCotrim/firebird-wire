@@ -18,6 +18,7 @@ sha2 = "0.10"
 rand = "0.8"
 thiserror = "2"
 tracing = { version = "0.1", optional = true }
+encoding_rs = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -26,3 +27,7 @@ tokio = { version = "1", features = ["full"] }
 default = []
 # Emit tracing spans/events for protocol-level debugging.
 trace = ["dep:tracing"]
+# Suporte a charsets multibyte e single-byte adicionais (SJIS, EUC-JP, GBK,
+# Big5, KOI8, ISO-8859-* e Windows-125x) via `encoding_rs`. Sem ela, esses
+# charsets de conexão recaem em UTF-8 com perdas.
+charset-full = ["dep:encoding_rs"]

@@ -6,8 +6,11 @@
 //! aqui de acordo com o charset da conexão; colunas `OCTETS` (binárias) são
 //! tratadas à parte em `message.rs` e permanecem como bytes.
 //!
-//! Suportamos UTF-8 (padrão), ISO-8859-1 (Latin-1) e Windows-1252 nativamente;
-//! qualquer outro nome recai em UTF-8 com perdas (`from_utf8_lossy`).
+//! Suportamos UTF-8 (padrão), ISO-8859-1 (Latin-1) e Windows-1252 nativamente.
+//! Com a feature `charset-full`, charsets multibyte (SJIS, EUC-JP, GBK, Big5,
+//! GB18030, EUC-KR) e vários single-byte adicionais (KOI8, ISO-8859-*,
+//! Windows-125x) são suportados via `encoding_rs`. Qualquer nome não reconhecido
+//! recai em UTF-8 com perdas (`from_utf8_lossy`).
 
 /// Charset da conexão, usado para decodificar CHAR/VARCHAR vindos do servidor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,14 +22,20 @@ pub enum Charset {
     Latin1,
     /// Windows-1252: como Latin-1, mas `0x80..=0x9F` têm mapeamento próprio.
     Win1252,
+    /// Um charset resolvido via `encoding_rs` (feature `charset-full`): cobre os
+    /// multibyte (SJIS/EUC/GBK/Big5/…) e single-byte adicionais.
+    #[cfg(feature = "charset-full")]
+    Encoding(&'static encoding_rs::Encoding),
     /// Charset não reconhecido: decodifica como UTF-8 com perdas.
     Unknown,
 }
 
 impl Charset {
     /// Resolve a partir do nome do charset da conexão (ex.: `"UTF8"`,
-    /// `"WIN1252"`, `"ISO8859_1"`). A comparação ignora caixa e separadores
-    /// (`-`, `_`). Nomes não reconhecidos viram [`Charset::Unknown`].
+    /// `"WIN1252"`, `"ISO8859_1"`, `"SJIS_0208"`). A comparação ignora caixa e
+    /// separadores (`-`, `_`). Os multibyte e single-byte extras só resolvem com
+    /// a feature `charset-full`; sem ela viram [`Charset::Unknown`] (UTF-8 com
+    /// perdas).
     pub fn from_name(name: &str) -> Self {
         let n: String = name
             .chars()
@@ -37,8 +46,26 @@ impl Charset {
             "UTF8" | "UNICODEFSS" => Charset::Utf8,
             "ISO88591" | "LATIN1" => Charset::Latin1,
             "WIN1252" | "WINDOWS1252" => Charset::Win1252,
-            _ => Charset::Unknown,
+            other => Self::resolve_extra(other),
         }
+    }
+
+    /// Resolve nomes além dos embutidos. Com `charset-full`, mapeia o nome do
+    /// charset do Firebird para um rótulo WHATWG e consulta o `encoding_rs`.
+    #[cfg(feature = "charset-full")]
+    fn resolve_extra(normalized: &str) -> Self {
+        match whatwg_label(normalized) {
+            Some(label) => match encoding_rs::Encoding::for_label(label.as_bytes()) {
+                Some(enc) => Charset::Encoding(enc),
+                None => Charset::Unknown,
+            },
+            None => Charset::Unknown,
+        }
+    }
+
+    #[cfg(not(feature = "charset-full"))]
+    fn resolve_extra(_normalized: &str) -> Self {
+        Charset::Unknown
     }
 
     /// Decodifica bytes para `String` conforme o charset.
@@ -47,12 +74,16 @@ impl Charset {
             Charset::Utf8 | Charset::Unknown => String::from_utf8_lossy(raw).into_owned(),
             Charset::Latin1 => raw.iter().map(|&b| b as char).collect(),
             Charset::Win1252 => raw.iter().map(|&b| win1252_char(b)).collect(),
+            #[cfg(feature = "charset-full")]
+            Charset::Encoding(enc) => enc.decode(raw).0.into_owned(),
         }
     }
 
     /// Codifica uma `&str` para bytes conforme o charset (o inverso de
     /// [`Self::decode`]), para enviar parâmetros de texto ao servidor numa conexão
-    /// não-UTF8. Caracteres não representáveis no charset alvo viram `?`.
+    /// não-UTF8. Para Latin-1/Win-1252, caracteres não representáveis viram `?`;
+    /// para os charsets do `encoding_rs`, viram referências numéricas HTML
+    /// (`&#N;`), conforme o comportamento da biblioteca.
     pub fn encode(self, s: &str) -> Vec<u8> {
         match self {
             Charset::Utf8 | Charset::Unknown => s.as_bytes().to_vec(),
@@ -61,8 +92,66 @@ impl Charset {
                 .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
                 .collect(),
             Charset::Win1252 => s.chars().map(win1252_byte).collect(),
+            #[cfg(feature = "charset-full")]
+            Charset::Encoding(enc) => enc.encode(s).0.into_owned(),
         }
     }
+}
+
+/// Mapeia um nome de charset do Firebird (já normalizado: alfanumérico,
+/// maiúsculo) para o rótulo WHATWG que o `encoding_rs` entende. Devolve `None`
+/// para nomes sem suporte conhecido (que então recaem em UTF-8 com perdas).
+#[cfg(feature = "charset-full")]
+fn whatwg_label(n: &str) -> Option<&'static str> {
+    // Famílias com parte numérica: ISO8859_N e WIN125x derivam o rótulo direto.
+    if let Some(num) = n.strip_prefix("ISO8859") {
+        // O Firebird vai de ISO8859_1 a _16 (sem _12). encoding_rs usa
+        // "iso-8859-N" exceto o 1 (Latin-1, já tratado antes daqui).
+        return match num {
+            "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "13" | "14" | "15" | "16" => {
+                Some(match num {
+                    "2" => "iso-8859-2",
+                    "3" => "iso-8859-3",
+                    "4" => "iso-8859-4",
+                    "5" => "iso-8859-5",
+                    "6" => "iso-8859-6",
+                    "7" => "iso-8859-7",
+                    "8" => "iso-8859-8",
+                    "9" => "iso-8859-9", // alias de windows-1254 no WHATWG
+                    "10" => "iso-8859-10",
+                    "13" => "iso-8859-13",
+                    "14" => "iso-8859-14",
+                    "15" => "iso-8859-15",
+                    _ => "iso-8859-16",
+                })
+            }
+            _ => None,
+        };
+    }
+    Some(match n {
+        // Japonês.
+        "SJIS0208" | "SJIS" | "SHIFTJIS" => "shift_jis",
+        "EUCJ0208" | "EUCJP" => "euc-jp",
+        // Coreano.
+        "KSC5601" | "EUCKR" => "euc-kr",
+        // Chinês.
+        "GB2312" | "GBK" => "gbk",
+        "GB18030" => "gb18030",
+        "BIG5" => "big5",
+        // Cirílico e outros single-byte.
+        "KOI8R" => "koi8-r",
+        "KOI8U" => "koi8-u",
+        "TIS620" => "windows-874",
+        "WIN1250" => "windows-1250",
+        "WIN1251" => "windows-1251",
+        "WIN1253" => "windows-1253",
+        "WIN1254" => "windows-1254",
+        "WIN1255" => "windows-1255",
+        "WIN1256" => "windows-1256",
+        "WIN1257" => "windows-1257",
+        "WIN1258" => "windows-1258",
+        _ => return None,
+    })
 }
 
 /// Mapeia um byte Windows-1252 para `char`. Igual a Latin-1 fora de
@@ -151,7 +240,8 @@ mod tests {
         assert_eq!(Charset::from_name("ISO8859_1"), Charset::Latin1);
         assert_eq!(Charset::from_name("Latin1"), Charset::Latin1);
         assert_eq!(Charset::from_name("WIN1252"), Charset::Win1252);
-        assert_eq!(Charset::from_name("KOI8R"), Charset::Unknown);
+        // Um nome que nunca é reconhecido, com ou sem a feature `charset-full`.
+        assert_eq!(Charset::from_name("NOSUCHCHARSET"), Charset::Unknown);
     }
 
     #[test]
@@ -190,5 +280,51 @@ mod tests {
         assert_eq!(Charset::Latin1.encode("a€b"), b"a?b");
         // CJK fora de Win-1252.
         assert_eq!(Charset::Win1252.encode("x\u{4E00}y"), b"x?y");
+    }
+
+    #[cfg(not(feature = "charset-full"))]
+    #[test]
+    fn multibyte_without_feature_is_unknown() {
+        // Sem a feature, SJIS/EUC não resolvem e recaem em UTF-8 com perdas.
+        assert_eq!(Charset::from_name("SJIS_0208"), Charset::Unknown);
+        assert_eq!(Charset::from_name("EUCJ_0208"), Charset::Unknown);
+    }
+
+    #[cfg(feature = "charset-full")]
+    mod full {
+        use super::*;
+
+        #[test]
+        fn resolves_multibyte_names() {
+            // Os nomes do Firebird viram um Charset::Encoding concreto.
+            for name in ["SJIS_0208", "EUCJ_0208", "GBK", "BIG_5", "WIN1251", "ISO8859_2"] {
+                assert!(
+                    matches!(Charset::from_name(name), Charset::Encoding(_)),
+                    "{name} não resolveu para encoding_rs"
+                );
+            }
+        }
+
+        #[test]
+        fn shift_jis_roundtrip() {
+            let sjis = Charset::from_name("SJIS_0208");
+            // 日本語 em Shift-JIS.
+            let bytes = sjis.encode("日本語");
+            assert_eq!(bytes, vec![0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea]);
+            assert_eq!(sjis.decode(&bytes), "日本語");
+        }
+
+        #[test]
+        fn win1251_decode_cyrillic() {
+            let cp = Charset::from_name("WIN1251");
+            // 0xCF 0xF0 0xE8 0xE2 0xE5 0xF2 = "Привет" parcial; checa um caractere.
+            assert_eq!(cp.decode(&[0xcf]), "П");
+        }
+
+        #[test]
+        fn iso8859_15_euro() {
+            // No ISO-8859-15, 0xA4 é o símbolo do euro (difere do 8859-1).
+            assert_eq!(Charset::from_name("ISO8859_15").decode(&[0xA4]), "€");
+        }
     }
 }
