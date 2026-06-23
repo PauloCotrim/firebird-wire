@@ -1,4 +1,4 @@
-# Comece aqui com o `fdb_driver`
+# Comece aqui com o `firebird-wire`
 
 Este arquivo é para quem quer usar o driver sem entender ainda os detalhes do
 protocolo Firebird. A ideia é mostrar o caminho comum: conectar, criar uma
@@ -17,7 +17,7 @@ No `Cargo.toml` do seu projeto:
 
 ```toml
 [dependencies]
-fdb_driver = { path = "../fdb_driver" }
+firebird-wire = { path = "../firebird-wire" }
 ```
 
 Se a crate estiver em outro lugar, ajuste o caminho.
@@ -42,9 +42,9 @@ Este exemplo usa uma tabela própria, então não depende do banco exemplo
 `employee`. Troque host, porta, banco, usuário e senha pelos seus dados.
 
 ```rust
-use fdb_driver::{ConnectConfig, Connection, Value};
+use firebird_wire::{ConnectConfig, Connection, Value};
 
-fn main() -> fdb_driver::Result<()> {
+fn main() -> firebird_wire::Result<()> {
     let cfg = ConnectConfig::new()
         .host("127.0.0.1")
         .port(3050)

@@ -6,7 +6,7 @@
 //! FB_PASSWORD=masterkey cargo run --example dump
 //! ```
 
-use fdb_driver::{ConnectConfig, Connection, Result, WireCrypt};
+use firebird_wire::{ConnectConfig, Connection, Result, WireCrypt};
 
 fn main() -> Result<()> {
     let cfg = ConnectConfig::new()

@@ -655,7 +655,7 @@ fn process_name() -> String {
             s.truncate(255);
             s
         })
-        .unwrap_or_else(|| "fdb_driver".to_string())
+        .unwrap_or_else(|| "firebird-wire".to_string())
 }
 
 fn dbg_log(msg: &str) {

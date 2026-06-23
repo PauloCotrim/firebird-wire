@@ -1,13 +1,13 @@
-# fdb_driver
+# firebird-wire
 
 Driver **síncrono e puramente em Rust** para **Firebird 5+**, falando o
 protocolo nativo (wire protocol v19) diretamente sobre TCP — **sem dependência do
 `libfbclient`**.
 
 ```rust
-use fdb_driver::{ConnectConfig, Connection};
+use firebird_wire::{ConnectConfig, Connection};
 
-fn main() -> fdb_driver::Result<()> {
+fn main() -> firebird_wire::Result<()> {
     let cfg = ConnectConfig::new()
         .host("127.0.0.1").port(3050).database("employee")
         .user("SYSDBA").password("masterkey");

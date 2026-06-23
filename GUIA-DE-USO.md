@@ -1,4 +1,4 @@
-# Guia de uso do `fdb_driver`
+# Guia de uso do `firebird-wire`
 
 Driver **síncrono e puramente em Rust** para **Firebird 5+**, falando o
 protocolo nativo (wire protocol v19) direto sobre TCP — **sem `libfbclient`**.
@@ -47,17 +47,17 @@ O driver ainda não está publicado no crates.io; use por caminho/git no
 
 ```toml
 [dependencies]
-fdb_driver = { path = "../fdb_driver" }   # ou git = "..."
+firebird-wire = { path = "../firebird-wire" }   # ou git = "..."
 ```
 
 ```rust
-fn main() -> fdb_driver::Result<()> {
+fn main() -> firebird_wire::Result<()> {
     // ... seu código ...
     Ok(())
 }
 ```
 
-O tipo de erro do driver é `fdb_driver::Error` e o alias `fdb_driver::Result<T>`
+O tipo de erro do driver é `firebird_wire::Error` e o alias `firebird_wire::Result<T>`
 é `Result<T, Error>`.
 
 ---
@@ -67,7 +67,7 @@ O tipo de erro do driver é `fdb_driver::Error` e o alias `fdb_driver::Result<T>
 A conexão é descrita por um [`ConnectConfig`], construído com um *builder*:
 
 ```rust
-use fdb_driver::{ConnectConfig, Connection, WireCrypt};
+use firebird_wire::{ConnectConfig, Connection, WireCrypt};
 
 let cfg = ConnectConfig::new()
     .host("127.0.0.1")
@@ -125,7 +125,7 @@ tx.commit_retaining(&mut conn)?;   // grava, mas mantém a tx
 ### Parâmetros de transação
 
 ```rust
-use fdb_driver::{TransactionBuilder, IsolationLevel};
+use firebird_wire::{TransactionBuilder, IsolationLevel};
 
 let tx = conn.begin_with(
     &TransactionBuilder::new()
@@ -181,7 +181,7 @@ tx.commit(&mut conn)?;
 Ou tudo de uma vez com `fetch_all`:
 
 ```rust
-let rows: Vec<Vec<fdb_driver::Value>> = stmt.fetch_all(&mut conn)?;
+let rows: Vec<Vec<firebird_wire::Value>> = stmt.fetch_all(&mut conn)?;
 println!("{} linhas", rows.len());
 ```
 
@@ -193,7 +193,7 @@ Metadados das colunas/parâmetros estão em `stmt.columns()` e `stmt.params()`
 Os `?` posicionais são preenchidos por um slice de `Value`, na ordem:
 
 ```rust
-use fdb_driver::Value;
+use firebird_wire::Value;
 
 let mut stmt = conn.prepare(&tx, "SELECT nome FROM t WHERE id = ?")?;
 stmt.execute(&mut conn, &tx, &[Value::Int(42)])?;
@@ -290,7 +290,7 @@ vírgula). `DECFLOAT(16)` e `DECFLOAT(34)` são decodificados (formatos decimais
 IEEE 754 *decimal64*/*decimal128*) num `Value::DecFloat`:
 
 ```rust
-use fdb_driver::{Value, DecFloat};
+use firebird_wire::{Value, DecFloat};
 
 if let Value::DecFloat(d) = &row[0] {
     println!("{d}");                 // string decimal exata, ex.: "123.45"
@@ -327,7 +327,7 @@ Os tipos crus (`Date`/`Time`/`Timestamp`) podem ser convertidos para/de tipos
 civis legíveis, sem dependência externa:
 
 ```rust
-use fdb_driver::{Value, CivilDate, CivilTime};
+use firebird_wire::{Value, CivilDate, CivilTime};
 
 // Construir parâmetros:
 let d = Value::date(2026, 6, 21);             // ano, mês, dia
@@ -582,7 +582,7 @@ máximo de espera.
 ## Pool de conexões
 
 ```rust
-use fdb_driver::{Pool, PoolConfig};
+use firebird_wire::{Pool, PoolConfig};
 use std::time::Duration;
 
 let pool = Pool::new(cfg, PoolConfig {
@@ -638,7 +638,7 @@ nomes recaem em UTF-8 com perdas (igual a antes).
 
 ```toml
 [dependencies]
-fdb_driver = { path = "../fdb_driver", features = ["charset-full"] }
+firebird-wire = { path = "../firebird-wire", features = ["charset-full"] }
 ```
 
 ```rust
@@ -660,7 +660,7 @@ uma conexão, mas no "banco" especial `service_mgr`). Serve para backup/restore
 `database` do `ConnectConfig` é ignorado.
 
 ```rust
-use fdb_driver::ServiceManager;
+use firebird_wire::ServiceManager;
 
 let mut svc = ServiceManager::attach(&cfg)?;
 
@@ -684,7 +684,7 @@ voltam como `String`. As opções são bitmasks em `svc_bkp::*` / `svc_res::*` /
 let out = svc.backup("employee", "/srv/bkp/emp.fbk", 0)?;
 
 // Restore: (arquivo .fbk, banco destino, opções) — CREATE é o padrão.
-use fdb_driver::wire::consts::svc_res;
+use firebird_wire::wire::consts::svc_res;
 let out = svc.restore("/srv/bkp/emp.fbk", "/srv/db/emp2.fdb", svc_res::REPLACE)?;
 
 // Estatísticas (gstat): (banco, opções)
@@ -694,7 +694,7 @@ let stats = svc.statistics("employee", 0)?;
 ### Gestão de usuários
 
 ```rust
-use fdb_driver::{UserParams};
+use firebird_wire::{UserParams};
 
 // Criar:
 svc.add_user(&UserParams::new("MARIA")
@@ -725,7 +725,7 @@ Negociada após o SRP. Plugins suportados: **ChaCha** (preferido), **ChaCha64** 
 **Arc4** — todos validados ao vivo. Defina a postura desejada:
 
 ```rust
-use fdb_driver::WireCrypt;
+use firebird_wire::WireCrypt;
 
 let cfg = ConnectConfig::new()
     /* ... */
@@ -747,7 +747,7 @@ handshake. Confira com `conn.is_encrypted()`.
 
 ## Tratamento de erros
 
-`fdb_driver::Error` é um enum:
+`firebird_wire::Error` é um enum:
 
 | Variante | Quando |
 |----------|--------|
@@ -763,7 +763,7 @@ handshake. Confira com `conn.is_encrypted()`.
 ```rust
 match conn.prepare(&tx, "SELECT * FROM inexistente") {
     Ok(stmt) => { /* ... */ }
-    Err(fdb_driver::Error::Database(db)) => eprintln!("erro do servidor: {db}"),
+    Err(firebird_wire::Error::Database(db)) => eprintln!("erro do servidor: {db}"),
     Err(e) => eprintln!("outro erro: {e}"),
 }
 ```

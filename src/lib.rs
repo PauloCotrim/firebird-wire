@@ -1,4 +1,4 @@
-//! # fdb_driver
+//! # firebird-wire
 //!
 //! Um driver síncrono, puramente em Rust, para o **Firebird 5+**, que fala o
 //! protocolo de comunicação nativo (wire protocol) diretamente sobre TCP — sem
@@ -18,9 +18,9 @@
 //! Um primeiro uso costuma seguir esta ordem:
 //!
 //! ```no_run
-//! use fdb_driver::{ConnectConfig, Connection, Value};
+//! use firebird_wire::{ConnectConfig, Connection, Value};
 //!
-//! fn main() -> fdb_driver::Result<()> {
+//! fn main() -> firebird_wire::Result<()> {
 //!     let cfg = ConnectConfig::new()
 //!         .host("127.0.0.1")
 //!         .port(3050)

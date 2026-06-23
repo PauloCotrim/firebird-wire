@@ -8,8 +8,8 @@
 //!   FB_USER=SYSDBA FB_PASSWORD=yourpw cargo test --test integration -- --nocapture
 //! ```
 
-use fdb_driver::wire::consts::batch_cs;
-use fdb_driver::{
+use firebird_wire::wire::consts::batch_cs;
+use firebird_wire::{
     CivilDate, CivilTime, ConnectConfig, Connection, Pool, PoolConfig, Result, Value, WireCrypt,
 };
 
@@ -301,7 +301,7 @@ fn read_array_from_employee() -> Result<()> {
     assert_eq!(desc.element_count(), 5);
     assert_eq!(
         desc.dimensions,
-        vec![fdb_driver::Dimension { lower: 1, upper: 5 }]
+        vec![firebird_wire::Dimension { lower: 1, upper: 5 }]
     );
 
     let mut stmt = conn.prepare(
@@ -426,8 +426,8 @@ fn array_multidimensional() -> Result<()> {
     assert_eq!(
         desc.dimensions,
         vec![
-            fdb_driver::Dimension { lower: 1, upper: 2 },
-            fdb_driver::Dimension { lower: 1, upper: 3 },
+            firebird_wire::Dimension { lower: 1, upper: 2 },
+            firebird_wire::Dimension { lower: 1, upper: 3 },
         ]
     );
     assert_eq!(desc.element_count(), 6); // 2 × 3
@@ -618,7 +618,7 @@ fn batch_per_row_errors() -> Result<()> {
     let mut batch = conn.create_batch_with(
         &tx,
         "INSERT INTO fdb_batch_e (id, nome) VALUES (?, ?)",
-        fdb_driver::BatchOptions::new().multierror(true),
+        firebird_wire::BatchOptions::new().multierror(true),
     )?;
 
     // ids: 1, 2, 2(dup), 3, 1(dup) — as posições 2 e 4 devem falhar.
@@ -725,7 +725,7 @@ fn database_events() -> Result<()> {
             let fired = ev.wait(&mut conn)?;
             ev.cancel(&mut conn)?;
             conn.close()?;
-            Ok::<_, fdb_driver::Error>(fired)
+            Ok::<_, firebird_wire::Error>(fired)
         })();
         let _ = tx_done.send(result);
     });
@@ -738,12 +738,12 @@ fn database_events() -> Result<()> {
         let mut b = Connection::connect(&cfg2)?;
         b.exec_immediate(None, "EXECUTE BLOCK AS BEGIN POST_EVENT 'fdb_test_ev'; END")?;
         b.close()?;
-        Ok::<(), fdb_driver::Error>(())
+        Ok::<(), firebird_wire::Error>(())
     });
 
     let fired = rx_done
         .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| fdb_driver::Error::Timeout)??;
+        .map_err(|_| firebird_wire::Error::Timeout)??;
     assert_eq!(fired, vec!["fdb_test_ev".to_string()]);
 
     poster.join().expect("thread do poster")?;
@@ -1035,8 +1035,8 @@ fn decfloat_and_int128() -> Result<()> {
 
     // Caminho de ENTRADA: insere DECFLOAT(16) e (34) como parâmetros e relê.
     use std::str::FromStr;
-    let d34 = fdb_driver::DecFloat::from_str("987.654321").unwrap();
-    let d16 = fdb_driver::DecFloat::from_str("-0.0025").unwrap();
+    let d34 = firebird_wire::DecFloat::from_str("987.654321").unwrap();
+    let d16 = firebird_wire::DecFloat::from_str("-0.0025").unwrap();
     let tx = conn.begin()?;
     let mut ins = conn.prepare(&tx, "INSERT INTO fdb_dec (id, d34, d16) VALUES (2, ?, ?)")?;
     ins.execute(
@@ -1067,7 +1067,7 @@ fn decfloat_and_int128() -> Result<()> {
 /// local e o nome da zona.
 #[test]
 fn time_zone_types() -> Result<()> {
-    use fdb_driver::Value;
+    use firebird_wire::Value;
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg)?;
 
@@ -1132,12 +1132,12 @@ fn time_zone_types() -> Result<()> {
     tx.commit(&mut conn)?;
 
     // Caminho de ENTRADA: insere um TimeTz como parâmetro (UTC + zona) e relê.
-    use fdb_driver::tz::offset_zone_id;
+    use firebird_wire::tz::offset_zone_id;
     conn.exec_immediate(
         None,
         "RECREATE TABLE fdb_tz (id INT, t TIME WITH TIME ZONE)",
     )?;
-    let param = fdb_driver::TimeTz {
+    let param = firebird_wire::TimeTz {
         utc_time: 8 * 3600 * 10_000, // 08:00:00 UTC
         zone: offset_zone_id(120),   // +02:00 → hora local 10:00
         offset: 120,
@@ -1472,7 +1472,7 @@ fn date_time_civil_conversion() -> Result<()> {
 #[test]
 fn service_manager() -> Result<()> {
     let cfg = require_server!();
-    let mut svc = fdb_driver::ServiceManager::attach(&cfg)?;
+    let mut svc = firebird_wire::ServiceManager::attach(&cfg)?;
 
     let ver = svc.server_version()?;
     println!("server_version = {ver}");
@@ -1525,7 +1525,7 @@ fn service_backup_restore() -> Result<()> {
     let fbk = dir.join("dump.fbk");
     let restored = dir.join("restored.fdb");
 
-    let mut svc = fdb_driver::ServiceManager::attach(&cfg)?;
+    let mut svc = firebird_wire::ServiceManager::attach(&cfg)?;
 
     // Estatísticas (cabeçalho do banco): ação só com dbname.
     let stats = svc.statistics(&db, 0)?;
@@ -1566,7 +1566,7 @@ fn service_backup_restore() -> Result<()> {
 /// `employee` compartilhado.
 #[test]
 fn service_maintenance_actions() -> Result<()> {
-    use fdb_driver::wire::consts::svc_rpr;
+    use firebird_wire::wire::consts::svc_rpr;
     let cfg = require_server!();
     let db = std::env::var("FB_DB").unwrap_or_else(|_| "employee".into());
 
@@ -1582,7 +1582,7 @@ fn service_maintenance_actions() -> Result<()> {
     let test_db = dir.join("maint.fdb");
     let nbk = dir.join("maint.nbk0");
 
-    let mut svc = fdb_driver::ServiceManager::attach(&cfg)?;
+    let mut svc = firebird_wire::ServiceManager::attach(&cfg)?;
     svc.backup(&db, fbk.to_str().unwrap(), 0)?;
     svc.restore(fbk.to_str().unwrap(), test_db.to_str().unwrap(), 0)?;
     let target = test_db.to_str().unwrap();
@@ -1620,7 +1620,7 @@ fn service_maintenance_actions() -> Result<()> {
 #[test]
 fn service_user_management() -> Result<()> {
     let cfg = require_server!();
-    let mut svc = fdb_driver::ServiceManager::attach(&cfg)?;
+    let mut svc = firebird_wire::ServiceManager::attach(&cfg)?;
 
     let name = format!("FDBT{}", std::process::id());
 
@@ -1628,7 +1628,7 @@ fn service_user_management() -> Result<()> {
     svc.delete_user(&name)?;
 
     // Cria.
-    let params = fdb_driver::UserParams::new(&name)
+    let params = firebird_wire::UserParams::new(&name)
         .password("zaq12wsx")
         .first_name("Integração")
         .last_name("Teste");
@@ -1641,7 +1641,7 @@ fn service_user_management() -> Result<()> {
     assert_eq!(created.last_name, "Teste");
 
     // Altera o sobrenome e confirma.
-    svc.modify_user(&fdb_driver::UserParams::new(&name).last_name("Alterado"))?;
+    svc.modify_user(&firebird_wire::UserParams::new(&name).last_name("Alterado"))?;
     let modified = svc.display_user(&name)?.expect("usuário alterado");
     assert_eq!(modified.last_name, "Alterado");
     // O primeiro nome não foi tocado pelo modify.

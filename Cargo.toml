@@ -18,6 +18,7 @@ rand = "0.8"
 thiserror = "2"
 tracing = { version = "0.1", optional = true }
 encoding_rs = { version = "0.8", optional = true }
+chrono = { version = "0.4", default-features = false, optional = true }
 
 [features]
 default = []
@@ -27,3 +28,5 @@ trace = ["dep:tracing"]
 # Big5, KOI8, ISO-8859-* e Windows-125x) via `encoding_rs`. Sem ela, esses
 # charsets de conexão recaem em UTF-8 com perdas.
 charset-full = ["dep:encoding_rs"]
+# Conversões entre `Value` e `chrono::NaiveDate`/`NaiveTime`/`NaiveDateTime`.
+chrono = ["dep:chrono"]

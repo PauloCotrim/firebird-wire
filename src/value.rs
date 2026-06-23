@@ -374,6 +374,137 @@ impl From<&[u8]> for Value {
     }
 }
 
+#[cfg(feature = "chrono")]
+impl From<chrono::NaiveDate> for CivilDate {
+    fn from(v: chrono::NaiveDate) -> Self {
+        use chrono::Datelike;
+
+        CivilDate {
+            year: v.year(),
+            month: v.month(),
+            day: v.day(),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::NaiveTime> for CivilTime {
+    fn from(v: chrono::NaiveTime) -> Self {
+        use chrono::Timelike;
+
+        CivilTime {
+            hour: v.hour(),
+            minute: v.minute(),
+            second: v.second(),
+            frac: v.nanosecond() / 100_000,
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::NaiveDateTime> for CivilTimestamp {
+    fn from(v: chrono::NaiveDateTime) -> Self {
+        CivilTimestamp {
+            date: v.date().into(),
+            time: v.time().into(),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::NaiveDate> for Value {
+    fn from(v: chrono::NaiveDate) -> Self {
+        Value::Date(CivilDate::from(v).to_fb_days())
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::NaiveTime> for Value {
+    fn from(v: chrono::NaiveTime) -> Self {
+        Value::Time(CivilTime::from(v).to_fb_time())
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl From<chrono::NaiveDateTime> for Value {
+    fn from(v: chrono::NaiveDateTime) -> Self {
+        Value::timestamp(v.date().into(), v.time().into())
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<&Value> for chrono::NaiveDate {
+    type Error = crate::Error;
+
+    fn try_from(v: &Value) -> Result<Self, Self::Error> {
+        let d = v
+            .as_civil_date()
+            .ok_or_else(|| crate::Error::protocol("expected a DATE/TIMESTAMP value"))?;
+        chrono::NaiveDate::from_ymd_opt(d.year, d.month, d.day)
+            .ok_or_else(|| crate::Error::protocol("DATE value is out of chrono range"))
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<Value> for chrono::NaiveDate {
+    type Error = crate::Error;
+
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        chrono::NaiveDate::try_from(&v)
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<&Value> for chrono::NaiveTime {
+    type Error = crate::Error;
+
+    fn try_from(v: &Value) -> Result<Self, Self::Error> {
+        let t = v
+            .as_civil_time()
+            .ok_or_else(|| crate::Error::protocol("expected a TIME/TIMESTAMP value"))?;
+        chrono::NaiveTime::from_hms_nano_opt(t.hour, t.minute, t.second, t.nanos())
+            .ok_or_else(|| crate::Error::protocol("TIME value is out of chrono range"))
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<Value> for chrono::NaiveTime {
+    type Error = crate::Error;
+
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        chrono::NaiveTime::try_from(&v)
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<&Value> for chrono::NaiveDateTime {
+    type Error = crate::Error;
+
+    fn try_from(v: &Value) -> Result<Self, Self::Error> {
+        let ts = v
+            .as_civil_timestamp()
+            .ok_or_else(|| crate::Error::protocol("expected a TIMESTAMP value"))?;
+        let date = chrono::NaiveDate::from_ymd_opt(ts.date.year, ts.date.month, ts.date.day)
+            .ok_or_else(|| crate::Error::protocol("TIMESTAMP date is out of chrono range"))?;
+        date.and_hms_nano_opt(
+            ts.time.hour,
+            ts.time.minute,
+            ts.time.second,
+            ts.time.nanos(),
+        )
+        .ok_or_else(|| crate::Error::protocol("TIMESTAMP time is out of chrono range"))
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<Value> for chrono::NaiveDateTime {
+    type Error = crate::Error;
+
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        chrono::NaiveDateTime::try_from(&v)
+    }
+}
+
 /// Metadados que descrevem uma coluna da saída de uma instrução preparada (ou um
 /// de seus parâmetros de entrada).
 #[derive(Debug, Clone, Default)]
@@ -553,5 +684,72 @@ mod tests {
         );
         assert_eq!(Value::from(vec![1_u8, 2, 3]), Value::Bytes(vec![1, 2, 3]));
         assert_eq!(Value::from(&[4_u8, 5][..]), Value::Bytes(vec![4, 5]));
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_naive_values_convert_to_driver_values() {
+        use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
+        let date = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+        assert_eq!(Value::from(date), Value::date(2026, 6, 23));
+
+        let time = NaiveTime::from_hms_nano_opt(14, 5, 6, 123_456_789).unwrap();
+        assert_eq!(Value::from(time), Value::time(14, 5, 6, 1234));
+
+        let timestamp = NaiveDateTime::new(date, time);
+        assert_eq!(
+            Value::from(timestamp),
+            Value::timestamp(
+                CivilDate {
+                    year: 2026,
+                    month: 6,
+                    day: 23
+                },
+                CivilTime {
+                    hour: 14,
+                    minute: 5,
+                    second: 6,
+                    frac: 1234
+                }
+            )
+        );
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_naive_values_convert_from_driver_values() {
+        use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
+        let date = NaiveDate::try_from(&Value::date(2026, 6, 23)).unwrap();
+        assert_eq!(date, NaiveDate::from_ymd_opt(2026, 6, 23).unwrap());
+
+        let time = NaiveTime::try_from(&Value::time(14, 5, 6, 1234)).unwrap();
+        assert_eq!(
+            time,
+            NaiveTime::from_hms_nano_opt(14, 5, 6, 123_400_000).unwrap()
+        );
+
+        let timestamp = Value::timestamp(
+            CivilDate {
+                year: 2026,
+                month: 6,
+                day: 23,
+            },
+            CivilTime {
+                hour: 14,
+                minute: 5,
+                second: 6,
+                frac: 1234,
+            },
+        );
+        let timestamp = NaiveDateTime::try_from(&timestamp).unwrap();
+        assert_eq!(
+            timestamp,
+            NaiveDate::from_ymd_opt(2026, 6, 23)
+                .unwrap()
+                .and_hms_nano_opt(14, 5, 6, 123_400_000)
+                .unwrap()
+        );
     }
 }
