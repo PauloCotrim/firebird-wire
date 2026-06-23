@@ -9,7 +9,7 @@
 
 use crate::charset::Charset;
 use crate::error::{Error, Result};
-use crate::value::{align4, ColumnMeta, Value};
+use crate::value::{ColumnMeta, Value, align4};
 use crate::wire::consts::sql_type;
 use crate::wire::stream::FbStream;
 
@@ -71,6 +71,23 @@ fn type_size_align(col: &ColumnMeta) -> (usize, usize) {
 /// seguido do valor XDR de cada coluna NÃO-NULL, em ordem. O inverso de
 /// [`decode_row`].
 pub fn encode_row(columns: &[ColumnMeta], values: &[Value], charset: Charset) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_row_into(&mut out, columns, values, charset)?;
+    Ok(out)
+}
+
+/// Como [`encode_row`], mas **anexa** a mensagem ao fim de `out`, sem alocar um buffer
+/// temporário por linha — útil para acumular muitas linhas (ver [`crate::Batch::add`]).
+///
+/// `out` deve começar numa fronteira de 4 bytes, o que vale ao concatenar mensagens
+/// que já terminam alinhadas a 4. Em caso de erro, `out` é restaurado ao tamanho que
+/// tinha na entrada (a mensagem parcial é descartada), preservando a atomicidade.
+pub fn encode_row_into(
+    out: &mut Vec<u8>,
+    columns: &[ColumnMeta],
+    values: &[Value],
+    charset: Charset,
+) -> Result<()> {
     if values.len() != columns.len() {
         return Err(Error::protocol(format!(
             "parameter count mismatch: statement expects {}, got {}",
@@ -78,15 +95,17 @@ pub fn encode_row(columns: &[ColumnMeta], values: &[Value], charset: Charset) ->
             values.len()
         )));
     }
-    let mut out = vec![0u8; null_bitmap_len(columns.len())];
+    let inicio = out.len();
+    out.resize(inicio + null_bitmap_len(columns.len()), 0);
     for (i, (col, val)) in columns.iter().zip(values).enumerate() {
         if val.is_null() {
-            out[i / 8] |= 1 << (i % 8);
-        } else {
-            encode_value(&mut out, col, val, charset)?;
+            out[inicio + i / 8] |= 1 << (i % 8);
+        } else if let Err(e) = encode_value(out, col, val, charset) {
+            out.truncate(inicio); // desfaz a mensagem parcial
+            return Err(e);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn put_i32_be(out: &mut Vec<u8>, v: i32) {
@@ -107,7 +126,9 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
         sql_type::INT64 => out.extend_from_slice(&val.as_i64().ok_or_else(mismatch)?.to_be_bytes()),
         sql_type::INT128 => match val {
             Value::Int128(v) => out.extend_from_slice(&v.to_be_bytes()),
-            _ => out.extend_from_slice(&i128::from(val.as_i64().ok_or_else(mismatch)?).to_be_bytes()),
+            _ => {
+                out.extend_from_slice(&i128::from(val.as_i64().ok_or_else(mismatch)?).to_be_bytes())
+            }
         },
         sql_type::FLOAT => match val {
             Value::Float(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
@@ -182,7 +203,12 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
             }
             _ => return Err(mismatch()),
         },
-        _ => return Err(Error::protocol(format!("unsupported parameter type {}", col.sql_type))),
+        _ => {
+            return Err(Error::protocol(format!(
+                "unsupported parameter type {}",
+                col.sql_type
+            )));
+        }
     }
     Ok(())
 }
@@ -215,89 +241,102 @@ fn expect_time(val: &Value) -> Result<u32> {
 
 /// Decodifica uma linha do stream a partir dos metadados das colunas de saída.
 /// `charset` é o charset da conexão, usado para decodificar CHAR/VARCHAR.
-pub async fn decode_row(
+pub fn decode_row(
     stream: &mut FbStream,
     columns: &[ColumnMeta],
     charset: Charset,
 ) -> Result<Vec<Value>> {
-    let bitmap = stream.read_raw(null_bitmap_len(columns.len())).await?;
+    let bitmap = stream.read_raw(null_bitmap_len(columns.len()))?;
     let mut values = Vec::with_capacity(columns.len());
     for (i, col) in columns.iter().enumerate() {
         let is_null = bitmap[i / 8] & (1 << (i % 8)) != 0;
         if is_null {
             values.push(Value::Null);
         } else {
-            values.push(decode_value(stream, col, charset).await?);
+            values.push(decode_value(stream, col, charset)?);
         }
     }
     Ok(values)
 }
 
-async fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset) -> Result<Value> {
+fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset) -> Result<Value> {
     Ok(match sql_type::base(col.sql_type) {
-        sql_type::SHORT => Value::Short(stream.read_i32().await? as i16),
-        sql_type::LONG => Value::Int(stream.read_i32().await?),
-        sql_type::INT64 => Value::BigInt(stream.read_i64().await?),
+        sql_type::SHORT => Value::Short(stream.read_i32()? as i16),
+        sql_type::LONG => Value::Int(stream.read_i32()?),
+        sql_type::INT64 => Value::BigInt(stream.read_i64()?),
         sql_type::INT128 => {
-            let b = stream.read_raw(16).await?;
+            let b = stream.read_raw(16)?;
             Value::Int128(i128::from_be_bytes(b.try_into().unwrap()))
         }
         sql_type::DEC16 => {
-            let b = stream.read_raw(8).await?;
-            Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(b.try_into().unwrap()))
+            let b = stream.read_raw(8)?;
+            Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(
+                b.try_into().unwrap(),
+            ))
         }
         sql_type::DEC34 => {
-            let b = stream.read_raw(16).await?;
-            Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(b.try_into().unwrap()))
+            let b = stream.read_raw(16)?;
+            Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(
+                b.try_into().unwrap(),
+            ))
         }
-        sql_type::FLOAT => Value::Float(f32::from_bits(stream.read_i32().await? as u32)),
-        sql_type::DOUBLE | sql_type::D_FLOAT => Value::Double(stream.read_f64().await?),
+        sql_type::FLOAT => Value::Float(f32::from_bits(stream.read_i32()? as u32)),
+        sql_type::DOUBLE | sql_type::D_FLOAT => Value::Double(stream.read_f64()?),
         sql_type::TEXT => {
             let n = col.length as usize;
-            let raw = stream.read_raw(n).await?;
-            stream.read_pad(n).await?;
+            let raw = stream.read_raw(n)?;
+            stream.read_pad(n)?;
             text_or_bytes(col, raw, charset)
         }
         sql_type::VARYING => {
-            let raw = stream.read_bytes().await?; // prefixado por comprimento + com padding
+            let raw = stream.read_bytes()?; // prefixado por comprimento + com padding
             text_or_bytes(col, raw, charset)
         }
-        sql_type::TYPE_DATE => Value::Date(stream.read_i32().await?),
-        sql_type::TYPE_TIME => Value::Time(stream.read_i32().await? as u32),
+        sql_type::TYPE_DATE => Value::Date(stream.read_i32()?),
+        sql_type::TYPE_TIME => Value::Time(stream.read_i32()? as u32),
         sql_type::TIMESTAMP => {
-            let date = stream.read_i32().await?;
-            let time = stream.read_i32().await? as u32;
+            let date = stream.read_i32()?;
+            let time = stream.read_i32()? as u32;
             Value::Timestamp(date, time)
         }
         // Tipos WITH TIME ZONE: pedimos o formato ESTENDIDO (`_EX`) no BLR de
         // saída, então o servidor envia, além de UTC + zona, o offset resolvido.
         // Cada componente é um inteiro XDR de 4 bytes (USHORT/SSHORT inclusive).
         sql_type::TIME_TZ | sql_type::TIME_TZ_EX => {
-            let utc_time = stream.read_i32().await? as u32;
-            let zone = stream.read_i32().await? as u16;
-            let offset = stream.read_i32().await? as i16;
-            Value::TimeTz(crate::value::TimeTz { utc_time, zone, offset })
+            let utc_time = stream.read_i32()? as u32;
+            let zone = stream.read_i32()? as u16;
+            let offset = stream.read_i32()? as i16;
+            Value::TimeTz(crate::value::TimeTz {
+                utc_time,
+                zone,
+                offset,
+            })
         }
         sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => {
-            let utc_date = stream.read_i32().await?;
-            let utc_time = stream.read_i32().await? as u32;
-            let zone = stream.read_i32().await? as u16;
-            let offset = stream.read_i32().await? as i16;
-            Value::TimestampTz(crate::value::TimestampTz { utc_date, utc_time, zone, offset })
+            let utc_date = stream.read_i32()?;
+            let utc_time = stream.read_i32()? as u32;
+            let zone = stream.read_i32()? as u16;
+            let offset = stream.read_i32()? as i16;
+            Value::TimestampTz(crate::value::TimestampTz {
+                utc_date,
+                utc_time,
+                zone,
+                offset,
+            })
         }
-        sql_type::BLOB | sql_type::QUAD => Value::Blob(stream.read_quad().await?),
+        sql_type::BLOB | sql_type::QUAD => Value::Blob(stream.read_quad()?),
         // Coluna ARRAY: chega como um id de 8 bytes (quad), igual ao blob; os
         // elementos são buscados à parte via op_get_slice (ver [`crate::array`]).
-        sql_type::ARRAY => Value::Array(stream.read_quad().await?),
+        sql_type::ARRAY => Value::Array(stream.read_quad()?),
         sql_type::BOOLEAN => {
-            let b = stream.read_raw(1).await?;
-            stream.read_pad(1).await?;
+            let b = stream.read_raw(1)?;
+            stream.read_pad(1)?;
             Value::Bool(b[0] != 0)
         }
         _ => {
             // Tipo desconhecido: consome sua largura declarada como bytes opacos.
             let n = col.xdr_len();
-            Value::Bytes(stream.read_raw(n).await?)
+            Value::Bytes(stream.read_raw(n)?)
         }
     })
 }
@@ -326,7 +365,11 @@ mod tests {
     use super::*;
 
     fn col(sql_type: i32, length: i32) -> ColumnMeta {
-        ColumnMeta { sql_type, length, ..Default::default() }
+        ColumnMeta {
+            sql_type,
+            length,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -350,8 +393,12 @@ mod tests {
         // Cada mensagem codificada deve terminar em fronteira de 4 bytes para que
         // a concatenação no op_batch_msg permaneça alinhada.
         let cols = [col(sql_type::LONG, 4), col(sql_type::VARYING, 20)];
-        let msg =
-            encode_row(&cols, &[Value::Int(1), Value::Text("um".into())], Charset::Utf8).unwrap();
+        let msg = encode_row(
+            &cols,
+            &[Value::Int(1), Value::Text("um".into())],
+            Charset::Utf8,
+        )
+        .unwrap();
         assert_eq!(msg.len() % 4, 0);
         assert_eq!(msg.len(), 16); // bitmap(4) + int(4) + len(4)+"um"+pad(2)=8
     }

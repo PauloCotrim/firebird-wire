@@ -84,7 +84,13 @@ impl Charset {
             Charset::Encoding(enc) => enc.decode(raw).0.into_owned(),
             Charset::Dos(table) => raw
                 .iter()
-                .map(|&b| if b < 0x80 { b as char } else { table[(b - 0x80) as usize] })
+                .map(|&b| {
+                    if b < 0x80 {
+                        b as char
+                    } else {
+                        table[(b - 0x80) as usize]
+                    }
+                })
                 .collect(),
         }
     }
@@ -363,7 +369,14 @@ mod tests {
         #[test]
         fn resolves_multibyte_names() {
             // Os nomes do Firebird viram um Charset::Encoding concreto.
-            for name in ["SJIS_0208", "EUCJ_0208", "GBK", "BIG_5", "WIN1251", "ISO8859_2"] {
+            for name in [
+                "SJIS_0208",
+                "EUCJ_0208",
+                "GBK",
+                "BIG_5",
+                "WIN1251",
+                "ISO8859_2",
+            ] {
                 assert!(
                     matches!(Charset::from_name(name), Charset::Encoding(_)),
                     "{name} não resolveu para encoding_rs"

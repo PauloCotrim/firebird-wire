@@ -72,7 +72,7 @@ impl Blob {
     /// Lê o próximo bloco do blob (um ou mais segmentos, já concatenados). Retorna
     /// um vetor vazio quando não há mais nada. Após o fim, [`Self::is_eof`] fica
     /// verdadeiro.
-    pub async fn read_segment(&mut self, conn: &mut Connection) -> Result<Vec<u8>> {
+    pub fn read_segment(&mut self, conn: &mut Connection) -> Result<Vec<u8>> {
         if self.eof {
             return Ok(Vec::new());
         }
@@ -80,9 +80,9 @@ impl Blob {
         w.put_i32(self.handle);
         w.put_i32(SEGMENT_BUFFER); // comprimento máximo do buffer
         w.put_bytes(&[]); // campo de segmento (cstring vazia na leitura)
-        conn.io().send(&w).await?;
+        conn.io().send(&w)?;
 
-        let resp = read_response(conn.io()).await?;
+        let resp = read_response(conn.io())?;
         // p_resp_object carrega o status; p_resp_data, os segmentos empacotados.
         if resp.handle == SEG_EOF {
             self.eof = true;
@@ -91,10 +91,10 @@ impl Blob {
     }
 
     /// Lê o blob inteiro até o fim, concatenando todos os segmentos.
-    pub async fn read_to_end(&mut self, conn: &mut Connection) -> Result<Vec<u8>> {
+    pub fn read_to_end(&mut self, conn: &mut Connection) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
-            let chunk = self.read_segment(conn).await?;
+            let chunk = self.read_segment(conn)?;
             out.extend_from_slice(&chunk);
             if self.eof {
                 break;
@@ -108,12 +108,12 @@ impl Blob {
     }
 
     /// Fecha o blob (`op_close_blob`), consumindo o handle.
-    pub async fn close(mut self, conn: &mut Connection) -> Result<()> {
+    pub fn close(mut self, conn: &mut Connection) -> Result<()> {
         self.done = true;
         let mut w = op_packet(op::CLOSE_BLOB);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(())
     }
 }
@@ -153,38 +153,38 @@ impl BlobWriter {
 
     /// Envia `data` para o servidor em segmentos de no máximo `MAX_SEGMENT`
     /// bytes, usando `op_put_segment`. Pode ser chamado várias vezes.
-    pub async fn write(&self, conn: &mut Connection, data: &[u8]) -> Result<()> {
+    pub fn write(&self, conn: &mut Connection, data: &[u8]) -> Result<()> {
         for chunk in data.chunks(MAX_SEGMENT) {
             // O servidor armazena o conteúdo do cstring verbatim — sem prefixo de 2 bytes.
             let mut w = op_packet(op::PUT_SEGMENT);
             w.put_i32(self.handle);
             w.put_i32(chunk.len() as i32); // comprimento bruto do segmento
-            w.put_bytes(chunk);             // cstring: bytes brutos + padding XDR
-            conn.io().send(&w).await?;
-            read_response(conn.io()).await?;
+            w.put_bytes(chunk); // cstring: bytes brutos + padding XDR
+            conn.io().send(&w)?;
+            read_response(conn.io())?;
         }
         Ok(())
     }
 
     /// Cancela o blob (`op_cancel_blob`), descartando o conteúdo já enviado.
     /// Use quando ocorrer um erro após [`Connection::create_blob`].
-    pub async fn cancel(mut self, conn: &mut Connection) -> Result<()> {
+    pub fn cancel(mut self, conn: &mut Connection) -> Result<()> {
         self.done = true;
         let mut w = op_packet(op::CANCEL_BLOB);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(())
     }
 
     /// Fecha o blob (`op_close_blob`) e devolve o seu id para usar como parâmetro
     /// de coluna BLOB em INSERT/UPDATE.
-    pub async fn close(mut self, conn: &mut Connection) -> Result<u64> {
+    pub fn close(mut self, conn: &mut Connection) -> Result<u64> {
         self.done = true;
         let mut w = op_packet(op::CLOSE_BLOB);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(self.blob_id)
     }
 }
@@ -200,50 +200,62 @@ impl Drop for BlobWriter {
 impl Connection {
     /// Abre um BLOB para leitura pelo seu id (obtido de uma coluna
     /// [`Value::Blob`](crate::value::Value::Blob)).
-    pub async fn open_blob(&mut self, tx: &Transaction, blob_id: u64) -> Result<Blob> {
+    pub fn open_blob(&mut self, tx: &Transaction, blob_id: u64) -> Result<Blob> {
         let mut w = op_packet(op::OPEN_BLOB2);
         w.put_bytes(&[]); // BPB vazia (cstring) — usa o tipo de blob padrão
         w.put_i32(tx.handle()); // transação
         w.put_i64(blob_id as i64); // id do blob (quad de 8 bytes, big-endian)
-        self.io().send(&w).await?;
-        let resp = read_response(self.io()).await?;
-        Ok(Blob { handle: resp.handle, eof: false, done: false })
+        self.io().send(&w)?;
+        let resp = read_response(self.io())?;
+        Ok(Blob {
+            handle: resp.handle,
+            eof: false,
+            done: false,
+        })
     }
 
     /// Cria um BLOB vazio para escrita (`op_create_blob2`). Escreva dados com
     /// [`BlobWriter::write`] e finalize com [`BlobWriter::close`] para obter o
     /// id do blob. Em caso de erro, chame [`BlobWriter::cancel`].
-    pub async fn create_blob(&mut self, tx: &Transaction) -> Result<BlobWriter> {
+    pub fn create_blob(&mut self, tx: &Transaction) -> Result<BlobWriter> {
         let mut w = op_packet(op::CREATE_BLOB2);
         w.put_bytes(&[]); // BPB vazia — tipo de blob padrão
         w.put_i32(tx.handle());
         w.put_i64(0); // blob_id ignorado na criação; o servidor atribui um novo
-        self.io().send(&w).await?;
-        let resp = read_response(self.io()).await?;
-        Ok(BlobWriter { handle: resp.handle, blob_id: resp.blob_id, done: false })
+        self.io().send(&w)?;
+        let resp = read_response(self.io())?;
+        Ok(BlobWriter {
+            handle: resp.handle,
+            blob_id: resp.blob_id,
+            done: false,
+        })
     }
 
     /// Conveniência: cria um BLOB, escreve `data` integralmente e o fecha,
     /// devolvendo o id para usar como parâmetro de coluna BLOB.
-    pub async fn write_blob(&mut self, tx: &Transaction, data: &[u8]) -> Result<u64> {
-        let writer = self.create_blob(tx).await?;
+    pub fn write_blob(&mut self, tx: &Transaction, data: &[u8]) -> Result<u64> {
+        let writer = self.create_blob(tx)?;
         // `write` toma `&self` (não consome writer), então podemos cancelar em caso de erro.
-        if let Err(e) = writer.write(self, data).await {
-            let _ = writer.cancel(self).await;
+        if let Err(e) = writer.write(self, data) {
+            match writer.cancel(self) {
+                Ok(()) | Err(_) => {}
+            }
             return Err(e);
         }
-        writer.close(self).await
+        writer.close(self)
     }
 
     /// Conveniência: abre o BLOB, lê todo o conteúdo e o fecha, devolvendo os
     /// bytes. Fecha mesmo se a leitura falhar.
-    pub async fn read_blob(&mut self, tx: &Transaction, blob_id: u64) -> Result<Vec<u8>> {
-        let mut blob = self.open_blob(tx, blob_id).await?;
-        let result = blob.read_to_end(self).await;
-        let close = blob.close(self).await;
-        let data = result?;
-        close?;
-        Ok(data)
+    pub fn read_blob(&mut self, tx: &Transaction, blob_id: u64) -> Result<Vec<u8>> {
+        let mut blob = self.open_blob(tx, blob_id)?;
+        let result = blob.read_to_end(self);
+        let close = blob.close(self);
+        match (result, close) {
+            (Ok(data), Ok(())) => Ok(data),
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(e),
+        }
     }
 }
 

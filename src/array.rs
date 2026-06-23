@@ -33,12 +33,14 @@ use crate::transaction::Transaction;
 use crate::value::Value;
 use crate::wire::consts::{blr, op, sdl};
 use crate::wire::response::{read_op, read_response, read_response_body};
-use crate::wire::stream::{op_name, op_packet, FbStream};
+use crate::wire::stream::{FbStream, op_name, op_packet};
 
 /// Os limites (inferior, superior) de uma dimensão de array, ambos inclusivos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dimension {
+    /// Primeiro índice válido desta dimensão.
     pub lower: i32,
+    /// Último índice válido desta dimensão.
     pub upper: i32,
 }
 
@@ -177,7 +179,7 @@ impl Connection {
     /// sistema (`RDB$*`), exatamente como o fbclient faz antes de uma fatia.
     /// `relation`/`field` são os nomes como armazenados (normalmente maiúsculas;
     /// um `ColumnMeta` de saída já os traz assim).
-    pub async fn array_desc(
+    pub fn array_desc(
         &mut self,
         tx: &Transaction,
         relation: &str,
@@ -185,22 +187,26 @@ impl Connection {
     ) -> Result<ArrayDesc> {
         // 1. Tipo/escala/comprimento/dimensões + a "fonte" do campo (o domínio,
         //    p.ex. "RDB$4"), que é a chave de RDB$FIELD_DIMENSIONS.
-        let mut stmt = self
-            .prepare(
-                tx,
-                "SELECT f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_SCALE, \
+        let mut stmt = self.prepare(
+            tx,
+            "SELECT f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE, f.RDB$FIELD_SCALE, \
                  f.RDB$FIELD_LENGTH, f.RDB$DIMENSIONS, f.RDB$FIELD_NAME \
                  FROM RDB$RELATION_FIELDS rf \
                  JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE \
                  WHERE rf.RDB$RELATION_NAME = ? AND rf.RDB$FIELD_NAME = ?",
-            )
-            .await?;
-        stmt.execute(self, tx, &[Value::Text(relation.into()), Value::Text(field.into())]).await?;
-        let rows = stmt.fetch_all(self).await?;
-        stmt.drop_statement(self).await?;
+        )?;
+        stmt.execute(
+            self,
+            tx,
+            &[Value::Text(relation.into()), Value::Text(field.into())],
+        )?;
+        let rows = stmt.fetch_all(self)?;
+        stmt.drop_statement(self)?;
 
         let row = rows.into_iter().next().ok_or_else(|| {
-            Error::protocol(format!("coluna '{relation}.{field}' não encontrada no catálogo"))
+            Error::protocol(format!(
+                "coluna '{relation}.{field}' não encontrada no catálogo"
+            ))
         })?;
         let blr_type = val_i64(&row[0]).unwrap_or(0) as u8;
         let sub_type = val_i64(&row[1]).unwrap_or(0) as i32;
@@ -209,21 +215,21 @@ impl Connection {
         let dims = val_i64(&row[4]).unwrap_or(0);
         let source = row[5].as_str().unwrap_or("").trim_end().to_string();
         if dims <= 0 {
-            return Err(Error::protocol(format!("'{relation}.{field}' não é uma coluna ARRAY")));
+            return Err(Error::protocol(format!(
+                "'{relation}.{field}' não é uma coluna ARRAY"
+            )));
         }
 
         // 2. Limites de cada dimensão, em ordem.
-        let mut stmt = self
-            .prepare(
-                tx,
-                "SELECT fd.RDB$LOWER_BOUND, fd.RDB$UPPER_BOUND \
+        let mut stmt = self.prepare(
+            tx,
+            "SELECT fd.RDB$LOWER_BOUND, fd.RDB$UPPER_BOUND \
                  FROM RDB$FIELD_DIMENSIONS fd WHERE fd.RDB$FIELD_NAME = ? \
                  ORDER BY fd.RDB$DIMENSION",
-            )
-            .await?;
-        stmt.execute(self, tx, &[Value::Text(source)]).await?;
-        let dim_rows = stmt.fetch_all(self).await?;
-        stmt.drop_statement(self).await?;
+        )?;
+        stmt.execute(self, tx, &[Value::Text(source)])?;
+        let dim_rows = stmt.fetch_all(self)?;
+        stmt.drop_statement(self)?;
 
         let dimensions: Vec<Dimension> = dim_rows
             .iter()
@@ -233,13 +239,21 @@ impl Connection {
             })
             .collect();
 
-        Ok(ArrayDesc { relation: relation.into(), field: field.into(), blr_type, sub_type, scale, length, dimensions })
+        Ok(ArrayDesc {
+            relation: relation.into(),
+            field: field.into(),
+            blr_type,
+            sub_type,
+            scale,
+            length,
+            dimensions,
+        })
     }
 
     /// Lê todos os elementos de um array (`op_get_slice`). `array_id` é o id que
     /// veio na coluna ([`Value::Array`]); `desc` descreve o tipo e as dimensões.
     /// Devolve um valor por elemento, na ordem em que o servidor os transmite.
-    pub async fn read_array(
+    pub fn read_array(
         &mut self,
         tx: &Transaction,
         array_id: u64,
@@ -255,13 +269,13 @@ impl Connection {
         w.put_bytes(&sdl);
         w.put_bytes(&[]); // parâmetros da fatia: nenhum
         w.put_i32(0); // fatia de saída vazia (no get não enviamos dados)
-        self.io().send(&w).await?;
+        self.io().send(&w)?;
 
         // A resposta de sucesso é um op_slice (sem vetor de status); um erro vem
         // como op_response.
-        let code = read_op(self.io()).await?;
+        let code = read_op(self.io())?;
         if code == op::RESPONSE {
-            read_response_body(self.io()).await?.into_result()?;
+            read_response_body(self.io())?.into_result()?;
             return Err(Error::protocol("op_get_slice falhou sem status de erro"));
         }
         if code != op::SLICE {
@@ -270,13 +284,13 @@ impl Connection {
                 op_name(code)
             )));
         }
-        let _slr_length = self.io().read_i32().await?; // tamanho na repr. do cliente
-        let _xdr_length = self.io().read_i32().await?; // comprimento lógico XDR
+        let _slr_length = self.io().read_i32()?; // tamanho na repr. do cliente
+        let _xdr_length = self.io().read_i32()?; // comprimento lógico XDR
 
         let charset = self.charset();
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            out.push(decode_element(self.io(), desc, charset).await?);
+            out.push(decode_element(self.io(), desc, charset)?);
         }
         Ok(out)
     }
@@ -284,7 +298,7 @@ impl Connection {
     /// Cria um novo array com `values` (`op_put_slice`) e devolve seu id, para
     /// usar como [`Value::Array`] num INSERT/UPDATE. O número de valores deve
     /// bater com `desc.element_count()`.
-    pub async fn write_array(
+    pub fn write_array(
         &mut self,
         tx: &Transaction,
         desc: &ArrayDesc,
@@ -315,10 +329,10 @@ impl Connection {
         w.put_i32(desc.slice_len() as i32); // comprimento lógico da fatia
         w.put_raw(&data);
         w.align();
-        self.io().send(&w).await?;
+        self.io().send(&w)?;
 
         // O id do novo array volta no campo blob_id do op_response.
-        Ok(read_response(self.io()).await?.blob_id)
+        Ok(read_response(self.io())?.blob_id)
     }
 }
 
@@ -328,65 +342,81 @@ fn val_i64(v: &Value) -> Option<i64> {
 }
 
 /// Decodifica um elemento da fatia conforme seu tipo BLR (formato xdr_datum).
-async fn decode_element(stream: &mut FbStream, desc: &ArrayDesc, charset: Charset) -> Result<Value> {
+fn decode_element(stream: &mut FbStream, desc: &ArrayDesc, charset: Charset) -> Result<Value> {
     Ok(match desc.blr_type {
-        blr::SHORT => Value::Short(stream.read_i32().await? as i16),
-        blr::LONG => Value::Int(stream.read_i32().await?),
-        blr::INT64 => Value::BigInt(stream.read_i64().await?),
+        blr::SHORT => Value::Short(stream.read_i32()? as i16),
+        blr::LONG => Value::Int(stream.read_i32()?),
+        blr::INT64 => Value::BigInt(stream.read_i64()?),
         blr::INT128 => {
-            let b = stream.read_raw(16).await?;
+            let b = stream.read_raw(16)?;
             Value::Int128(i128::from_be_bytes(b.try_into().unwrap()))
         }
-        blr::FLOAT => Value::Float(f32::from_bits(stream.read_i32().await? as u32)),
-        blr::DOUBLE | blr::D_FLOAT => Value::Double(stream.read_f64().await?),
-        blr::SQL_DATE => Value::Date(stream.read_i32().await?),
-        blr::SQL_TIME => Value::Time(stream.read_i32().await? as u32),
+        blr::FLOAT => Value::Float(f32::from_bits(stream.read_i32()? as u32)),
+        blr::DOUBLE | blr::D_FLOAT => Value::Double(stream.read_f64()?),
+        blr::SQL_DATE => Value::Date(stream.read_i32()?),
+        blr::SQL_TIME => Value::Time(stream.read_i32()? as u32),
         blr::TIMESTAMP => {
-            let date = stream.read_i32().await?;
-            let time = stream.read_i32().await? as u32;
+            let date = stream.read_i32()?;
+            let time = stream.read_i32()? as u32;
             Value::Timestamp(date, time)
         }
         blr::BOOL => {
-            let b = stream.read_raw(1).await?;
-            stream.read_pad(1).await?;
+            let b = stream.read_raw(1)?;
+            stream.read_pad(1)?;
             Value::Bool(b[0] != 0)
         }
         blr::DEC64 => {
-            let b = stream.read_raw(8).await?;
-            Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(b.try_into().unwrap()))
+            let b = stream.read_raw(8)?;
+            Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(
+                b.try_into().unwrap(),
+            ))
         }
         blr::DEC128 => {
-            let b = stream.read_raw(16).await?;
-            Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(b.try_into().unwrap()))
+            let b = stream.read_raw(16)?;
+            Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(
+                b.try_into().unwrap(),
+            ))
         }
         blr::TEXT => {
             let n = desc.length as usize;
-            let raw = stream.read_raw(n).await?;
-            stream.read_pad(n).await?;
+            let raw = stream.read_raw(n)?;
+            stream.read_pad(n)?;
             text_or_bytes(desc, raw, charset, true)
         }
         blr::VARYING => {
-            let raw = stream.read_bytes().await?; // comprimento(4) + bytes + padding
+            let raw = stream.read_bytes()?; // comprimento(4) + bytes + padding
             text_or_bytes(desc, raw, charset, false)
         }
         other => {
             // Tipo não tratado: consome o stride como bytes opacos.
             let _ = other;
-            Value::Bytes(stream.read_raw(desc.element_stride()).await?)
+            Value::Bytes(stream.read_raw(desc.element_stride())?)
         }
     })
 }
 
 /// Serializa um elemento no formato xdr_datum (espelho de [`decode_element`]).
-fn encode_element(out: &mut Vec<u8>, desc: &ArrayDesc, val: &Value, charset: Charset) -> Result<()> {
-    let mismatch = || Error::protocol(format!("valor não cabe no tipo de elemento BLR {}", desc.blr_type));
+fn encode_element(
+    out: &mut Vec<u8>,
+    desc: &ArrayDesc,
+    val: &Value,
+    charset: Charset,
+) -> Result<()> {
+    let mismatch = || {
+        Error::protocol(format!(
+            "valor não cabe no tipo de elemento BLR {}",
+            desc.blr_type
+        ))
+    };
     match desc.blr_type {
         blr::SHORT => put_i32_be(out, i32::from(val.as_i64().ok_or_else(mismatch)? as i16)),
         blr::LONG => put_i32_be(out, val.as_i64().ok_or_else(mismatch)? as i32),
         blr::INT64 => out.extend_from_slice(&val.as_i64().ok_or_else(mismatch)?.to_be_bytes()),
         blr::INT128 => match val {
             Value::Int128(v) => out.extend_from_slice(&v.to_be_bytes()),
-            _ => out.extend_from_slice(&i128::from(val.as_i64().ok_or_else(mismatch)?).to_be_bytes()),
+            _ => {
+                out.extend_from_slice(&i128::from(val.as_i64().ok_or_else(mismatch)?).to_be_bytes())
+            }
         },
         blr::FLOAT => match val {
             Value::Float(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
@@ -440,7 +470,12 @@ fn encode_element(out: &mut Vec<u8>, desc: &ArrayDesc, val: &Value, charset: Cha
             }
             put_pad(out, n.max(bytes.len()));
         }
-        _ => return Err(Error::protocol(format!("tipo de elemento BLR {} não suportado para escrita", desc.blr_type))),
+        _ => {
+            return Err(Error::protocol(format!(
+                "tipo de elemento BLR {} não suportado para escrita",
+                desc.blr_type
+            )));
+        }
     }
     Ok(())
 }
@@ -460,7 +495,9 @@ fn elem_text_bytes(val: &Value, charset: Charset) -> Result<std::borrow::Cow<'_,
     match val {
         Value::Text(s) => Ok(Cow::Owned(charset.encode(s))),
         Value::Bytes(b) => Ok(Cow::Borrowed(b)),
-        _ => Err(Error::protocol("esperava um valor de texto/bytes para elemento de array")),
+        _ => Err(Error::protocol(
+            "esperava um valor de texto/bytes para elemento de array",
+        )),
     }
 }
 
@@ -519,7 +556,10 @@ mod tests {
     #[test]
     fn sdl_uses_do2_when_lower_bound_not_one() {
         let mut d = varchar15_1to5();
-        d.dimensions = vec![Dimension { lower: -2, upper: 3 }];
+        d.dimensions = vec![Dimension {
+            lower: -2,
+            upper: 3,
+        }];
         let s = d.to_sdl();
         // Procura o verbo de laço: deve ser DO2 (34) com os dois limites.
         let pos = s.iter().position(|&b| b == sdl::DO2).expect("esperava DO2");
@@ -536,7 +576,10 @@ mod tests {
         let mut d = varchar15_1to5();
         d.blr_type = blr::LONG;
         d.length = 4;
-        d.dimensions = vec![Dimension { lower: 1, upper: 2 }, Dimension { lower: 1, upper: 3 }];
+        d.dimensions = vec![
+            Dimension { lower: 1, upper: 2 },
+            Dimension { lower: 1, upper: 3 },
+        ];
         let s = d.to_sdl();
         assert_eq!(s.iter().filter(|&&b| b == sdl::DO1).count(), 2);
         assert_eq!(s.iter().filter(|&&b| b == sdl::VARIABLE).count(), 2);

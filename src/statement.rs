@@ -50,9 +50,13 @@ const RECORDS_BUFFER_LEN: i32 = 64;
 /// Retornado por [`Statement::rows_affected`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowsAffected {
+    /// Linhas selecionadas por comandos que reportam contagem de seleção.
     pub selected: u64,
+    /// Linhas inseridas pela última execução.
     pub inserted: u64,
+    /// Linhas atualizadas pela última execução.
     pub updated: u64,
+    /// Linhas excluídas pela última execução.
     pub deleted: u64,
 }
 
@@ -140,14 +144,18 @@ impl Statement {
     /// Executa a instrução. Para um `SELECT` isto abre um cursor; prossiga com
     /// [`Self::fetch`] / [`Self::fetch_all`]. Para DML o servidor responde com um
     /// `op_response` simples.
-    pub async fn execute(
+    pub fn execute(
         &mut self,
         conn: &mut Connection,
         tx: &Transaction,
         params: &[Value],
     ) -> Result<()> {
         let has_params = !self.params.is_empty();
-        let in_blr = if has_params { input_blr(&self.params) } else { Vec::new() };
+        let in_blr = if has_params {
+            input_blr(&self.params)
+        } else {
+            Vec::new()
+        };
         let message = if has_params {
             encode_row(&self.params, params, conn.charset())?
         } else {
@@ -174,7 +182,11 @@ impl Statement {
         // do fbclient: a única palavra que muda entre um openCursor normal e um
         // rolável é esta — 0 = normal, 1 = CURSOR_TYPE_SCROLLABLE). O op_execute
         // (ao contrário do op_execute2) não carrega out_message_number aqui.
-        w.put_i32(if self.scrollable { cursor_type::SCROLLABLE } else { 0 });
+        w.put_i32(if self.scrollable {
+            cursor_type::SCROLLABLE
+        } else {
+            0
+        });
         // Campo final único na v19/FB5 (confirmado por captura strace: o pacote
         // sem parâmetros tem 9 palavras): o tamanho máximo de blob a embutir
         // inline na resposta do fetch. Enviamos 0 para DESATIVAR o inline — assim
@@ -184,8 +196,8 @@ impl Statement {
         if conn.protocol_version() >= 18 {
             w.put_i32(0); // inline_blob_size (FB5): 0 = sem inline
         }
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
 
         self.cursor_open = self.is_select();
         self.buffered.clear();
@@ -195,7 +207,7 @@ impl Statement {
 
     /// Busca a próxima linha, ou `None` no fim do cursor. Retorna `None` para uma
     /// instrução que não tem cursor aberto (que não é SELECT, ou já esgotada).
-    pub async fn fetch(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+    pub fn fetch(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
         loop {
             if let Some(row) = self.buffered.pop_front() {
                 return Ok(Some(row));
@@ -204,28 +216,28 @@ impl Statement {
                 self.cursor_open = false;
                 return Ok(None);
             }
-            self.fetch_batch(conn).await?;
+            self.fetch_batch(conn)?;
         }
     }
 
     /// Envia um `op_fetch` e drena todos os `op_fetch_response` resultantes para o
     /// buffer, até o pacote terminador (count 0). Define `exhausted` quando o
     /// servidor sinaliza fim de cursor (status 100).
-    async fn fetch_batch(&mut self, conn: &mut Connection) -> Result<()> {
+    fn fetch_batch(&mut self, conn: &mut Connection) -> Result<()> {
         let out_blr = message_blr(&self.columns);
         let mut w = op_packet(op::FETCH);
         w.put_i32(self.handle);
         w.put_bytes(&out_blr);
         w.put_i32(0); // message number
         w.put_i32(self.fetch_size);
-        conn.io().send(&w).await?;
+        conn.io().send(&w)?;
 
         loop {
-            let code = read_op(conn.io()).await?;
+            let code = read_op(conn.io())?;
             if code != op::FETCH_RESPONSE {
                 if code == op::RESPONSE {
                     // Um erro veio como op_response; decodifica-o para a mensagem.
-                    read_response_body(conn.io()).await?.into_result()?;
+                    read_response_body(conn.io())?.into_result()?;
                 }
                 return Err(Error::protocol(format!(
                     "expected op_fetch_response, got {} ({code})",
@@ -233,8 +245,8 @@ impl Statement {
                 )));
             }
 
-            let status = conn.io().read_i32().await?; // 0 = linha, 100 = fim do cursor
-            let count = conn.io().read_i32().await?; // 0 = sem mensagem neste pacote
+            let status = conn.io().read_i32()?; // 0 = linha, 100 = fim do cursor
+            let count = conn.io().read_i32()?; // 0 = sem mensagem neste pacote
             if count == 0 {
                 // Terminador do lote: status 100 ⇒ cursor esgotado; status 0 ⇒
                 // limite do lote atingido, mas ainda há linhas (busque mais).
@@ -243,7 +255,7 @@ impl Statement {
             }
 
             let cs = conn.charset();
-            let row = decode_row(conn.io(), &self.columns, cs).await?;
+            let row = decode_row(conn.io(), &self.columns, cs)?;
             self.buffered.push_back(row);
             if status == 100 {
                 self.exhausted = true;
@@ -253,22 +265,22 @@ impl Statement {
     }
 
     /// Esvazia o cursor para um vetor de linhas.
-    pub async fn fetch_all(&mut self, conn: &mut Connection) -> Result<Vec<Vec<Value>>> {
+    pub fn fetch_all(&mut self, conn: &mut Connection) -> Result<Vec<Vec<Value>>> {
         let mut rows = Vec::new();
-        while let Some(row) = self.fetch(conn).await? {
+        while let Some(row) = self.fetch(conn)? {
             rows.push(row);
         }
         Ok(rows)
     }
 
-    /// Cria um stream assíncrono sobre as linhas do cursor (ver [`RowStream`]),
+    /// Cria um stream síncrono sobre as linhas do cursor (ver [`RowStream`]),
     /// empacotando a conexão para não precisar repassá-la a cada linha. As linhas
     /// chegam sob demanda (em lotes de [`Self::fetch_size`]), sem materializar
     /// tudo na memória como [`Self::fetch_all`].
     ///
     /// ```text
     /// let mut rows = stmt.rows(&mut conn);
-    /// while let Some(row) = rows.next().await? {
+    /// while let Some(row) = rows.try_next()? {
     ///     println!("{row:?}");
     /// }
     /// ```
@@ -283,7 +295,7 @@ impl Statement {
     /// `direction` é uma das constantes [`scroll`]; `offset` é a posição absoluta
     /// (1-based) para [`scroll::ABSOLUTE`], o deslocamento com sinal para
     /// [`scroll::RELATIVE`], e ignorado (use 0) nas demais direções.
-    pub async fn fetch_scroll(
+    pub fn fetch_scroll(
         &mut self,
         conn: &mut Connection,
         direction: i32,
@@ -303,29 +315,29 @@ impl Statement {
         w.put_i32(1); // fetch count: uma linha por salto (como faz o fbclient)
         w.put_i32(direction);
         w.put_i32(offset);
-        conn.io().send(&w).await?;
+        conn.io().send(&w)?;
 
         // Drena os op_fetch_response até o terminador (count 0), guardando a (única)
         // linha. status 100 ⇒ posição fora do cursor (nenhuma linha naquele ponto).
         let mut row = None;
         loop {
-            let code = read_op(conn.io()).await?;
+            let code = read_op(conn.io())?;
             if code != op::FETCH_RESPONSE {
                 if code == op::RESPONSE {
-                    read_response_body(conn.io()).await?.into_result()?;
+                    read_response_body(conn.io())?.into_result()?;
                 }
                 return Err(Error::protocol(format!(
                     "expected op_fetch_response, got {} ({code})",
                     op_name(code)
                 )));
             }
-            let status = conn.io().read_i32().await?;
-            let count = conn.io().read_i32().await?;
+            let status = conn.io().read_i32()?;
+            let count = conn.io().read_i32()?;
             if count == 0 {
                 break;
             }
             let cs = conn.charset();
-            let r = decode_row(conn.io(), &self.columns, cs).await?;
+            let r = decode_row(conn.io(), &self.columns, cs)?;
             if row.is_none() {
                 row = Some(r);
             }
@@ -339,83 +351,83 @@ impl Statement {
     }
 
     /// Próxima linha (rolável). Equivale a [`Self::fetch`] num cursor rolável.
-    pub async fn fetch_next(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
-        self.fetch_scroll(conn, scroll::NEXT, 0).await
+    pub fn fetch_next(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::NEXT, 0)
     }
 
     /// Linha anterior.
-    pub async fn fetch_prior(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
-        self.fetch_scroll(conn, scroll::PRIOR, 0).await
+    pub fn fetch_prior(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::PRIOR, 0)
     }
 
     /// Primeira linha do conjunto de resultados.
-    pub async fn fetch_first(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
-        self.fetch_scroll(conn, scroll::FIRST, 0).await
+    pub fn fetch_first(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::FIRST, 0)
     }
 
     /// Última linha do conjunto de resultados.
-    pub async fn fetch_last(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
-        self.fetch_scroll(conn, scroll::LAST, 0).await
+    pub fn fetch_last(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+        self.fetch_scroll(conn, scroll::LAST, 0)
     }
 
     /// Linha na posição absoluta `pos` (1-based; negativa conta a partir do fim).
-    pub async fn fetch_absolute(
+    pub fn fetch_absolute(
         &mut self,
         conn: &mut Connection,
         pos: i32,
     ) -> Result<Option<Vec<Value>>> {
-        self.fetch_scroll(conn, scroll::ABSOLUTE, pos).await
+        self.fetch_scroll(conn, scroll::ABSOLUTE, pos)
     }
 
     /// Linha `offset` posições à frente (positivo) ou atrás (negativo) da atual.
-    pub async fn fetch_relative(
+    pub fn fetch_relative(
         &mut self,
         conn: &mut Connection,
         offset: i32,
     ) -> Result<Option<Vec<Value>>> {
-        self.fetch_scroll(conn, scroll::RELATIVE, offset).await
+        self.fetch_scroll(conn, scroll::RELATIVE, offset)
     }
 
     /// Quantas linhas a última execução afetou, via `op_info_sql` com
     /// `isc_info_sql_records`. Útil após um INSERT/UPDATE/DELETE — use
     /// [`RowsAffected::total_modified`] para o total.
-    pub async fn rows_affected(&self, conn: &mut Connection) -> Result<RowsAffected> {
+    pub fn rows_affected(&self, conn: &mut Connection) -> Result<RowsAffected> {
         let w = crate::connection::info_request(
             op::INFO_SQL,
             self.handle,
             &[isql::RECORDS],
             RECORDS_BUFFER_LEN,
         );
-        conn.io().send(&w).await?;
-        let resp = read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        let resp = read_response(conn.io())?;
         Ok(parse_records(&resp.data))
     }
 
     /// Fecha o cursor aberto (`op_free_statement` com `DSQL_close`) sem liberar a
     /// instrução preparada, para que possa ser reexecutada.
-    pub async fn close(&mut self, conn: &mut Connection) -> Result<()> {
+    pub fn close(&mut self, conn: &mut Connection) -> Result<()> {
         if !self.cursor_open {
             return Ok(());
         }
-        self.free(conn, free::CLOSE).await?;
+        self.free(conn, free::CLOSE)?;
         self.cursor_open = false;
         Ok(())
     }
 
     /// Libera a instrução no servidor (`op_free_statement` com `DSQL_drop`),
     /// consumindo o handle.
-    pub async fn drop_statement(mut self, conn: &mut Connection) -> Result<()> {
-        self.free(conn, free::DROP).await?;
+    pub fn drop_statement(mut self, conn: &mut Connection) -> Result<()> {
+        self.free(conn, free::DROP)?;
         self.dropped = true;
         Ok(())
     }
 
-    async fn free(&mut self, conn: &mut Connection, mode: i32) -> Result<()> {
+    fn free(&mut self, conn: &mut Connection, mode: i32) -> Result<()> {
         let mut w = op_packet(op::FREE_STATEMENT);
         w.put_i32(self.handle);
         w.put_i32(mode);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(())
     }
 
@@ -435,14 +447,14 @@ impl Drop for Statement {
     }
 }
 
-/// Stream assíncrono sobre as linhas de um cursor aberto, criado por
-/// [`Statement::rows`]. Entrega uma linha por vez via [`Self::next`], buscando
+/// Stream síncrono sobre as linhas de um cursor aberto, criado por
+/// [`Statement::rows`]. Entrega uma linha por vez via [`Self::try_next`], buscando
 /// lotes do servidor sob demanda — não materializa o resultado inteiro.
 ///
-/// É um *lending iterator* (`next(&mut self)`), não um `futures::Stream`: como
-/// o stream toma `&mut Connection` emprestado, um `Stream` exigiria um future
-/// auto-referencial (e uma dependência a mais). Para a maioria dos usos, o laço
-/// `while let Some(row) = rows.next().await?` é suficiente; há também
+/// É um *lending iterator* (`try_next(&mut self)`), não um `Iterator` padrão: como
+/// o stream toma `&mut Connection` emprestado, a conexão fica presa ao cursor
+/// enquanto o stream existir. Para a maioria dos usos, o laço
+/// `while let Some(row) = rows.try_next()?` é suficiente; há também
 /// [`Self::try_collect`] e [`Self::try_for_each`].
 pub struct RowStream<'a> {
     stmt: &'a mut Statement,
@@ -451,26 +463,35 @@ pub struct RowStream<'a> {
 
 impl RowStream<'_> {
     /// A próxima linha, ou `None` no fim do cursor.
-    pub async fn next(&mut self) -> Result<Option<Vec<Value>>> {
-        self.stmt.fetch(self.conn).await
+    pub fn try_next(&mut self) -> Result<Option<Vec<Value>>> {
+        self.stmt.fetch(self.conn)
+    }
+
+    /// A próxima linha, ou `None` no fim do cursor.
+    ///
+    /// Prefera [`Self::try_next`] em código novo; este método fica como alias
+    /// compatível para exemplos/código existentes.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        self.try_next()
     }
 
     /// Coleta todas as linhas restantes num vetor (equivalente a
     /// [`Statement::fetch_all`], mas consumindo o stream).
-    pub async fn try_collect(mut self) -> Result<Vec<Vec<Value>>> {
+    pub fn try_collect(mut self) -> Result<Vec<Vec<Value>>> {
         let mut rows = Vec::new();
-        while let Some(row) = self.next().await? {
+        while let Some(row) = self.try_next()? {
             rows.push(row);
         }
         Ok(rows)
     }
 
     /// Aplica `f` a cada linha restante, parando no primeiro erro.
-    pub async fn try_for_each<F>(mut self, mut f: F) -> Result<()>
+    pub fn try_for_each<F>(mut self, mut f: F) -> Result<()>
     where
         F: FnMut(Vec<Value>) -> Result<()>,
     {
-        while let Some(row) = self.next().await? {
+        while let Some(row) = self.try_next()? {
             f(row)?;
         }
         Ok(())
@@ -479,12 +500,12 @@ impl RowStream<'_> {
 
 impl Connection {
     /// Prepara uma instrução SQL dentro da transação informada.
-    pub async fn prepare(&mut self, tx: &Transaction, sql: &str) -> Result<Statement> {
+    pub fn prepare(&mut self, tx: &Transaction, sql: &str) -> Result<Statement> {
         // 1. Aloca um handle de instrução.
         let mut w = op_packet(op::ALLOCATE_STATEMENT);
         w.put_i32(self.db_handle());
-        self.io().send(&w).await?;
-        let handle = read_response(self.io()).await?.handle;
+        self.io().send(&w)?;
+        let handle = read_response(self.io())?.handle;
 
         // 2. Prepara-a; a requisição de info de descrição (describe-info) segue
         //    junto e seu resultado volta no campo data do op_response.
@@ -495,8 +516,8 @@ impl Connection {
         w.put_str(sql);
         w.put_bytes(prepare_info_items());
         w.put_i32(INFO_BUFFER_LEN);
-        self.io().send(&w).await?;
-        let resp = read_response(self.io()).await?;
+        self.io().send(&w)?;
+        let resp = read_response(self.io())?;
 
         let info = parse_prepare_response(&resp.data)?;
         Ok(Statement {
@@ -546,7 +567,9 @@ fn parse_prepare_response(data: &[u8]) -> Result<PreparedInfo> {
         match tag {
             INFO_END => break,
             INFO_TRUNCATED => {
-                return Err(Error::protocol("prepare describe-info truncated; buffer too small"))
+                return Err(Error::protocol(
+                    "prepare describe-info truncated; buffer too small",
+                ));
             }
             isql::SELECT => block = Block::Select,
             isql::BIND => block = Block::Bind,
@@ -576,7 +599,11 @@ fn parse_prepare_response(data: &[u8]) -> Result<PreparedInfo> {
         }
     }
 
-    Ok(PreparedInfo { stmt_type, params, columns })
+    Ok(PreparedInfo {
+        stmt_type,
+        params,
+        columns,
+    })
 }
 
 fn apply_info_item(tag: u8, val: &[u8], stmt_type: &mut i32, cur: &mut Option<ColumnMeta>) {
@@ -585,7 +612,10 @@ fn apply_info_item(tag: u8, val: &[u8], stmt_type: &mut i32, cur: &mut Option<Co
         isql::SQLDA_SEQ => {
             // Inicia uma nova variável; sqlda_seq começa em 1.
             let seq = read_le_int(val) as usize;
-            *cur = Some(ColumnMeta { index: seq.saturating_sub(1), ..Default::default() });
+            *cur = Some(ColumnMeta {
+                index: seq.saturating_sub(1),
+                ..Default::default()
+            });
         }
         isql::TYPE => {
             if let Some(c) = cur.as_mut() {

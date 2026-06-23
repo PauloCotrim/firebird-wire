@@ -1,15 +1,15 @@
 //! A conexão TCP: negociação de protocolo, autenticação SRP, criptografia de
 //! comunicação (wire) opcional, e attach/create do banco de dados.
 
-use tokio::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 
-use crate::auth::srp::{parse_server_data, SrpClient, SrpHash};
-use crate::auth::wirecrypt::{make_ciphers, WireCryptPlugin};
+use crate::auth::srp::{SrpClient, SrpHash, parse_server_data};
+use crate::auth::wirecrypt::{WireCryptPlugin, make_ciphers};
 use crate::config::{ConnectConfig, WireCrypt};
 use crate::error::{Error, Result};
 use crate::wire::consts::*;
 use crate::wire::response::{read_op, read_response, read_response_body};
-use crate::wire::stream::{op_name, op_packet, FbStream};
+use crate::wire::stream::{FbStream, op_name, op_packet};
 use crate::wire::xdr::{ParameterBuffer, XdrWriter};
 
 /// Versões de protocolo que oferecemos, em preferência ascendente (`weight`).
@@ -34,30 +34,29 @@ pub struct Connection {
 
 impl Connection {
     /// Conecta ao servidor e anexa (attach) a um banco de dados existente.
-    pub async fn connect(config: &ConnectConfig) -> Result<Connection> {
-        Self::open(config, false).await
+    pub fn connect(config: &ConnectConfig) -> Result<Connection> {
+        Self::open(config, false)
     }
 
     /// Conecta e cria um novo banco de dados, e então anexa (attach) a ele.
-    pub async fn create_database(config: &ConnectConfig) -> Result<Connection> {
-        Self::open(config, true).await
+    pub fn create_database(config: &ConnectConfig) -> Result<Connection> {
+        Self::open(config, true)
     }
 
-    async fn open(config: &ConnectConfig, create: bool) -> Result<Connection> {
-        let fut = Self::open_inner(config, create);
-        match config.connect_timeout {
-            Some(t) => tokio::time::timeout(t, fut).await.map_err(|_| Error::Timeout)?,
-            None => fut.await,
-        }
+    fn open(config: &ConnectConfig, create: bool) -> Result<Connection> {
+        Self::open_inner(config, create)
     }
 
-    async fn open_inner(config: &ConnectConfig, create: bool) -> Result<Connection> {
+    fn open_inner(config: &ConnectConfig, create: bool) -> Result<Connection> {
         let connect_op = if create { op::CREATE } else { op::ATTACH };
 
         // O handshake (connect + accept + SRP + wire-crypt) é idêntico ao do
         // attach de serviço; está fatorado em [`handshake`].
-        let Handshake { mut stream, protocol_version, auth } =
-            handshake(config, connect_op, &config.database).await?;
+        let Handshake {
+            mut stream,
+            protocol_version,
+            auth,
+        } = handshake(config, connect_op, &config.database)?;
 
         // --- attach / create ----------------------------------------------
         let dpb = build_dpb(config, create, &auth);
@@ -65,8 +64,8 @@ impl Connection {
         w.put_i32(0); // id do objeto de banco de dados
         w.put_str(&config.database);
         w.put_bytes(&dpb);
-        stream.send(&w).await?;
-        let resp = attach_response(&mut stream).await?;
+        stream.send(&w)?;
+        let resp = attach_response(&mut stream)?;
 
         let mut conn = Connection {
             stream,
@@ -85,7 +84,7 @@ impl Connection {
                 "SET BIND OF DECFLOAT TO NATIVE",
                 "SET BIND OF TIME ZONE TO NATIVE",
             ] {
-                conn.exec_immediate(None, stmt).await?;
+                conn.exec_immediate(None, stmt)?;
             }
         }
 
@@ -104,19 +103,19 @@ impl Connection {
     }
 
     /// Desanexa (detach) do banco de dados e fecha o socket.
-    pub async fn close(mut self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
         let mut w = op_packet(op::DETACH);
         w.put_i32(self.db_handle);
-        self.stream.send(&w).await?;
-        let _ = read_response(&mut self.stream).await?;
+        self.stream.send(&w)?;
+        let _ = read_response(&mut self.stream)?;
         Ok(())
     }
 
     /// Faz um round-trip de `op_ping` para verificar se a conexão está viva.
-    pub async fn ping(&mut self) -> Result<()> {
+    pub fn ping(&mut self) -> Result<()> {
         let w = op_packet(op::PING);
-        self.stream.send(&w).await?;
-        read_response(&mut self.stream).await?;
+        self.stream.send(&w)?;
+        read_response(&mut self.stream)?;
         Ok(())
     }
 
@@ -141,17 +140,21 @@ impl Connection {
     /// Passe `None` para deixar o driver criar e fazer commit de uma transação
     /// implícita (necessário para DDL autocommit). Passe `Some(&tx)` para executar
     /// dentro de uma transação existente.
-    pub async fn exec_immediate(&mut self, tx: Option<&crate::transaction::Transaction>, sql: &str) -> Result<()> {
+    pub fn exec_immediate(
+        &mut self,
+        tx: Option<&crate::transaction::Transaction>,
+        sql: &str,
+    ) -> Result<()> {
         match tx {
-            Some(t) => self.exec_immediate_inner(t.handle(), sql).await,
+            Some(t) => self.exec_immediate_inner(t.handle(), sql),
             None => {
                 // DDL exige contexto de transação no wire; cria e faz commit implicitamente.
-                let implicit_tx = self.begin().await?;
+                let implicit_tx = self.begin()?;
                 let tx_handle = implicit_tx.handle();
-                match self.exec_immediate_inner(tx_handle, sql).await {
-                    Ok(()) => implicit_tx.commit(self).await,
+                match self.exec_immediate_inner(tx_handle, sql) {
+                    Ok(()) => implicit_tx.commit(self),
                     Err(e) => {
-                        let _ = implicit_tx.rollback(self).await;
+                        let _ = implicit_tx.rollback(self);
                         Err(e)
                     }
                 }
@@ -161,16 +164,16 @@ impl Connection {
 
     // Envia op_exec_immediate com os campos na ordem correta confirmada via strace:
     // tx_handle (campo 1) | db_handle (campo 2) | dialect | sql | items | buf_len.
-    async fn exec_immediate_inner(&mut self, tx_handle: i32, sql: &str) -> Result<()> {
+    fn exec_immediate_inner(&mut self, tx_handle: i32, sql: &str) -> Result<()> {
         let mut w = op_packet(op::EXEC_IMMEDIATE);
-        w.put_i32(tx_handle);      // campo 1: transação
+        w.put_i32(tx_handle); // campo 1: transação
         w.put_i32(self.db_handle); // campo 2: banco de dados
-        w.put_i32(3);              // dialeto SQL (3 = padrão)
+        w.put_i32(3); // dialeto SQL (3 = padrão)
         w.put_str(sql);
         w.put_bytes(&[]); // itens de info vazios
-        w.put_i32(0);     // buffer_length = 0
-        self.stream.send(&w).await?;
-        read_response(&mut self.stream).await?;
+        w.put_i32(0); // buffer_length = 0
+        self.stream.send(&w)?;
+        read_response(&mut self.stream)?;
         Ok(())
     }
 
@@ -214,32 +217,48 @@ struct Accept {
     cond: bool,
 }
 
-async fn read_accept(stream: &mut FbStream) -> Result<Accept> {
-    let code = read_op(stream).await?;
+fn read_accept(stream: &mut FbStream) -> Result<Accept> {
+    let code = read_op(stream)?;
     match code {
         c if c == op::ACCEPT => {
-            let version = stream.read_i32().await?;
-            let _arch = stream.read_i32().await?;
-            let _ptype = stream.read_i32().await?;
-            Ok(Accept { version, data: Vec::new(), plugin: String::new(), authenticated: true, keys: Vec::new(), cond: false })
+            let version = stream.read_i32()?;
+            let _arch = stream.read_i32()?;
+            let _ptype = stream.read_i32()?;
+            Ok(Accept {
+                version,
+                data: Vec::new(),
+                plugin: String::new(),
+                authenticated: true,
+                keys: Vec::new(),
+                cond: false,
+            })
         }
         // op_accept_data e op_cond_accept compartilham um layout de comunicação
         // (wire) idêntico; a única diferença é se o cliente ainda precisa
         // concluir a autenticação, o que lemos da flag `authenticated`.
         c if c == op::ACCEPT_DATA || c == op::COND_ACCEPT => {
-            let version = stream.read_i32().await?;
-            let _arch = stream.read_i32().await?;
-            let _ptype = stream.read_i32().await?;
-            let data = stream.read_bytes().await?;
-            let plugin = String::from_utf8_lossy(&stream.read_bytes().await?).trim().to_string();
-            let authenticated = stream.read_i32().await? != 0;
-            let keys = stream.read_bytes().await?;
-            Ok(Accept { version, data, plugin, authenticated, keys, cond: c == op::COND_ACCEPT })
+            let version = stream.read_i32()?;
+            let _arch = stream.read_i32()?;
+            let _ptype = stream.read_i32()?;
+            let data = stream.read_bytes()?;
+            let plugin = String::from_utf8_lossy(&stream.read_bytes()?)
+                .trim()
+                .to_string();
+            let authenticated = stream.read_i32()? != 0;
+            let keys = stream.read_bytes()?;
+            Ok(Accept {
+                version,
+                data,
+                plugin,
+                authenticated,
+                keys,
+                cond: c == op::COND_ACCEPT,
+            })
         }
         c if c == op::REJECT => Err(Error::auth("server rejected the connection")),
         c if c == op::RESPONSE => {
             // Uma resposta de erro durante o connect.
-            crate::wire::response::read_response_body(stream).await?.into_result()?;
+            crate::wire::response::read_response_body(stream)?.into_result()?;
             Err(Error::protocol("unexpected op_response during connect"))
         }
         other => Err(Error::protocol(format!(
@@ -279,14 +298,13 @@ pub(crate) struct Handshake {
 /// accept do servidor, calcula a prova SRP e negocia a criptografia de
 /// comunicação (wire). `connect_op` é a operação anunciada no bloco connect
 /// (`op_attach`/`op_create`/`op_service_attach`); `target` é o arquivo/serviço.
-pub(crate) async fn handshake(
+pub(crate) fn handshake(
     config: &ConnectConfig,
     connect_op: i32,
     target: &str,
 ) -> Result<Handshake> {
     config.validate()?;
-    let addr = (config.host.as_str(), config.port);
-    let sock = TcpStream::connect(addr).await?;
+    let sock = connect_socket(config)?;
     let mut stream = FbStream::new(sock);
 
     let mut srp = SrpClient::new(SrpHash::Sha256);
@@ -310,11 +328,11 @@ pub(crate) async fn handshake(
         w.put_i32(PTYPE_BATCH_SEND); // tipo máximo aceitável (sem lazy-send)
         w.put_i32((i + 1) as i32); // weight (peso)
     }
-    stream.send(&w).await?;
+    stream.send(&w)?;
     dbg_log("sent op_connect");
 
     // --- accept / autenticação ---------------------------------------------
-    let accept = read_accept(&mut stream).await?;
+    let accept = read_accept(&mut stream)?;
     // A versão chega como um USHORT com sinal estendido (ex.: 0xffff8013);
     // mantemos os 15 bits baixos para recuperar a versão base (flag removida).
     let protocol_version = accept.version & 0x7fff;
@@ -339,22 +357,57 @@ pub(crate) async fn handshake(
     // contrário, usamos a prova embutida no PB e as chaves do accept.
     let auth = match (auth, accept.cond, config.wire_crypt != WireCrypt::Disabled) {
         (Some(a), true, true) => {
-            let keys = continue_auth(&mut stream, &a).await?;
-            negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys).await?;
+            let keys = continue_auth(&mut stream, &a)?;
+            negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys)?;
             AuthState::Done
         }
         (Some(a), _, _) => {
-            negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+            negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys)?;
             AuthState::Proof(a)
         }
         (None, _, _) => {
-            negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys).await?;
+            negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys)?;
             AuthState::Legacy
         }
     };
-    dbg_log(&format!("crypt negotiated; encrypted={}", stream.is_encrypted()));
+    dbg_log(&format!(
+        "crypt negotiated; encrypted={}",
+        stream.is_encrypted()
+    ));
 
-    Ok(Handshake { stream, protocol_version, auth })
+    Ok(Handshake {
+        stream,
+        protocol_version,
+        auth,
+    })
+}
+
+fn connect_socket(config: &ConnectConfig) -> Result<TcpStream> {
+    let addrs: Vec<_> = (config.host.as_str(), config.port)
+        .to_socket_addrs()?
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::protocol("host resolution returned no addresses"));
+    }
+
+    let mut last_err = None;
+    for addr in addrs {
+        let result = match config.connect_timeout {
+            Some(timeout) => TcpStream::connect_timeout(&addr, timeout),
+            None => TcpStream::connect(addr),
+        };
+        match result {
+            Ok(sock) => return Ok(sock),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(Error::Timeout),
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no socket address resolved")
+        })
+        .into())
 }
 
 /// Calcula a prova SRP a partir do salt/B do servidor. Retorna `None` para um
@@ -391,14 +444,14 @@ fn compute_auth(
 /// servidores `WireCrypt=Required`: as chaves (com o nonce dos plugins ChaCha)
 /// só chegam após esta rodada. Layout do `op_cont_auth`:
 /// `data(prova, cstring) | name(plugin) | list(plugins) | keys(cstring vazia)`.
-async fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>> {
+fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>> {
     let mut w = op_packet(op::CONT_AUTH);
     w.put_str(&auth.proof_hex);
     w.put_str(&auth.plugin);
     w.put_str("Srp256,Srp,Legacy_Auth");
     w.put_bytes(&[]);
-    stream.send(&w).await?;
-    let resp = read_response(stream).await?;
+    stream.send(&w)?;
+    let resp = read_response(stream)?;
     Ok(resp.data)
 }
 
@@ -406,16 +459,16 @@ async fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>
 /// autenticação carregada no PB o servidor normalmente responde `op_response`
 /// diretamente, mas pode conduzir uma ou mais rodadas de `op_cont_auth` antes;
 /// absorva-as.
-pub(crate) async fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response::Response> {
+pub(crate) fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response::Response> {
     loop {
-        let code = read_op(stream).await?;
+        let code = read_op(stream)?;
         if code == op::RESPONSE {
-            return read_response_body(stream).await?.into_result();
+            return read_response_body(stream)?.into_result();
         } else if code == op::CONT_AUTH {
             // data, name, list, keys — consome e continua; o servidor virá
             // em seguida com o op_response real.
             for _ in 0..4 {
-                let _ = stream.read_bytes().await?;
+                let _ = stream.read_bytes()?;
             }
         } else {
             return Err(Error::protocol(format!(
@@ -427,7 +480,7 @@ pub(crate) async fn attach_response(stream: &mut FbStream) -> Result<crate::wire
 }
 
 /// Negocia a criptografia de comunicação (wire) conforme a postura [`WireCrypt`] requisitada.
-async fn negotiate_crypt(
+fn negotiate_crypt(
     stream: &mut FbStream,
     config: &ConnectConfig,
     session_key: Option<&[u8]>,
@@ -441,7 +494,9 @@ async fn negotiate_crypt(
         Some(k) => k,
         None => {
             if config.wire_crypt == WireCrypt::Required {
-                return Err(Error::auth("encryption required but no session key was negotiated"));
+                return Err(Error::auth(
+                    "encryption required but no session key was negotiated",
+                ));
             }
             return Ok(());
         }
@@ -466,13 +521,13 @@ async fn negotiate_crypt(
     let mut w = op_packet(op::CRYPT);
     w.put_str(plugin.name()); // plugin
     w.put_str("Symmetric"); // tipo de chave
-    stream.send(&w).await?;
+    stream.send(&w)?;
 
     // A partir daqui a comunicação (wire) está criptografada em ambas as direções.
     let (rd, wr) = make_ciphers(plugin, key, &nonce);
     stream.enable_encryption(rd, wr);
 
-    read_response(stream).await?;
+    read_response(stream)?;
     Ok(())
 }
 
@@ -530,7 +585,11 @@ fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
         off = end;
     }
 
-    push_cnct(&mut b, cnct::CLIENT_CRYPT, &wire_crypt_level(config.wire_crypt).to_le_bytes());
+    push_cnct(
+        &mut b,
+        cnct::CLIENT_CRYPT,
+        &wire_crypt_level(config.wire_crypt).to_le_bytes(),
+    );
     b
 }
 
@@ -573,7 +632,10 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> 
         pb.int(dpb::PARALLEL_WORKERS, workers);
     }
     if let Some(t) = config.connect_timeout {
-        pb.int(dpb::CONNECT_TIMEOUT, t.as_secs().clamp(1, i32::MAX as u64) as i32);
+        pb.int(
+            dpb::CONNECT_TIMEOUT,
+            t.as_secs().clamp(1, i32::MAX as u64) as i32,
+        );
     }
     if create && let Some(size) = config.page_size {
         pb.int(dpb::PAGE_SIZE, size);
@@ -612,16 +674,23 @@ fn hexdump(b: &[u8]) -> String {
 }
 
 fn os_user() -> Option<String> {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok().map(|mut s| {
-        s.truncate(255);
-        s
-    })
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .map(|mut s| {
+            s.truncate(255);
+            s
+        })
 }
 
 fn host_name() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
         .filter(|s| !s.is_empty())
         .map(|mut s| {
             s.truncate(255);

@@ -20,17 +20,23 @@ pub enum WireCrypt {
 /// Tudo o que é necessário para abrir uma conexão com um servidor Firebird.
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
+    /// Nome ou IP do servidor Firebird.
     pub host: String,
+    /// Porta TCP do servidor Firebird. O padrão do Firebird é `3050`.
     pub port: u16,
     /// Caminho ou alias do banco de dados no servidor (ex.: `employee` ou `/data/db.fdb`).
     pub database: String,
+    /// Nome do usuário Firebird.
     pub user: String,
+    /// Senha do usuário Firebird.
     pub password: String,
+    /// Papel SQL opcional usado na conexão (`ROLE`).
     pub role: Option<String>,
     /// Charset da conexão (padrão `UTF8`).
     pub charset: String,
     /// Dialeto SQL (padrão `3`).
     pub dialect: i32,
+    /// Política de criptografia da comunicação.
     pub wire_crypt: WireCrypt,
     /// Timeout de TCP + handshake.
     pub connect_timeout: Option<Duration>,
@@ -74,54 +80,67 @@ impl ConnectConfig {
         Self::default()
     }
 
+    /// Define o host ou IP do servidor Firebird.
     pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
         self
     }
+    /// Define a porta TCP do servidor Firebird.
     pub fn port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
+    /// Define o banco por alias ou caminho no servidor.
     pub fn database(mut self, db: impl Into<String>) -> Self {
         self.database = db.into();
         self
     }
+    /// Define o usuário Firebird.
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.user = user.into();
         self
     }
+    /// Define a senha do usuário Firebird.
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = password.into();
         self
     }
+    /// Define o papel SQL (`ROLE`) usado após o login.
     pub fn role(mut self, role: impl Into<String>) -> Self {
         self.role = Some(role.into());
         self
     }
+    /// Define o charset da conexão, como `UTF8`, `WIN1252` ou `ISO8859_1`.
     pub fn charset(mut self, charset: impl Into<String>) -> Self {
         self.charset = charset.into();
         self
     }
+    /// Define o dialeto SQL. Use `3` para bancos modernos.
     pub fn dialect(mut self, dialect: i32) -> Self {
         self.dialect = dialect;
         self
     }
+    /// Define se a comunicação deve ser criptografada, quando disponível ou obrigatoriamente.
     pub fn wire_crypt(mut self, wc: WireCrypt) -> Self {
         self.wire_crypt = wc;
         self
     }
+    /// Define o tempo máximo para abrir o socket TCP e completar o handshake.
     pub fn connect_timeout(mut self, t: Duration) -> Self {
         self.connect_timeout = Some(t);
         self
     }
+    /// Define o tamanho de página ao criar um banco novo com [`crate::Connection::create_database`].
     pub fn page_size(mut self, size: i32) -> Self {
         self.page_size = Some(size);
         self
     }
+    /// Define o fuso horário da sessão, por exemplo `America/Sao_Paulo`.
     pub fn timezone(mut self, tz: impl Into<String>) -> Self {
         self.timezone = Some(tz.into());
         self
     }
+    /// Define o número de workers paralelos solicitado ao servidor Firebird 5.
     pub fn parallel_workers(mut self, n: i32) -> Self {
         self.parallel_workers = Some(n);
         self
@@ -182,12 +201,17 @@ mod tests {
     fn over_long_password_is_rejected() {
         let cfg = ConnectConfig::new().password("x".repeat(256));
         let err = cfg.validate().unwrap_err();
-        assert!(matches!(err, Error::Conversion(_)), "esperava erro de conversão, veio {err:?}");
+        assert!(
+            matches!(err, Error::Conversion(_)),
+            "esperava erro de conversão, veio {err:?}"
+        );
     }
 
     #[test]
     fn max_length_fields_pass() {
-        let cfg = ConnectConfig::new().role("r".repeat(255)).charset("c".repeat(255));
+        let cfg = ConnectConfig::new()
+            .role("r".repeat(255))
+            .charset("c".repeat(255));
         assert!(cfg.validate().is_ok());
     }
 }

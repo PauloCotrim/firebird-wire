@@ -1,12 +1,14 @@
 # Guia de uso do `fdb_driver`
 
-Driver **assíncrono e puramente em Rust** para **Firebird 5+**, falando o
+Driver **síncrono e puramente em Rust** para **Firebird 5+**, falando o
 protocolo nativo (wire protocol v19) direto sobre TCP — **sem `libfbclient`**.
-Construído sobre [Tokio](https://tokio.rs).
 
 > Estado: trabalho em andamento, mas a superfície principal já está implementada
 > e validada ao vivo contra um Firebird 5.0.3 real. Veja o
 > [checklist de recursos](#recursos-implementados) ao final.
+
+Se você está começando agora, leia primeiro o [COMECE-AQUI.md](COMECE-AQUI.md).
+Este guia é a referência completa, com mais opções e recursos avançados.
 
 ## Índice
 
@@ -46,14 +48,10 @@ O driver ainda não está publicado no crates.io; use por caminho/git no
 ```toml
 [dependencies]
 fdb_driver = { path = "../fdb_driver" }   # ou git = "..."
-tokio = { version = "1", features = ["full"] }
 ```
 
-Tudo é assíncrono, então você precisa de um runtime Tokio:
-
 ```rust
-#[tokio::main]
-async fn main() -> fdb_driver::Result<()> {
+fn main() -> fdb_driver::Result<()> {
     // ... seu código ...
     Ok(())
 }
@@ -80,12 +78,12 @@ let cfg = ConnectConfig::new()
     .charset("UTF8")          // padrão UTF8
     .dialect(3);              // padrão 3
 
-let mut conn = Connection::connect(&cfg).await?;
+let mut conn = Connection::connect(&cfg)?;
 println!("protocolo v{}, criptografado={}",
     conn.protocol_version(), conn.is_encrypted());
 
-conn.ping().await?;
-conn.close().await?;          // detach explícito
+conn.ping()?;
+conn.close()?;          // detach explícito
 ```
 
 Opções adicionais do builder: `.role(...)`, `.timezone("America/Sao_Paulo")`,
@@ -101,7 +99,7 @@ let cfg = ConnectConfig::new()
     .user("SYSDBA").password("masterkey")
     .page_size(8192);
 
-let mut conn = Connection::create_database(&cfg).await?;
+let mut conn = Connection::create_database(&cfg)?;
 ```
 
 ---
@@ -112,16 +110,16 @@ Toda leitura/escrita acontece dentro de uma transação. `begin()` usa os padrõ
 (snapshot, leitura-escrita, *wait*):
 
 ```rust
-let tx = conn.begin().await?;
+let tx = conn.begin()?;
 // ... use tx ...
-tx.commit(&mut conn).await?;     // ou tx.rollback(&mut conn).await?
+tx.commit(&mut conn)?;     // ou tx.rollback(&mut conn)?
 ```
 
 `commit`/`rollback` **consomem** a transação. Para manter o contexto ativo após
 gravar, use as variantes *retaining* (que tomam `&self`):
 
 ```rust
-tx.commit_retaining(&mut conn).await?;   // grava, mas mantém a tx
+tx.commit_retaining(&mut conn)?;   // grava, mas mantém a tx
 ```
 
 ### Parâmetros de transação
@@ -135,7 +133,7 @@ let tx = conn.begin_with(
         .read_only()
         .no_wait()
         .lock_timeout(5),
-).await?;
+)?;
 ```
 
 Níveis disponíveis em `IsolationLevel`: `Snapshot` (concorrência),
@@ -152,12 +150,12 @@ usar uma transação sua:
 
 ```rust
 // DDL com transação implícita (commit automático):
-conn.exec_immediate(None, "CREATE TABLE t (id INTEGER, nome VARCHAR(40))").await?;
+conn.exec_immediate(None, "CREATE TABLE t (id INTEGER, nome VARCHAR(40))")?;
 
 // DML dentro de uma transação existente:
-let tx = conn.begin().await?;
-conn.exec_immediate(Some(&tx), "DELETE FROM t WHERE id < 0").await?;
-tx.commit(&mut conn).await?;
+let tx = conn.begin()?;
+conn.exec_immediate(Some(&tx), "DELETE FROM t WHERE id < 0")?;
+tx.commit(&mut conn)?;
 ```
 
 ---
@@ -165,25 +163,25 @@ tx.commit(&mut conn).await?;
 ## Consultas (prepared statements)
 
 ```rust
-let tx = conn.begin().await?;
-let mut stmt = conn.prepare(&tx, "SELECT id, nome FROM t ORDER BY id").await?;
-stmt.execute(&mut conn, &tx, &[]).await?;          // sem parâmetros
+let tx = conn.begin()?;
+let mut stmt = conn.prepare(&tx, "SELECT id, nome FROM t ORDER BY id")?;
+stmt.execute(&mut conn, &tx, &[])?;          // sem parâmetros
 
 // Uma linha por vez:
-while let Some(row) = stmt.fetch(&mut conn).await? {
+while let Some(row) = stmt.fetch(&mut conn)? {
     let id = row[0].as_i64().unwrap_or_default();
     let nome = row[1].as_str().unwrap_or("");
     println!("{id} -> {nome}");
 }
 
-stmt.drop_statement(&mut conn).await?;   // libera a instrução no servidor
-tx.commit(&mut conn).await?;
+stmt.drop_statement(&mut conn)?;   // libera a instrução no servidor
+tx.commit(&mut conn)?;
 ```
 
 Ou tudo de uma vez com `fetch_all`:
 
 ```rust
-let rows: Vec<Vec<fdb_driver::Value>> = stmt.fetch_all(&mut conn).await?;
+let rows: Vec<Vec<fdb_driver::Value>> = stmt.fetch_all(&mut conn)?;
 println!("{} linhas", rows.len());
 ```
 
@@ -197,12 +195,12 @@ Os `?` posicionais são preenchidos por um slice de `Value`, na ordem:
 ```rust
 use fdb_driver::Value;
 
-let mut stmt = conn.prepare(&tx, "SELECT nome FROM t WHERE id = ?").await?;
-stmt.execute(&mut conn, &tx, &[Value::Int(42)]).await?;
-if let Some(row) = stmt.fetch(&mut conn).await? {
+let mut stmt = conn.prepare(&tx, "SELECT nome FROM t WHERE id = ?")?;
+stmt.execute(&mut conn, &tx, &[Value::Int(42)])?;
+if let Some(row) = stmt.fetch(&mut conn)? {
     println!("nome = {:?}", row[0].as_str());
 }
-stmt.drop_statement(&mut conn).await?;
+stmt.drop_statement(&mut conn)?;
 ```
 
 Quão grande é cada lote de `op_fetch` pode ser ajustado (compromisso entre
@@ -216,22 +214,22 @@ stmt.set_fetch_size(1000);
 
 ## Streaming de linhas
 
-`Statement::rows(&mut conn)` devolve um [`RowStream`] — um iterador assíncrono
+`Statement::rows(&mut conn)` devolve um [`RowStream`] — um iterador síncrono
 que entrega uma linha por vez **sem materializar todo o resultado** (busca lotes
-sob demanda). É um *lending iterator* (`next().await`), não um `futures::Stream`.
+sob demanda). É um *lending iterator* (`try_next()`), não um `Iterator` padrão.
 
 ```rust
-let mut stmt = conn.prepare(&tx, "SELECT id FROM t").await?;
-stmt.execute(&mut conn, &tx, &[]).await?;
+let mut stmt = conn.prepare(&tx, "SELECT id FROM t")?;
+stmt.execute(&mut conn, &tx, &[])?;
 
 let mut rows = stmt.rows(&mut conn);
-while let Some(row) = rows.next().await? {
+while let Some(row) = rows.try_next()? {
     println!("{:?}", row[0]);
 }
 ```
 
-Atalhos: `rows(&mut conn).try_collect().await?` (coleta num `Vec`) e
-`rows(&mut conn).try_for_each(|row| { /* ... */ Ok(()) }).await?`.
+Atalhos: `rows(&mut conn).try_collect()?` (coleta num `Vec`) e
+`rows(&mut conn).try_for_each(|row| { /* ... */ Ok(()) })?`.
 
 ---
 
@@ -258,6 +256,19 @@ pub enum Value {
     DecFloat(DecFloat),  // DECFLOAT(16)/DECFLOAT(34)
 }
 ```
+
+Para parâmetros, os tipos Rust mais comuns implementam `Into<Value>`:
+
+```rust
+let id: i32 = 42;
+let nome = "Ana";
+let ativo = true;
+
+stmt.execute(&mut conn, &tx, &[id.into(), nome.into(), ativo.into()])?;
+```
+
+Conversões disponíveis: `bool`, `i16`, `i32`, `i64`, `i128`, `f32`, `f64`,
+`String`, `&str`, `Vec<u8>` e `&[u8]`.
 
 Acessores convenientes (devolvem `Option`):
 
@@ -301,8 +312,8 @@ if let Value::Int128(v) = row[1] {
 > receber os tipos nativos, peça-os na sessão antes da consulta:
 >
 > ```rust
-> conn.exec_immediate(None, "SET BIND OF INT128 TO NATIVE").await?;
-> conn.exec_immediate(None, "SET BIND OF DECFLOAT TO NATIVE").await?;
+> conn.exec_immediate(None, "SET BIND OF INT128 TO NATIVE")?;
+> conn.exec_immediate(None, "SET BIND OF DECFLOAT TO NATIVE")?;
 > ```
 
 DECFLOAT por enquanto é só **leitura**: passar um `Value::DecFloat` como
@@ -337,14 +348,14 @@ let cts = row[2].as_civil_timestamp();   // Option<CivilTimestamp>
 ## INSERT/UPDATE/DELETE e linhas afetadas
 
 ```rust
-let mut stmt = conn.prepare(&tx, "UPDATE t SET nome = ? WHERE id = ?").await?;
-stmt.execute(&mut conn, &tx, &[Value::Text("novo".into()), Value::Int(42)]).await?;
+let mut stmt = conn.prepare(&tx, "UPDATE t SET nome = ? WHERE id = ?")?;
+stmt.execute(&mut conn, &tx, &[Value::Text("novo".into()), Value::Int(42)])?;
 
-let aff = stmt.rows_affected(&mut conn).await?;
+let aff = stmt.rows_affected(&mut conn)?;
 println!("{} linha(s) modificada(s)", aff.total_modified());
 
-stmt.drop_statement(&mut conn).await?;
-tx.commit(&mut conn).await?;
+stmt.drop_statement(&mut conn)?;
+tx.commit(&mut conn)?;
 ```
 
 ---
@@ -355,16 +366,16 @@ Marque o statement como rolável **antes** do `execute` (precisa de FB5/protocol
 ≥ 17 — confira com `conn.supports_fetch_scroll()`):
 
 ```rust
-let mut stmt = conn.prepare(&tx, "SELECT id FROM t ORDER BY id").await?;
+let mut stmt = conn.prepare(&tx, "SELECT id FROM t ORDER BY id")?;
 stmt.set_scrollable(true);
-stmt.execute(&mut conn, &tx, &[]).await?;
+stmt.execute(&mut conn, &tx, &[])?;
 
-let primeira = stmt.fetch_first(&mut conn).await?;
-let ultima   = stmt.fetch_last(&mut conn).await?;
-let anterior = stmt.fetch_prior(&mut conn).await?;
-let proxima  = stmt.fetch_next(&mut conn).await?;
-let terceira = stmt.fetch_absolute(&mut conn, 3).await?;   // posição 1-based
-let pula2    = stmt.fetch_relative(&mut conn, 2).await?;    // deslocamento com sinal
+let primeira = stmt.fetch_first(&mut conn)?;
+let ultima   = stmt.fetch_last(&mut conn)?;
+let anterior = stmt.fetch_prior(&mut conn)?;
+let proxima  = stmt.fetch_next(&mut conn)?;
+let terceira = stmt.fetch_absolute(&mut conn, 3)?;   // posição 1-based
+let pula2    = stmt.fetch_relative(&mut conn, 2)?;    // deslocamento com sinal
 ```
 
 `None` significa que a posição caiu fora do conjunto. Há também o método de baixo
@@ -378,38 +389,38 @@ nível `fetch_scroll(&mut conn, direction, offset)` (constantes em `wire::consts
 
 ```rust
 // Escrever: devolve o id do BLOB para usar como parâmetro.
-let blob_id: u64 = conn.write_blob(&tx, b"conteudo grande...").await?;
+let blob_id: u64 = conn.write_blob(&tx, b"conteudo grande...")?;
 
-let mut stmt = conn.prepare(&tx, "INSERT INTO docs (corpo) VALUES (?)").await?;
-stmt.execute(&mut conn, &tx, &[Value::Blob(blob_id)]).await?;
-stmt.drop_statement(&mut conn).await?;
+let mut stmt = conn.prepare(&tx, "INSERT INTO docs (corpo) VALUES (?)")?;
+stmt.execute(&mut conn, &tx, &[Value::Blob(blob_id)])?;
+stmt.drop_statement(&mut conn)?;
 
 // Ler: pegue o id de uma coluna BLOB e leia o conteúdo.
-let mut q = conn.prepare(&tx, "SELECT corpo FROM docs").await?;
-q.execute(&mut conn, &tx, &[]).await?;
-if let Some(row) = q.fetch(&mut conn).await? {
+let mut q = conn.prepare(&tx, "SELECT corpo FROM docs")?;
+q.execute(&mut conn, &tx, &[])?;
+if let Some(row) = q.fetch(&mut conn)? {
     if let Value::Blob(id) = row[0] {
-        let bytes = conn.read_blob(&tx, id).await?;
+        let bytes = conn.read_blob(&tx, id)?;
         println!("{} bytes", bytes.len());
     }
 }
-q.drop_statement(&mut conn).await?;
+q.drop_statement(&mut conn)?;
 ```
 
 ### Escrita em partes (streaming) e leitura por segmentos
 
 ```rust
 // Escrita incremental:
-let writer = conn.create_blob(&tx).await?;
-writer.write(&mut conn, b"parte 1 ").await?;
-writer.write(&mut conn, b"parte 2").await?;
-let blob_id = writer.close(&mut conn).await?;   // devolve o id
-// (use writer.cancel(&mut conn).await? para descartar em caso de erro)
+let writer = conn.create_blob(&tx)?;
+writer.write(&mut conn, b"parte 1 ")?;
+writer.write(&mut conn, b"parte 2")?;
+let blob_id = writer.close(&mut conn)?;   // devolve o id
+// (use writer.cancel(&mut conn)? para descartar em caso de erro)
 
 // Leitura incremental:
-let mut blob = conn.open_blob(&tx, blob_id).await?;
-let tudo = blob.read_to_end(&mut conn).await?;  // ou read_segment em laço
-blob.close(&mut conn).await?;
+let mut blob = conn.open_blob(&tx, blob_id)?;
+let tudo = blob.read_to_end(&mut conn)?;  // ou read_segment em laço
+blob.close(&mut conn)?;
 ```
 
 ---
@@ -424,23 +435,23 @@ Primeiro obtenha o descritor da coluna com `array_desc` (ele consulta o catálog
 
 ```rust
 // Tabela exemplo: CREATE TABLE t (id INTEGER, nums INTEGER[1:4])
-let desc = conn.array_desc(&tx, "T", "NUMS").await?;   // nomes como no catálogo
+let desc = conn.array_desc(&tx, "T", "NUMS")?;   // nomes como no catálogo
 assert_eq!(desc.element_count(), 4);
 
 // Escrever: cria o array e devolve um id, que vai como parâmetro no INSERT.
 let nums = [Value::Int(10), Value::Int(20), Value::Int(30), Value::Int(40)];
-let nums_id = conn.write_array(&tx, &desc, &nums).await?;
-let mut ins = conn.prepare(&tx, "INSERT INTO t (id, nums) VALUES (1, ?)").await?;
-ins.execute(&mut conn, &tx, &[Value::Array(nums_id)]).await?;
-ins.drop_statement(&mut conn).await?;
+let nums_id = conn.write_array(&tx, &desc, &nums)?;
+let mut ins = conn.prepare(&tx, "INSERT INTO t (id, nums) VALUES (1, ?)")?;
+ins.execute(&mut conn, &tx, &[Value::Array(nums_id)])?;
+ins.drop_statement(&mut conn)?;
 
 // Ler: pegue o id da coluna ARRAY e leia os elementos com o mesmo descritor.
-let mut q = conn.prepare(&tx, "SELECT nums FROM t WHERE id = 1").await?;
-q.execute(&mut conn, &tx, &[]).await?;
-let row = q.fetch(&mut conn).await?.unwrap();
-q.drop_statement(&mut conn).await?;
+let mut q = conn.prepare(&tx, "SELECT nums FROM t WHERE id = 1")?;
+q.execute(&mut conn, &tx, &[])?;
+let row = q.fetch(&mut conn)?.unwrap();
+q.drop_statement(&mut conn)?;
 if let Value::Array(id) = row[0] {
-    let elems = conn.read_array(&tx, id, &desc).await?;   // Vec<Value>, em ordem
+    let elems = conn.read_array(&tx, id, &desc)?;   // Vec<Value>, em ordem
     println!("{elems:?}");
 }
 ```
@@ -450,9 +461,9 @@ Arrays **multidimensionais** funcionam do mesmo jeito — `array_desc` traz uma
 
 ```rust
 // CREATE TABLE g (id INTEGER, grid INTEGER[1:2, 1:3])  → 6 elementos
-let desc = conn.array_desc(&tx, "G", "GRID").await?;
+let desc = conn.array_desc(&tx, "G", "GRID")?;
 let grid: Vec<Value> = (1..=6).map(Value::Int).collect();
-let id = conn.write_array(&tx, &desc, &grid).await?;
+let id = conn.write_array(&tx, &desc, &grid)?;
 // ... INSERT/SELECT e read_array como acima.
 ```
 
@@ -471,19 +482,19 @@ preparada, acumulando as mensagens no cliente e enviando num único *round-trip*
 Muito mais rápido que executar linha a linha.
 
 ```rust
-let tx = conn.begin().await?;
-let mut batch = conn.create_batch(&tx, "INSERT INTO t (id, nome) VALUES (?, ?)").await?;
+let tx = conn.begin()?;
+let mut batch = conn.create_batch(&tx, "INSERT INTO t (id, nome) VALUES (?, ?)")?;
 
 for (id, nome) in [(1, "um"), (2, "dois"), (3, "tres")] {
     batch.add(&[Value::Int(id), Value::Text(nome.into())])?;   // só acumula
 }
 
-let result = batch.execute(&mut conn, &tx).await?;   // envia + executa
+let result = batch.execute(&mut conn, &tx)?;   // envia + executa
 println!("total={} afetadas={}", result.total, result.total_affected());
 assert!(result.all_succeeded());
 
-batch.close(&mut conn).await?;   // libera o batch e a instrução
-tx.commit(&mut conn).await?;
+batch.close(&mut conn)?;   // libera o batch e a instrução
+tx.commit(&mut conn)?;
 ```
 
 ### Erros por linha
@@ -498,7 +509,7 @@ linha. `BatchResult` traz:
 - `all_succeeded()` e `total_affected()`.
 
 ```rust
-let result = batch.execute(&mut conn, &tx).await?;
+let result = batch.execute(&mut conn, &tx)?;
 if !result.all_succeeded() {
     for e in &result.errors {
         eprintln!("linha {} falhou: {}", e.message_index, e.error);
@@ -506,7 +517,7 @@ if !result.all_succeeded() {
 }
 ```
 
-`batch.cancel(&mut conn).await?` descarta o que ainda não foi executado; o batch
+`batch.cancel(&mut conn)?` descarta o que ainda não foi executado; o batch
 pode ser reutilizado (adicione mais linhas e execute de novo).
 
 ---
@@ -519,21 +530,21 @@ na linha:
 
 ```rust
 let mut batch = conn.create_batch(
-    &tx, "INSERT INTO docs (id, corpo) VALUES (?, ?)").await?;
+    &tx, "INSERT INTO docs (id, corpo) VALUES (?, ?)")?;
 
 for (i, dados) in [b"primeiro".as_slice(), b"segundo"].iter().enumerate() {
     let blob_id = batch.add_blob(dados)?;                       // bufferiza o blob
     batch.add(&[Value::Int(i as i32), Value::Blob(blob_id)])?;  // referencia na linha
 }
-let r = batch.execute(&mut conn, &tx).await?;
-batch.close(&mut conn).await?;
+let r = batch.execute(&mut conn, &tx)?;
+batch.close(&mut conn)?;
 ```
 
 Outras opções de blob em batch:
 
 - **Reaproveitar um BLOB já gravado** (sem reenviar os dados):
   ```rust
-  let existente = conn.write_blob(&tx, b"...").await?;
+  let existente = conn.write_blob(&tx, b"...")?;
   let id_local = batch.register_blob(existente)?;     // op_batch_regblob
   batch.add(&[Value::Int(1), Value::Blob(id_local)])?;
   ```
@@ -548,24 +559,24 @@ Outras opções de blob em batch:
 ## Eventos do banco
 
 Uma conexão pode aguardar **eventos** postados por outra (`POST_EVENT`), por um
-canal auxiliar assíncrono. Útil para invalidação de cache / notificações sem
+canal auxiliar síncrono. Útil para invalidação de cache / notificações sem
 *polling*.
 
 ```rust
 // Conexão A: registra e aguarda.
-let mut ev = conn.listen_events(&["estoque_mudou", "preco_mudou"]).await?;
-let disparados = ev.wait(&mut conn).await?;   // bloqueia até um POST_EVENT
+let mut ev = conn.listen_events(&["estoque_mudou", "preco_mudou"])?;
+let disparados = ev.wait(&mut conn)?;   // bloqueia até um POST_EVENT
 println!("dispararam: {disparados:?}");        // ex.: ["estoque_mudou"]
-ev.cancel(&mut conn).await?;                    // encerra o registro
+ev.cancel(&mut conn)?;                    // encerra o registro
 
 // Conexão B (em outro lugar): dispara o evento ao commitar.
 conn_b.exec_immediate(None,
-    "EXECUTE BLOCK AS BEGIN POST_EVENT 'estoque_mudou'; END").await?;
+    "EXECUTE BLOCK AS BEGIN POST_EVENT 'estoque_mudou'; END")?;
 // (ou um POST_EVENT dentro de um trigger / stored procedure)
 ```
 
 `wait` re-registra automaticamente, então pode ser chamado num laço para reagir a
-postagens sucessivas. Combine com `tokio::time::timeout` se quiser um tempo
+postagens sucessivas. Use uma thread ou canal com timeout se quiser limitar o tempo
 máximo de espera.
 
 ## Pool de conexões
@@ -579,11 +590,11 @@ let pool = Pool::new(cfg, PoolConfig {
     acquisition_timeout: Some(Duration::from_secs(5)),
 });
 
-let mut conn = pool.get().await?;     // PooledConnection: deref para Connection
-conn.ping().await?;
-let tx = conn.begin().await?;
+let mut conn = pool.get()?;     // PooledConnection: deref para Connection
+conn.ping()?;
+let tx = conn.begin()?;
 // ... use normalmente ...
-tx.commit(&mut conn).await?;
+tx.commit(&mut conn)?;
 drop(conn);                            // devolve ao pool automaticamente
 // conn.discard() descarta em vez de devolver (ex.: conexão suspeita).
 ```
@@ -591,6 +602,12 @@ drop(conn);                            // devolve ao pool automaticamente
 `PooledConnection` faz *deref* para `Connection`, então todos os métodos de
 conexão funcionam direto. O semáforo limita em `max_size`; `get()` aguarda (até o
 timeout) quando o pool está cheio.
+
+O pool não executa `ping` antes de entregar uma conexão ociosa. Ele só reutiliza
+conexões que ainda parecem saudáveis localmente; se o servidor tiver fechado o
+socket em silêncio, a próxima operação vai revelar o erro e a conexão será
+descartada ao voltar para o pool. Chame `conn.ping()?` após `pool.get()?` quando
+for mais importante detectar essa condição antes do primeiro comando real.
 
 ---
 
@@ -645,15 +662,15 @@ uma conexão, mas no "banco" especial `service_mgr`). Serve para backup/restore
 ```rust
 use fdb_driver::ServiceManager;
 
-let mut svc = ServiceManager::attach(&cfg).await?;
+let mut svc = ServiceManager::attach(&cfg)?;
 
 // Consultas de info:
-println!("{}", svc.server_version().await?);
-println!("{}", svc.implementation().await?);
-println!("{}", svc.security_database().await?);
-let log = svc.get_fb_log().await?;          // firebird.log
+println!("{}", svc.server_version()?);
+println!("{}", svc.implementation()?);
+println!("{}", svc.security_database()?);
+let log = svc.get_fb_log()?;          // firebird.log
 
-svc.close().await?;
+svc.close()?;
 ```
 
 ### Backup, restore e estatísticas
@@ -664,14 +681,14 @@ voltam como `String`. As opções são bitmasks em `svc_bkp::*` / `svc_res::*` /
 
 ```rust
 // Backup: (banco, arquivo .fbk, opções)
-let out = svc.backup("employee", "/srv/bkp/emp.fbk", 0).await?;
+let out = svc.backup("employee", "/srv/bkp/emp.fbk", 0)?;
 
 // Restore: (arquivo .fbk, banco destino, opções) — CREATE é o padrão.
 use fdb_driver::wire::consts::svc_res;
-let out = svc.restore("/srv/bkp/emp.fbk", "/srv/db/emp2.fdb", svc_res::REPLACE).await?;
+let out = svc.restore("/srv/bkp/emp.fbk", "/srv/db/emp2.fdb", svc_res::REPLACE)?;
 
 // Estatísticas (gstat): (banco, opções)
-let stats = svc.statistics("employee", 0).await?;
+let stats = svc.statistics("employee", 0)?;
 ```
 
 ### Gestão de usuários
@@ -682,19 +699,19 @@ use fdb_driver::{UserParams};
 // Criar:
 svc.add_user(&UserParams::new("MARIA")
     .password("s3nh4")
-    .first_name("Maria").last_name("Silva")).await?;
+    .first_name("Maria").last_name("Silva"))?;
 
 // Alterar (só os campos presentes mudam):
-svc.modify_user(&UserParams::new("MARIA").last_name("Souza")).await?;
+svc.modify_user(&UserParams::new("MARIA").last_name("Souza"))?;
 
 // Listar / consultar:
-for u in svc.display_users().await? {
+for u in svc.display_users()? {
     println!("{} ({} {})", u.username, u.first_name, u.last_name);
 }
-let um = svc.display_user("MARIA").await?;    // Option<UserInfo>
+let um = svc.display_user("MARIA")?;    // Option<UserInfo>
 
 // Remover:
-svc.delete_user("MARIA").await?;
+svc.delete_user("MARIA")?;
 ```
 
 Para ações de baixo nível há `svc.start(spb)` / `svc.run(spb)` (dispara + drena a
@@ -744,7 +761,7 @@ handshake. Confira com `conn.is_encrypted()`.
 | `Unsupported(String)` | recurso não suportado |
 
 ```rust
-match conn.prepare(&tx, "SELECT * FROM inexistente").await {
+match conn.prepare(&tx, "SELECT * FROM inexistente") {
     Ok(stmt) => { /* ... */ }
     Err(fdb_driver::Error::Database(db)) => eprintln!("erro do servidor: {db}"),
     Err(e) => eprintln!("outro erro: {e}"),
@@ -766,7 +783,7 @@ chame o método de fechamento adequado:
 Em *builds* de debug, soltar um desses sem fechar emite um aviso
 (`[fdb] aviso: ... foi descartado sem fechar/liberar ...`) para ajudar a achar
 vazamentos de handle. (Não há fechamento automático porque `Drop` não pode ser
-assíncrono.)
+síncrono.)
 
 ---
 
@@ -802,7 +819,7 @@ assíncrono.)
 
 O backlog funcional está fechado; o que resta é opcional/ergonômico:
 
-- ⬜ Adaptador `futures::Stream` (hoje o streaming é *lending iterator*)
+- ⬜ Adaptador `Iterator` (hoje o streaming é *lending iterator*)
 - ⬜ Escalar a largura do elemento de arrays de texto pelo charset da conexão
   (para ler arrays `NONE` por conexão `UTF8` sem casar os charsets)
 

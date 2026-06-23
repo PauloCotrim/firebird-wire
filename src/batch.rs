@@ -5,12 +5,12 @@
 //! ida só. É muito mais rápido que executar a instrução linha a linha.
 //!
 //! ```text
-//! let mut batch = conn.create_batch(&tx, "INSERT INTO t (a, b) VALUES (?, ?)").await?;
+//! let mut batch = conn.create_batch(&tx, "INSERT INTO t (a, b) VALUES (?, ?)")?;
 //! batch.add(&[Value::Int(1), Value::Text("um".into())])?;
 //! batch.add(&[Value::Int(2), Value::Text("dois".into())])?;
-//! let result = batch.execute(&mut conn, &tx).await?;   // envia + executa
+//! let result = batch.execute(&mut conn, &tx)?;   // envia + executa
 //! println!("{} linhas afetadas no total", result.total_affected());
-//! batch.close(&mut conn).await?;                        // libera no servidor
+//! batch.close(&mut conn)?;                        // libera no servidor
 //! ```
 //!
 //! # Protocolo (FB4+, op codes 99–103)
@@ -64,7 +64,7 @@
 use crate::blr::message_blr;
 use crate::connection::Connection;
 use crate::error::{DatabaseError, Error, Result, StatusVector};
-use crate::message::{encode_row, message_buffer_len};
+use crate::message::{encode_row_into, message_buffer_len};
 use crate::transaction::Transaction;
 use crate::value::{ColumnMeta, Value};
 use crate::wire::consts::*;
@@ -198,14 +198,17 @@ impl Batch {
             // *buffer* do servidor, que usa cabeçalho de 2 bytes alinhado a
             // `BLOB_SEGHDR_ALIGN`: `size = align2(2 + len)`. Ver `xdr_blob_stream`.
             let size_field = align_up(2 + data.len(), BLOB_SEGHDR_ALIGN);
-            self.pending_blobs.extend_from_slice(&(size_field as u32).to_be_bytes());
+            self.pending_blobs
+                .extend_from_slice(&(size_field as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
-            self.pending_blobs.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            self.pending_blobs
+                .extend_from_slice(&(data.len() as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(data);
             self.blob_stream_len += align_up(16 + size_field, BLOB_ALIGN);
         } else {
             // Blob de stream (não segmentado): dados crus.
-            self.pending_blobs.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            self.pending_blobs
+                .extend_from_slice(&(data.len() as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
             self.pending_blobs.extend_from_slice(data);
             self.blob_stream_len += align_up(16 + data.len(), BLOB_ALIGN);
@@ -270,8 +273,9 @@ impl Batch {
     /// tipo, aos parâmetros da instrução (ver [`Self::params`]). Apenas acumula
     /// na memória; nada vai à rede até [`Self::execute`].
     pub fn add(&mut self, values: &[Value]) -> Result<()> {
-        let msg = encode_row(&self.params, values, self.charset)?;
-        self.pending.extend_from_slice(&msg);
+        // Codifica direto no buffer pendente (sem Vec temporário por linha). Em erro,
+        // `encode_row_into` restaura o tamanho de `pending`, então não corrompe o lote.
+        encode_row_into(&mut self.pending, &self.params, values, self.charset)?;
         self.pending_count += 1;
         Ok(())
     }
@@ -279,7 +283,7 @@ impl Batch {
     /// Envia as mensagens acumuladas e executa o lote, retornando o estado de
     /// conclusão (contagens por linha e erros por linha). Esvazia o buffer
     /// pendente; o batch pode então ser reutilizado.
-    pub async fn execute(&mut self, conn: &mut Connection, tx: &Transaction) -> Result<BatchResult> {
+    pub fn execute(&mut self, conn: &mut Connection, tx: &Transaction) -> Result<BatchResult> {
         if self.closed {
             return Err(Error::protocol("batch já foi fechado"));
         }
@@ -288,8 +292,8 @@ impl Batch {
             let mut w = op_packet(op::BATCH_SET_BPB);
             w.put_i32(self.handle);
             w.put_bytes(&bpb); // cstring: len(4) + bpb + pad
-            conn.io().send(&w).await?;
-            read_response(conn.io()).await?;
+            conn.io().send(&w)?;
+            read_response(conn.io())?;
         }
         // 0b. Envia os BLOBs pendentes (op_batch_blob_stream) ANTES das mensagens,
         //    pois cada mensagem referencia um id de blob já registrado.
@@ -301,8 +305,8 @@ impl Batch {
             // e a próxima op pode começar em offset não múltiplo de 4.
             w.put_i32(self.blob_stream_len as i32);
             w.put_raw(&self.pending_blobs);
-            conn.io().send(&w).await?;
-            read_response(conn.io()).await?;
+            conn.io().send(&w)?;
+            read_response(conn.io())?;
             self.pending_blobs.clear();
             self.blob_stream_len = 0;
         }
@@ -314,8 +318,8 @@ impl Batch {
                 w.put_i32(self.handle);
                 w.put_raw(&existing_id.to_be_bytes());
                 w.put_raw(&batch_id.to_be_bytes());
-                conn.io().send(&w).await?;
-                read_response(conn.io()).await?;
+                conn.io().send(&w)?;
+                read_response(conn.io())?;
             }
         }
         // 1. Envia as mensagens pendentes (op_batch_msg), se houver.
@@ -325,8 +329,8 @@ impl Batch {
             w.put_i32(self.pending_count as i32);
             w.put_raw(&self.pending);
             w.align();
-            conn.io().send(&w).await?;
-            read_response(conn.io()).await?;
+            conn.io().send(&w)?;
+            read_response(conn.io())?;
             self.pending.clear();
             self.pending_count = 0;
         }
@@ -335,13 +339,13 @@ impl Batch {
         let mut w = op_packet(op::BATCH_EXEC);
         w.put_i32(self.handle);
         w.put_i32(tx.handle());
-        conn.io().send(&w).await?;
-        read_batch_cs(conn).await
+        conn.io().send(&w)?;
+        read_batch_cs(conn)
     }
 
     /// Descarta as mensagens acumuladas que ainda não foram executadas
     /// (`op_batch_cancel`). Não afeta linhas já executadas em chamadas anteriores.
-    pub async fn cancel(&mut self, conn: &mut Connection) -> Result<()> {
+    pub fn cancel(&mut self, conn: &mut Connection) -> Result<()> {
         self.pending.clear();
         self.pending_count = 0;
         self.pending_blobs.clear();
@@ -349,25 +353,25 @@ impl Batch {
         self.pending_regblobs.clear();
         let mut w = op_packet(op::BATCH_CANCEL);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(())
     }
 
     /// Libera o batch e a instrução preparada no servidor (`op_batch_rls` +
     /// `op_free_statement` com `DSQL_drop`), consumindo o handle.
-    pub async fn close(mut self, conn: &mut Connection) -> Result<()> {
+    pub fn close(mut self, conn: &mut Connection) -> Result<()> {
         self.closed = true;
         let mut w = op_packet(op::BATCH_RLS);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
 
         let mut w = op_packet(op::FREE_STATEMENT);
         w.put_i32(self.handle);
         w.put_i32(free::DROP);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(())
     }
 }
@@ -380,15 +384,72 @@ impl Drop for Batch {
     }
 }
 
-impl Connection {
-    /// Prepara uma instrução e cria um lote (batch) sobre ela. A instrução deve
-    /// ter parâmetros (`?`) — cada [`Batch::add`] fornece uma linha de valores.
+/// Opções de criação de um [`Batch`] (clumplets do `op_batch_create`).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchOptions {
+    /// Se `true`, o servidor CONTINUA após uma linha falhar, executando as demais e
+    /// reportando o erro de cada uma em [`BatchResult::errors`]. Para isso ele
+    /// bracketa cada linha num savepoint interno — o que tem **custo por linha**.
     ///
-    /// O servidor reporta as contagens de linhas afetadas por mensagem
-    /// (`TAG_RECORD_COUNTS`) e continua após erros por linha (`TAG_MULTIERROR`),
-    /// de modo que [`BatchResult`] traz o resultado completo de cada linha.
-    pub async fn create_batch(&mut self, tx: &Transaction, sql: &str) -> Result<Batch> {
-        let mut stmt = self.prepare(tx, sql).await?;
+    /// Se `false` (**padrão**), o lote PARA na primeira linha que falha (fail-fast):
+    /// é bem mais rápido (sem savepoint por linha) e é o que se quer quando a
+    /// transação é "tudo ou nada" e qualquer erro aborta a operação inteira.
+    pub multierror: bool,
+    /// Se `true` (**padrão**), o servidor reporta a contagem de linhas afetadas por
+    /// mensagem em [`BatchResult::update_counts`] (e portanto [`BatchResult::total_affected`]).
+    pub record_counts: bool,
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        // Fail-fast por padrão: a maioria dos usos de DML em lote quer abortar no
+        // primeiro erro, e o multierror (savepoint por linha) só compensa quando o
+        // chamador realmente vai inspecionar o erro de cada linha.
+        BatchOptions {
+            multierror: false,
+            record_counts: true,
+        }
+    }
+}
+
+impl BatchOptions {
+    /// Opções padrão (fail-fast, com contagens por linha).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Liga/desliga o modo multierro (continuar após erros por linha).
+    pub fn multierror(mut self, on: bool) -> Self {
+        self.multierror = on;
+        self
+    }
+
+    /// Liga/desliga o reporte de contagens de linhas afetadas por mensagem.
+    pub fn record_counts(mut self, on: bool) -> Self {
+        self.record_counts = on;
+        self
+    }
+}
+
+impl Connection {
+    /// Prepara uma instrução e cria um lote (batch) sobre ela com as opções padrão
+    /// ([`BatchOptions::default`]: fail-fast, com contagens por linha). A instrução
+    /// deve ter parâmetros (`?`) — cada [`Batch::add`] fornece uma linha de valores.
+    ///
+    /// Para continuar após erros por linha e coletá-los todos, use
+    /// [`Self::create_batch_with`] com `BatchOptions::new().multierror(true)`.
+    pub fn create_batch(&mut self, tx: &Transaction, sql: &str) -> Result<Batch> {
+        self.create_batch_with(tx, sql, BatchOptions::default())
+    }
+
+    /// Como [`Self::create_batch`], mas com [`BatchOptions`] explícitas.
+    pub fn create_batch_with(
+        &mut self,
+        tx: &Transaction,
+        sql: &str,
+        opts: BatchOptions,
+    ) -> Result<Batch> {
+        let mut stmt = self.prepare(tx, sql)?;
         let handle = stmt.handle();
         let params: Vec<ColumnMeta> = stmt.params().to_vec();
         // O handle passa a viver no Batch (liberado por Batch::close), então
@@ -407,12 +468,19 @@ impl Connection {
             .any(|c| sql_type::base(c.sql_type) == sql_type::BLOB);
 
         // Buffer de parâmetros do batch: byte de versão (1) seguido de clumplets
-        // com comprimento LE de 4 bytes. Pede contagens por linha e multierro.
+        // com comprimento LE de 4 bytes. Os tags são opcionais (ver `BatchOptions`).
         let mut pb = ParameterBuffer::new(1);
-        pb.bytes_be_len4(batch_tag::RECORD_COUNTS, &1u32.to_le_bytes());
-        pb.bytes_be_len4(batch_tag::MULTIERROR, &1u32.to_le_bytes());
+        if opts.record_counts {
+            pb.bytes_be_len4(batch_tag::RECORD_COUNTS, &1u32.to_le_bytes());
+        }
+        if opts.multierror {
+            pb.bytes_be_len4(batch_tag::MULTIERROR, &1u32.to_le_bytes());
+        }
         if blob_stream {
-            pb.bytes_be_len4(batch_tag::BLOB_POLICY, &(blob_policy::STREAM as u32).to_le_bytes());
+            pb.bytes_be_len4(
+                batch_tag::BLOB_POLICY,
+                &(blob_policy::STREAM as u32).to_le_bytes(),
+            );
         }
 
         let mut w = op_packet(op::BATCH_CREATE);
@@ -420,8 +488,8 @@ impl Connection {
         w.put_bytes(&blr); // cstring: len(4) + blr + pad
         w.put_i32(msglen as i32);
         w.put_bytes(pb.as_slice()); // cstring: len(4) + pb + pad
-        self.io().send(&w).await?;
-        read_response(self.io()).await?;
+        self.io().send(&w)?;
+        read_response(self.io())?;
 
         Ok(Batch {
             handle,
@@ -458,14 +526,17 @@ pub struct BatchResult {
 impl BatchResult {
     /// Verdadeiro se nenhuma mensagem falhou.
     pub fn all_succeeded(&self) -> bool {
-        self.errors.is_empty()
-            && !self.update_counts.contains(&batch_cs::EXECUTE_FAILED)
+        self.errors.is_empty() && !self.update_counts.contains(&batch_cs::EXECUTE_FAILED)
     }
 
     /// Soma das linhas afetadas pelas mensagens bem-sucedidas (ignora as que
     /// falharam ou não reportaram contagem).
     pub fn total_affected(&self) -> u64 {
-        self.update_counts.iter().filter(|&&c| c >= 0).map(|&c| c as u64).sum()
+        self.update_counts
+            .iter()
+            .filter(|&&c| c >= 0)
+            .map(|&c| c as u64)
+            .sum()
     }
 }
 
@@ -483,12 +554,14 @@ pub struct BatchError {
 /// Layout (confirmado por captura, inclusive com erros forçados):
 /// `op | stmt | reccount | updates | vectors | errors |`
 /// `updates×i32 (contagens) | vectors×(pos u32 + status vector) | errors×u32`.
-async fn read_batch_cs(conn: &mut Connection) -> Result<BatchResult> {
-    let code = read_op(conn.io()).await?;
+fn read_batch_cs(conn: &mut Connection) -> Result<BatchResult> {
+    let code = read_op(conn.io())?;
     if code == op::RESPONSE {
         // Falha global (não por linha) veio como op_response.
-        read_response_body(conn.io()).await?.into_result()?;
-        return Err(Error::protocol("op_batch_exec retornou op_response sem erro"));
+        read_response_body(conn.io())?.into_result()?;
+        return Err(Error::protocol(
+            "op_batch_exec retornou op_response sem erro",
+        ));
     }
     if code != op::BATCH_CS {
         return Err(Error::protocol(format!(
@@ -497,31 +570,44 @@ async fn read_batch_cs(conn: &mut Connection) -> Result<BatchResult> {
         )));
     }
 
-    let _stmt = conn.io().read_i32().await?;
-    let reccount = conn.io().read_i32().await? as u32;
-    let updates = conn.io().read_i32().await? as u32;
-    let vectors = conn.io().read_i32().await? as u32;
-    let errors = conn.io().read_i32().await? as u32;
+    let _stmt = conn.io().read_i32()?;
+    let reccount = conn.io().read_i32()? as u32;
+    let updates = conn.io().read_i32()? as u32;
+    let vectors = conn.io().read_i32()? as u32;
+    let errors = conn.io().read_i32()? as u32;
 
     let mut update_counts = Vec::with_capacity(updates as usize);
     for _ in 0..updates {
-        update_counts.push(conn.io().read_i32().await?);
+        update_counts.push(conn.io().read_i32()?);
     }
 
     let mut batch_errors = Vec::with_capacity(vectors as usize);
     for _ in 0..vectors {
-        let pos = conn.io().read_i32().await? as u32;
-        let status = read_status_vector(conn.io()).await?;
-        batch_errors.push(BatchError { message_index: pos, error: DatabaseError::new(status) });
+        let pos = conn.io().read_i32()? as u32;
+        let status = read_status_vector(conn.io())?;
+        batch_errors.push(BatchError {
+            message_index: pos,
+            error: DatabaseError::new(status),
+        });
     }
     // Lista simples de posições com erro (quando os detalhes não são pedidos).
     for _ in 0..errors {
-        let pos = conn.io().read_i32().await? as u32;
+        let pos = conn.io().read_i32()? as u32;
         if !batch_errors.iter().any(|e| e.message_index == pos) {
-            let empty = StatusVector { args: Vec::new(), sql_state: None };
-            batch_errors.push(BatchError { message_index: pos, error: DatabaseError::new(empty) });
+            let empty = StatusVector {
+                args: Vec::new(),
+                sql_state: None,
+            };
+            batch_errors.push(BatchError {
+                message_index: pos,
+                error: DatabaseError::new(empty),
+            });
         }
     }
 
-    Ok(BatchResult { total: reccount, update_counts, errors: batch_errors })
+    Ok(BatchResult {
+        total: reccount,
+        update_counts,
+        errors: batch_errors,
+    })
 }

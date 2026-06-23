@@ -31,6 +31,7 @@ pub enum WireCryptPlugin {
 }
 
 impl WireCryptPlugin {
+    /// Nome textual que o servidor Firebird espera no `op_crypt`.
     pub fn name(self) -> &'static str {
         match self {
             WireCryptPlugin::Arc4 => "Arc4",
@@ -113,8 +114,7 @@ impl ChaCha20 {
             12 => {
                 // contador (palavra 12) = 0; nonce nas palavras 13..16.
                 for i in 0..3 {
-                    state[13 + i] =
-                        u32::from_le_bytes(nonce[i * 4..i * 4 + 4].try_into().unwrap());
+                    state[13 + i] = u32::from_le_bytes(nonce[i * 4..i * 4 + 4].try_into().unwrap());
                 }
                 false
             }
@@ -126,7 +126,12 @@ impl ChaCha20 {
             }
             other => panic!("ChaCha nonce must be 12 or 8 bytes, got {other}"),
         };
-        let mut c = ChaCha20 { state, block: [0; 64], pos: 64, wide_counter };
+        let mut c = ChaCha20 {
+            state,
+            block: [0; 64],
+            pos: 64,
+            wide_counter,
+        };
         c.refill();
         c
     }
@@ -205,7 +210,10 @@ pub fn make_ciphers(
         WireCryptPlugin::Arc4 => (Box::new(Rc4::new(key)), Box::new(Rc4::new(key))),
         WireCryptPlugin::ChaCha | WireCryptPlugin::ChaCha64 => {
             let k = chacha_key(key);
-            (Box::new(ChaCha20::new(&k, nonce)), Box::new(ChaCha20::new(&k, nonce)))
+            (
+                Box::new(ChaCha20::new(&k, nonce)),
+                Box::new(ChaCha20::new(&k, nonce)),
+            )
         }
     }
 }

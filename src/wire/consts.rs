@@ -6,6 +6,7 @@
 //! ao longo do wire protocol e não devem ser alterados.
 
 #![allow(dead_code)]
+#![allow(missing_docs)]
 
 // ---------------------------------------------------------------------------
 // Operações (Protocol.h `P_OP`)
@@ -32,7 +33,7 @@ pub mod op {
     pub const INFO_DATABASE: i32 = 40;
     pub const INFO_TRANSACTION: i32 = 42;
 
-    // Eventos assíncronos (canal auxiliar).
+    // Eventos do banco (canal auxiliar).
     pub const QUE_EVENTS: i32 = 48;
     pub const CANCEL_EVENTS: i32 = 49;
     pub const COMMIT_RETAINING: i32 = 50;

@@ -37,11 +37,11 @@
 //! `isc_spb_options` (o servidor o lê como máscara de bits).
 
 use crate::config::ConnectConfig;
-use crate::connection::{handshake, AuthState, Handshake};
+use crate::connection::{AuthState, Handshake, handshake};
 use crate::error::{Error, Result};
 use crate::wire::consts::*;
 use crate::wire::response::read_response;
-use crate::wire::stream::{info_payload, op_packet, FbStream};
+use crate::wire::stream::{FbStream, info_payload, op_packet};
 use crate::wire::xdr::ParameterBuffer;
 
 /// Tamanho padrão do buffer de resposta para consultas/saída de serviço.
@@ -56,27 +56,29 @@ pub struct ServiceManager {
 impl ServiceManager {
     /// Anexa ao gerenciador de serviços usando host/porta/credenciais de `config`
     /// (o campo `database` é ignorado; o alvo é sempre `service_mgr`).
-    pub async fn attach(config: &ConnectConfig) -> Result<ServiceManager> {
-        let fut = Self::attach_inner(config);
-        match config.connect_timeout {
-            Some(t) => tokio::time::timeout(t, fut).await.map_err(|_| Error::Timeout)?,
-            None => fut.await,
-        }
+    pub fn attach(config: &ConnectConfig) -> Result<ServiceManager> {
+        Self::attach_inner(config)
     }
 
-    async fn attach_inner(config: &ConnectConfig) -> Result<ServiceManager> {
-        let Handshake { mut stream, protocol_version: _, auth } =
-            handshake(config, op::SERVICE_ATTACH, "service_mgr").await?;
+    fn attach_inner(config: &ConnectConfig) -> Result<ServiceManager> {
+        let Handshake {
+            mut stream,
+            protocol_version: _,
+            auth,
+        } = handshake(config, op::SERVICE_ATTACH, "service_mgr")?;
 
         let spb = build_attach_spb(config, &auth);
         let mut w = op_packet(op::SERVICE_ATTACH);
         w.put_i32(0); // id do objeto
         w.put_str("service_mgr");
         w.put_bytes(&spb);
-        stream.send(&w).await?;
-        let resp = crate::connection::attach_response(&mut stream).await?;
+        stream.send(&w)?;
+        let resp = crate::connection::attach_response(&mut stream)?;
 
-        Ok(ServiceManager { stream, handle: resp.handle })
+        Ok(ServiceManager {
+            stream,
+            handle: resp.handle,
+        })
     }
 
     /// Se a comunicação (wire) com o serviço está criptografada.
@@ -85,11 +87,11 @@ impl ServiceManager {
     }
 
     /// Desanexa do gerenciador de serviços (`op_service_detach`) e fecha o socket.
-    pub async fn close(mut self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
         let mut w = op_packet(op::SERVICE_DETACH);
         w.put_i32(self.handle);
-        self.stream.send(&w).await?;
-        let _ = read_response(&mut self.stream).await?;
+        self.stream.send(&w)?;
+        let _ = read_response(&mut self.stream)?;
         Ok(())
     }
 
@@ -100,43 +102,43 @@ impl ServiceManager {
     ///
     /// `send` são itens de configuração para esta chamada (ex.:
     /// `isc_info_svc_timeout`); normalmente vazio.
-    pub async fn info(&mut self, send: &[u8], recv: &[u8], buf_len: i32) -> Result<Vec<u8>> {
+    pub fn info(&mut self, send: &[u8], recv: &[u8], buf_len: i32) -> Result<Vec<u8>> {
         let mut w = op_packet(op::SERVICE_INFO);
         w.put_i32(self.handle);
         w.put_i32(0); // incarnation
         w.put_bytes(send); // itens de "envio"
         w.put_bytes(recv); // itens de "recepção" (o que queremos)
         w.put_i32(buf_len);
-        self.stream.send(&w).await?;
-        let resp = read_response(&mut self.stream).await?;
+        self.stream.send(&w)?;
+        let resp = read_response(&mut self.stream)?;
         Ok(resp.data)
     }
 
     /// Dispara uma ação (`op_service_start`). O `spb` deve começar pelo código da
     /// ação (`svc_action::*`). Use [`ServiceManager::run`] para também coletar a
     /// saída textual da ação.
-    pub async fn start(&mut self, spb: &[u8]) -> Result<()> {
+    pub fn start(&mut self, spb: &[u8]) -> Result<()> {
         let mut w = op_packet(op::SERVICE_START);
         w.put_i32(self.handle);
         w.put_i32(0); // incarnation
         w.put_bytes(spb);
-        self.stream.send(&w).await?;
-        read_response(&mut self.stream).await?;
+        self.stream.send(&w)?;
+        read_response(&mut self.stream)?;
         Ok(())
     }
 
     /// Dispara uma ação e coleta toda a sua saída textual, drenando o serviço com
     /// chamadas sucessivas de `op_service_info`/`isc_info_svc_to_eof` até o fim.
-    pub async fn run(&mut self, spb: &[u8]) -> Result<String> {
-        self.start(spb).await?;
-        self.collect_output().await
+    pub fn run(&mut self, spb: &[u8]) -> Result<String> {
+        self.start(spb)?;
+        self.collect_output()
     }
 
     /// Lê a saída acumulada do serviço (após um [`start`](Self::start)) até o EOF.
-    pub async fn collect_output(&mut self) -> Result<String> {
+    pub fn collect_output(&mut self) -> Result<String> {
         let mut out = String::new();
         loop {
-            let data = self.info(&[], &[svc_info::TO_EOF], DEFAULT_INFO_BUF).await?;
+            let data = self.info(&[], &[svc_info::TO_EOF], DEFAULT_INFO_BUF)?;
             let chunk = parse_svc_string(&data, svc_info::TO_EOF)?;
             if chunk.is_empty() {
                 break;
@@ -149,57 +151,52 @@ impl ServiceManager {
     // -- consultas de info comuns -------------------------------------------
 
     /// A versão do servidor Firebird (`isc_info_svc_server_version`).
-    pub async fn server_version(&mut self) -> Result<String> {
-        self.query_string(svc_info::SERVER_VERSION).await
+    pub fn server_version(&mut self) -> Result<String> {
+        self.query_string(svc_info::SERVER_VERSION)
     }
 
     /// A implementação do servidor (`isc_info_svc_implementation`).
-    pub async fn implementation(&mut self) -> Result<String> {
-        self.query_string(svc_info::IMPLEMENTATION).await
+    pub fn implementation(&mut self) -> Result<String> {
+        self.query_string(svc_info::IMPLEMENTATION)
     }
 
     /// O caminho do banco de segurança em uso (`isc_info_svc_user_dbpath`).
-    pub async fn security_database(&mut self) -> Result<String> {
-        self.query_string(svc_info::USER_DBPATH).await
+    pub fn security_database(&mut self) -> Result<String> {
+        self.query_string(svc_info::USER_DBPATH)
     }
 
     /// O valor de `$FIREBIRD` no servidor (`isc_info_svc_get_env`).
-    pub async fn home_directory(&mut self) -> Result<String> {
-        self.query_string(svc_info::GET_ENV).await
+    pub fn home_directory(&mut self) -> Result<String> {
+        self.query_string(svc_info::GET_ENV)
     }
 
     /// A versão do protocolo do Service Manager (`isc_info_svc_version`; um
     /// inteiro, p.ex. `2` no Firebird 5).
-    pub async fn manager_version(&mut self) -> Result<i32> {
-        self.query_int(svc_info::VERSION).await
+    pub fn manager_version(&mut self) -> Result<i32> {
+        self.query_int(svc_info::VERSION)
     }
 
     /// Indica se uma ação ainda está em execução nesta conexão de serviço
     /// (`isc_info_svc_running`). Útil para sondar o andamento entre leituras de
     /// saída de uma ação longa (backup, restore, etc.).
-    pub async fn is_running(&mut self) -> Result<bool> {
-        Ok(self.query_int(svc_info::RUNNING).await? != 0)
+    pub fn is_running(&mut self) -> Result<bool> {
+        Ok(self.query_int(svc_info::RUNNING)? != 0)
     }
 
     // -- ações de alto nível ------------------------------------------------
 
     /// Lê o log do servidor (`firebird.log`) via `isc_action_svc_get_fb_log`.
     /// (A ação não tem argumentos: o SPB é apenas o código da ação.)
-    pub async fn get_fb_log(&mut self) -> Result<String> {
+    pub fn get_fb_log(&mut self) -> Result<String> {
         let mut spb = ParameterBuffer::raw();
         spb.tag(svc_action::GET_FB_LOG);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     /// Faz backup de `database` (alias ou caminho no servidor) para `backup_file`
     /// (caminho **no servidor**) via `gbak`. `options` é um bitmask de `svc_bkp::*`
     /// (use `0` para o padrão). Devolve a saída textual do gbak (modo verbose).
-    pub async fn backup(
-        &mut self,
-        database: &str,
-        backup_file: &str,
-        options: u32,
-    ) -> Result<String> {
+    pub fn backup(&mut self, database: &str, backup_file: &str, options: u32) -> Result<String> {
         let mut spb = ActionSpb::new(svc_action::BACKUP);
         spb.string(spb::DBNAME, database);
         spb.string(svc_bkp::FILE, backup_file);
@@ -207,19 +204,14 @@ impl ServiceManager {
             spb.int(spb::OPTIONS, options);
         }
         spb.flag(spb::VERBOSE);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     /// Restaura `backup_file` (caminho **no servidor**) para `database` via `gbak`.
     /// `options` é um bitmask de `svc_res::*`; se nem `REPLACE` nem `CREATE`
     /// estiverem presentes, assume `CREATE` (o padrão do gbak). Devolve a saída
     /// textual do gbak (modo verbose).
-    pub async fn restore(
-        &mut self,
-        backup_file: &str,
-        database: &str,
-        options: u32,
-    ) -> Result<String> {
+    pub fn restore(&mut self, backup_file: &str, database: &str, options: u32) -> Result<String> {
         let mut options = options;
         if options & (svc_res::REPLACE | svc_res::CREATE) == 0 {
             options |= svc_res::CREATE;
@@ -230,18 +222,18 @@ impl ServiceManager {
         spb.string(spb::DBNAME, database);
         spb.int(spb::OPTIONS, options);
         spb.flag(spb::VERBOSE);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     /// Coleta estatísticas de `database` via `gstat` (`isc_action_svc_db_stats`).
     /// `options` é um bitmask de `svc_sts::*` (use `0` para o cabeçalho do banco).
-    pub async fn statistics(&mut self, database: &str, options: u32) -> Result<String> {
+    pub fn statistics(&mut self, database: &str, options: u32) -> Result<String> {
         let mut spb = ActionSpb::new(svc_action::DB_STATS);
         spb.string(spb::DBNAME, database);
         if options != 0 {
             spb.int(spb::OPTIONS, options);
         }
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     // -- nbackup (backup incremental) ---------------------------------------
@@ -250,7 +242,7 @@ impl ServiceManager {
     /// **no servidor**) no `level` dado (0 = base de uma cadeia incremental).
     /// `options` é um bitmask de `svc_nbk::*` (use `0` para o padrão). Devolve a
     /// saída textual.
-    pub async fn nbackup(
+    pub fn nbackup(
         &mut self,
         database: &str,
         backup_file: &str,
@@ -264,12 +256,12 @@ impl ServiceManager {
         if options != 0 {
             spb.int(spb::OPTIONS, options);
         }
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     /// Restauração incremental (`nrestore`): reconstrói `database` (caminho **no
     /// servidor**) aplicando `backup_files` em ordem (nível 0 primeiro).
-    pub async fn nrestore(
+    pub fn nrestore(
         &mut self,
         database: &str,
         backup_files: &[&str],
@@ -283,7 +275,7 @@ impl ServiceManager {
         if options != 0 {
             spb.int(spb::OPTIONS, options);
         }
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     // -- validação online ---------------------------------------------------
@@ -291,7 +283,7 @@ impl ServiceManager {
     /// Validação ONLINE de `database` (`isc_action_svc_validate`). `tables` e
     /// `indices` são expressões regulares opcionais (None = tudo). Devolve o
     /// relatório textual.
-    pub async fn validate(
+    pub fn validate(
         &mut self,
         database: &str,
         tables: Option<&str>,
@@ -305,7 +297,7 @@ impl ServiceManager {
         if let Some(i) = indices {
             spb.string(svc_val::IDX_INCL, i);
         }
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     // -- repair / gfix ------------------------------------------------------
@@ -313,83 +305,85 @@ impl ServiceManager {
     /// Manutenção/reparo de `database` via `gfix` (`isc_action_svc_repair`).
     /// `options` é um bitmask de `svc_rpr::*` (ex.: `MEND_DB | FULL`, ou
     /// `VALIDATE_DB` para checagem). Devolve a saída textual.
-    pub async fn repair(&mut self, database: &str, options: u32) -> Result<String> {
+    pub fn repair(&mut self, database: &str, options: u32) -> Result<String> {
         let mut spb = ActionSpb::new(svc_action::REPAIR);
         spb.string(spb::DBNAME, database);
         spb.int(spb::OPTIONS, options);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     /// Atalho de [`repair`](Self::repair) que dispara um sweep manual.
-    pub async fn sweep(&mut self, database: &str) -> Result<String> {
-        self.repair(database, svc_rpr::SWEEP_DB).await
+    pub fn sweep(&mut self, database: &str) -> Result<String> {
+        self.repair(database, svc_rpr::SWEEP_DB)
     }
 
     // -- propriedades (gfix) ------------------------------------------------
 
     /// Define o intervalo de sweep automático em transações (`gfix -h`).
-    pub async fn set_sweep_interval(&mut self, database: &str, interval: u32) -> Result<()> {
+    pub fn set_sweep_interval(&mut self, database: &str, interval: u32) -> Result<()> {
         self.properties(database, |s| {
             s.int(svc_prp::SWEEP_INTERVAL, interval);
         })
-        .await
     }
 
     /// Define o tamanho do cache do banco em páginas (`gfix -buffers`).
-    pub async fn set_page_buffers(&mut self, database: &str, buffers: u32) -> Result<()> {
+    pub fn set_page_buffers(&mut self, database: &str, buffers: u32) -> Result<()> {
         self.properties(database, |s| {
             s.int(svc_prp::PAGE_BUFFERS, buffers);
         })
-        .await
     }
 
     /// Liga/desliga a escrita síncrona (forced writes) do banco (`gfix -write`).
-    pub async fn set_forced_writes(&mut self, database: &str, sync: bool) -> Result<()> {
-        let mode = if sync { svc_prp::WM_SYNC } else { svc_prp::WM_ASYNC };
+    pub fn set_forced_writes(&mut self, database: &str, sync: bool) -> Result<()> {
+        let mode = if sync {
+            svc_prp::WM_SYNC
+        } else {
+            svc_prp::WM_ASYNC
+        };
         self.properties(database, |s| {
             s.byte(svc_prp::WRITE_MODE, mode);
         })
-        .await
     }
 
     /// Define o modo de acesso do banco: somente leitura ou leitura/escrita
     /// (`gfix -mode`).
-    pub async fn set_read_only(&mut self, database: &str, read_only: bool) -> Result<()> {
-        let mode = if read_only { svc_prp::AM_READONLY } else { svc_prp::AM_READWRITE };
+    pub fn set_read_only(&mut self, database: &str, read_only: bool) -> Result<()> {
+        let mode = if read_only {
+            svc_prp::AM_READONLY
+        } else {
+            svc_prp::AM_READWRITE
+        };
         self.properties(database, |s| {
             s.byte(svc_prp::ACCESS_MODE, mode);
         })
-        .await
     }
 
     /// Coloca o banco OFFLINE (shutdown) no `mode` dado (`svc_prp::SM_*`),
     /// aguardando até `timeout` segundos pelo término das conexões ativas.
-    pub async fn shutdown(&mut self, database: &str, mode: u8, timeout: u32) -> Result<()> {
+    pub fn shutdown(&mut self, database: &str, mode: u8, timeout: u32) -> Result<()> {
         self.properties(database, |s| {
             s.byte(svc_prp::SHUTDOWN_MODE, mode);
             s.int(svc_prp::ATTACHMENTS_SHUTDOWN, timeout);
         })
-        .await
     }
 
     /// Traz o banco de volta ONLINE no `mode` dado (`svc_prp::SM_*`).
-    pub async fn bring_online(&mut self, database: &str, mode: u8) -> Result<()> {
+    pub fn bring_online(&mut self, database: &str, mode: u8) -> Result<()> {
         self.properties(database, |s| {
             s.byte(svc_prp::ONLINE_MODE, mode);
         })
-        .await
     }
 
     /// Helper interno: dispara `isc_action_svc_properties` sobre `database` com os
     /// argumentos montados por `build`, descartando a saída.
-    async fn properties<F>(&mut self, database: &str, build: F) -> Result<()>
+    fn properties<F>(&mut self, database: &str, build: F) -> Result<()>
     where
         F: FnOnce(&mut ActionSpb),
     {
         let mut spb = ActionSpb::new(svc_action::PROPERTIES);
         spb.string(spb::DBNAME, database);
         build(&mut spb);
-        self.run(&spb.into_vec()).await?;
+        self.run(&spb.into_vec())?;
         Ok(())
     }
 
@@ -401,91 +395,91 @@ impl ServiceManager {
     /// após o retorno — pare-a com [`trace_stop`](Self::trace_stop). Para drenar o
     /// fluxo contínuo de eventos use uma conexão de serviço DEDICADA, pois esta
     /// chamada lê apenas a saída já disponível.
-    pub async fn trace_start(&mut self, name: &str, config: &str) -> Result<String> {
+    pub fn trace_start(&mut self, name: &str, config: &str) -> Result<String> {
         let mut spb = ActionSpb::new(svc_action::TRACE_START);
         if !name.is_empty() {
             spb.string(svc_trc::NAME, name);
         }
         spb.string(svc_trc::CFG, config);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     /// Para a sessão de trace de id `session_id`.
-    pub async fn trace_stop(&mut self, session_id: u32) -> Result<String> {
-        self.trace_action(svc_action::TRACE_STOP, session_id).await
+    pub fn trace_stop(&mut self, session_id: u32) -> Result<String> {
+        self.trace_action(svc_action::TRACE_STOP, session_id)
     }
 
     /// Suspende a sessão de trace de id `session_id`.
-    pub async fn trace_suspend(&mut self, session_id: u32) -> Result<String> {
-        self.trace_action(svc_action::TRACE_SUSPEND, session_id).await
+    pub fn trace_suspend(&mut self, session_id: u32) -> Result<String> {
+        self.trace_action(svc_action::TRACE_SUSPEND, session_id)
     }
 
     /// Retoma a sessão de trace de id `session_id`.
-    pub async fn trace_resume(&mut self, session_id: u32) -> Result<String> {
-        self.trace_action(svc_action::TRACE_RESUME, session_id).await
+    pub fn trace_resume(&mut self, session_id: u32) -> Result<String> {
+        self.trace_action(svc_action::TRACE_RESUME, session_id)
     }
 
     /// Lista as sessões de trace ativas no servidor.
-    pub async fn trace_list(&mut self) -> Result<String> {
+    pub fn trace_list(&mut self) -> Result<String> {
         let spb = ActionSpb::new(svc_action::TRACE_LIST);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
-    async fn trace_action(&mut self, action: u8, session_id: u32) -> Result<String> {
+    fn trace_action(&mut self, action: u8, session_id: u32) -> Result<String> {
         let mut spb = ActionSpb::new(action);
         spb.int(svc_trc::ID, session_id);
-        self.run(&spb.into_vec()).await
+        self.run(&spb.into_vec())
     }
 
     // -- gestão de usuários (banco de segurança) ----------------------------
 
     /// Cria um usuário no banco de segurança (`isc_action_svc_add_user`).
-    pub async fn add_user(&mut self, user: &UserParams) -> Result<()> {
-        self.run(&build_user_spb(svc_action::ADD_USER, user)).await?;
+    pub fn add_user(&mut self, user: &UserParams) -> Result<()> {
+        self.run(&build_user_spb(svc_action::ADD_USER, user))?;
         Ok(())
     }
 
     /// Altera um usuário existente (`isc_action_svc_modify_user`). Só os campos
     /// presentes em `user` são modificados.
-    pub async fn modify_user(&mut self, user: &UserParams) -> Result<()> {
-        self.run(&build_user_spb(svc_action::MODIFY_USER, user)).await?;
+    pub fn modify_user(&mut self, user: &UserParams) -> Result<()> {
+        self.run(&build_user_spb(svc_action::MODIFY_USER, user))?;
         Ok(())
     }
 
     /// Remove um usuário (`isc_action_svc_delete_user`).
-    pub async fn delete_user(&mut self, username: &str) -> Result<()> {
+    pub fn delete_user(&mut self, username: &str) -> Result<()> {
         let mut spb = ActionSpb::new(svc_action::DELETE_USER);
         spb.string(svc_sec::USERNAME, username);
-        self.run(&spb.into_vec()).await?;
+        self.run(&spb.into_vec())?;
         Ok(())
     }
 
     /// Lista todos os usuários do banco de segurança
     /// (`isc_action_svc_display_user` + `isc_info_svc_get_users`).
-    pub async fn display_users(&mut self) -> Result<Vec<UserInfo>> {
+    pub fn display_users(&mut self) -> Result<Vec<UserInfo>> {
         let spb = ActionSpb::new(svc_action::DISPLAY_USER);
-        self.fetch_users(spb.into_vec()).await
+        self.fetch_users(spb.into_vec())
     }
 
     /// Consulta um único usuário pelo nome; devolve `None` se não existir.
-    pub async fn display_user(&mut self, username: &str) -> Result<Option<UserInfo>> {
+    pub fn display_user(&mut self, username: &str) -> Result<Option<UserInfo>> {
         let mut spb = ActionSpb::new(svc_action::DISPLAY_USER);
         spb.string(svc_sec::USERNAME, username);
-        Ok(self.fetch_users(spb.into_vec()).await?.into_iter().next())
+        Ok(self.fetch_users(spb.into_vec())?.into_iter().next())
     }
 
     /// Dispara um `display_user` e decodifica o buffer `isc_info_svc_get_users`.
     /// `isc_info_svc_get_users` não tem continuação incremental: se a lista não
     /// couber no buffer, o servidor marca `isc_info_truncated` e devemos repetir
     /// com um buffer maior. Dobramos o tamanho até caber (ou atingir o teto).
-    async fn fetch_users(&mut self, spb: Vec<u8>) -> Result<Vec<UserInfo>> {
+    fn fetch_users(&mut self, spb: Vec<u8>) -> Result<Vec<UserInfo>> {
         const MAX_INFO_BUF: i32 = 16 * 1024 * 1024;
         let mut buf_len = DEFAULT_INFO_BUF;
         loop {
             // Re-dispara a ação a cada tentativa para que o buffer maior receba a
             // lista completa do zero (get_users não tem continuação incremental).
-            self.start(&spb).await?;
-            let data = self.info(&[], &[svc_info::GET_USERS], buf_len).await?;
+            self.start(&spb)?;
+            let data = self.info(&[], &[svc_info::GET_USERS], buf_len)?;
             if data.last() == Some(&INFO_TRUNCATED) && buf_len < MAX_INFO_BUF {
                 buf_len = buf_len.saturating_mul(2).min(MAX_INFO_BUF);
                 continue;
@@ -498,15 +492,15 @@ impl ServiceManager {
     // -- auxiliares ---------------------------------------------------------
 
     /// Consulta um único item de info que devolve uma string.
-    async fn query_string(&mut self, item: u8) -> Result<String> {
-        let data = self.info(&[], &[item], DEFAULT_INFO_BUF).await?;
+    fn query_string(&mut self, item: u8) -> Result<String> {
+        let data = self.info(&[], &[item], DEFAULT_INFO_BUF)?;
         let value = parse_svc_string(&data, item)?;
         Ok(String::from_utf8_lossy(&value).into_owned())
     }
 
     /// Consulta um único item de info que devolve um inteiro.
-    async fn query_int(&mut self, item: u8) -> Result<i32> {
-        let data = self.info(&[], &[item], DEFAULT_INFO_BUF).await?;
+    fn query_int(&mut self, item: u8) -> Result<i32> {
+        let data = self.info(&[], &[item], DEFAULT_INFO_BUF)?;
         parse_svc_int(&data, item)
     }
 }
@@ -555,7 +549,8 @@ impl ActionSpb {
     fn string(&mut self, tag: u8, value: &str) -> &mut Self {
         let bytes = value.as_bytes();
         self.buf.push(tag);
-        self.buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(bytes.len() as u16).to_le_bytes());
         self.buf.extend_from_slice(bytes);
         self
     }
@@ -604,7 +599,10 @@ pub struct UserParams {
 impl UserParams {
     /// Inicia os parâmetros para o usuário de nome `username`.
     pub fn new(username: impl Into<String>) -> Self {
-        Self { username: username.into(), ..Default::default() }
+        Self {
+            username: username.into(),
+            ..Default::default()
+        }
     }
 
     /// Define a senha (`isc_spb_sec_password`).
@@ -654,11 +652,17 @@ impl UserParams {
 /// [`ServiceManager::display_users`]/[`display_user`](ServiceManager::display_user).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserInfo {
+    /// Nome do usuário no banco de segurança.
     pub username: String,
+    /// Primeiro nome cadastrado, ou string vazia quando ausente.
     pub first_name: String,
+    /// Nome do meio cadastrado, ou string vazia quando ausente.
     pub middle_name: String,
+    /// Sobrenome cadastrado, ou string vazia quando ausente.
     pub last_name: String,
+    /// UID Unix associado ao usuário, quando usado pelo servidor.
     pub user_id: u32,
+    /// GID Unix associado ao usuário, quando usado pelo servidor.
     pub group_id: u32,
 }
 
@@ -704,8 +708,11 @@ fn parse_users(payload: &[u8]) -> Result<Vec<UserInfo>> {
         let tag = payload[p];
         p += 1;
         match tag {
-            svc_sec::USERNAME | svc_sec::GROUPNAME | svc_sec::FIRSTNAME
-            | svc_sec::MIDDLENAME | svc_sec::LASTNAME => {
+            svc_sec::USERNAME
+            | svc_sec::GROUPNAME
+            | svc_sec::FIRSTNAME
+            | svc_sec::MIDDLENAME
+            | svc_sec::LASTNAME => {
                 let len = payload
                     .get(p..p + 2)
                     .ok_or_else(|| Error::protocol("get_users: comprimento truncado"))?;
@@ -719,7 +726,10 @@ fn parse_users(payload: &[u8]) -> Result<Vec<UserInfo>> {
                     if let Some(u) = cur.take() {
                         users.push(u);
                     }
-                    cur = Some(UserInfo { username: s, ..Default::default() });
+                    cur = Some(UserInfo {
+                        username: s,
+                        ..Default::default()
+                    });
                 } else if let Some(u) = cur.as_mut() {
                     match tag {
                         svc_sec::FIRSTNAME => u.first_name = s,
@@ -830,9 +840,18 @@ mod tests {
             v,
             vec![
                 svc_action::PROPERTIES,
-                spb::DBNAME, 2, 0, b'd', b'b',
-                svc_prp::WRITE_MODE, svc_prp::WM_SYNC,
-                svc_prp::SWEEP_INTERVAL, 0x88, 0x13, 0, 0, // 5000 LE
+                spb::DBNAME,
+                2,
+                0,
+                b'd',
+                b'b',
+                svc_prp::WRITE_MODE,
+                svc_prp::WM_SYNC,
+                svc_prp::SWEEP_INTERVAL,
+                0x88,
+                0x13,
+                0,
+                0, // 5000 LE
             ]
         );
     }
@@ -880,10 +899,7 @@ mod tests {
         // 0b (db_stats) | 6a (dbname) | 0800 (len 8 LE) | "employee".
         let mut spb = ActionSpb::new(svc_action::DB_STATS);
         spb.string(spb::DBNAME, "employee");
-        assert_eq!(
-            spb.into_vec(),
-            b"\x0b\x6a\x08\x00employee".to_vec(),
-        );
+        assert_eq!(spb.into_vec(), b"\x0b\x6a\x08\x00employee".to_vec(),);
     }
 
     #[test]
@@ -911,7 +927,10 @@ mod tests {
 
     /// Decodifica uma string hex em bytes (auxiliar de teste).
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -919,18 +938,36 @@ mod tests {
         // Payload interno de isc_info_svc_get_users capturado ao vivo (3 usuários),
         // montado por campo para legibilidade.
         let payload = hex(concat!(
-            "070600", "535953444241",       // username "SYSDBA"
-            "0a0300", "53716c",             // first "Sql"
-            "0b0600", "536572766572",       // middle "Server"
-            "0c0d00", "41646d696e6973747261746f72", // last "Administrator"
-            "05", "00000000",               // userid 0
-            "06", "00000000",               // groupid 0
-            "070800", "4653435343504938",   // username "FSCSCPI8"
-            "0a0000", "0b0000", "0c0000",   // first/middle/last vazios
-            "05", "00000000", "06", "00000000",
-            "070600", "465343534950",       // username "FSCSIP"
-            "0a0000", "0b0000", "0c0000",
-            "05", "00000000", "06", "00000000",
+            "070600",
+            "535953444241", // username "SYSDBA"
+            "0a0300",
+            "53716c", // first "Sql"
+            "0b0600",
+            "536572766572", // middle "Server"
+            "0c0d00",
+            "41646d696e6973747261746f72", // last "Administrator"
+            "05",
+            "00000000", // userid 0
+            "06",
+            "00000000", // groupid 0
+            "070800",
+            "4653435343504938", // username "FSCSCPI8"
+            "0a0000",
+            "0b0000",
+            "0c0000", // first/middle/last vazios
+            "05",
+            "00000000",
+            "06",
+            "00000000",
+            "070600",
+            "465343534950", // username "FSCSIP"
+            "0a0000",
+            "0b0000",
+            "0c0000",
+            "05",
+            "00000000",
+            "06",
+            "00000000",
         ));
         let users = parse_users(&payload).unwrap();
         assert_eq!(users.len(), 3);
@@ -951,15 +988,29 @@ mod tests {
         let mut spb = ActionSpb::new(svc_action::BACKUP);
         spb.string(spb::DBNAME, "db");
         spb.string(svc_bkp::FILE, "f");
-        spb.int(spb::OPTIONS, svc_bkp::NO_GARBAGE_COLLECT | svc_bkp::IGNORE_CHECKSUMS);
+        spb.int(
+            spb::OPTIONS,
+            svc_bkp::NO_GARBAGE_COLLECT | svc_bkp::IGNORE_CHECKSUMS,
+        );
         spb.flag(spb::VERBOSE);
         assert_eq!(
             spb.into_vec(),
             vec![
                 svc_action::BACKUP,
-                spb::DBNAME, 2, 0, b'd', b'b',
-                svc_bkp::FILE, 1, 0, b'f',
-                spb::OPTIONS, 0x09, 0, 0, 0, // 8 | 1 = 9, little-endian
+                spb::DBNAME,
+                2,
+                0,
+                b'd',
+                b'b',
+                svc_bkp::FILE,
+                1,
+                0,
+                b'f',
+                spb::OPTIONS,
+                0x09,
+                0,
+                0,
+                0, // 8 | 1 = 9, little-endian
                 spb::VERBOSE,
             ],
         );

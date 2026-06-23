@@ -1,41 +1,40 @@
 # fdb_driver
 
-Driver **assíncrono e puramente em Rust** para **Firebird 5+**, falando o
+Driver **síncrono e puramente em Rust** para **Firebird 5+**, falando o
 protocolo nativo (wire protocol v19) diretamente sobre TCP — **sem dependência do
-`libfbclient`**. Construído sobre [Tokio](https://tokio.rs).
+`libfbclient`**.
 
 ```rust
-use fdb_driver::{ConnectConfig, Connection, Value};
+use fdb_driver::{ConnectConfig, Connection};
 
-#[tokio::main]
-async fn main() -> fdb_driver::Result<()> {
+fn main() -> fdb_driver::Result<()> {
     let cfg = ConnectConfig::new()
         .host("127.0.0.1").port(3050).database("employee")
         .user("SYSDBA").password("masterkey");
 
-    let mut conn = Connection::connect(&cfg).await?;
-    let tx = conn.begin().await?;
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
 
-    let mut stmt = conn.prepare(&tx, "SELECT first_name FROM employee WHERE emp_no = ?").await?;
-    stmt.execute(&mut conn, &tx, &[Value::Int(2)]).await?;
-    if let Some(row) = stmt.fetch(&mut conn).await? {
+    let mut stmt = conn.prepare(&tx, "SELECT first_name FROM employee WHERE emp_no = ?")?;
+    stmt.execute(&mut conn, &tx, &[2_i32.into()])?;
+    if let Some(row) = stmt.fetch(&mut conn)? {
         println!("{:?}", row[0].as_str());
     }
-    stmt.drop_statement(&mut conn).await?;
+    stmt.drop_statement(&mut conn)?;
 
-    tx.commit(&mut conn).await?;
-    conn.close().await?;
+    tx.commit(&mut conn)?;
+    conn.close()?;
     Ok(())
 }
 ```
 
 ## Documentação
 
+- **[COMECE-AQUI.md](COMECE-AQUI.md)** — introdução didática para o primeiro uso:
+  conceitos básicos, primeiro programa completo e mapa “quero fazer X”.
 - **[GUIA-DE-USO.md](GUIA-DE-USO.md)** — guia completo de uso, com exemplos de
   conexão, query, execute, transações, batch, BLOBs, pool, charsets, wire-crypt
   e mais, além do checklist de recursos.
-- **[PROXIMAS-ETAPAS.md](PROXIMAS-ETAPAS.md)** — roadmap (o que está feito e o que
-  falta).
 - **[PROTOCOL-NOTES.md](PROTOCOL-NOTES.md)** — notas de engenharia reversa dos
   layouts do wire protocol.
 

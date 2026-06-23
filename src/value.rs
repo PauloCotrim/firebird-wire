@@ -7,7 +7,9 @@ use crate::wire::consts::sql_type;
 /// da coluna para renderizar o ponto decimal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// Valor SQL `NULL`.
     Null,
+    /// Booleano SQL (`BOOLEAN`).
     Bool(bool),
     /// SMALLINT (também a mantissa bruta de um NUMERIC com escala baseado em SMALLINT).
     Short(i16),
@@ -15,7 +17,9 @@ pub enum Value {
     Int(i32),
     /// BIGINT (ou NUMERIC com escala baseado em BIGINT).
     BigInt(i64),
+    /// Número de ponto flutuante de 32 bits (`FLOAT`).
     Float(f32),
+    /// Número de ponto flutuante de 64 bits (`DOUBLE PRECISION`).
     Double(f64),
     /// Texto CHAR/VARCHAR, decodificado conforme o charset da conexão (ver
     /// [`crate::charset::Charset`]); CHAR vem sem o padding de espaços à direita.
@@ -132,6 +136,7 @@ const FB_TIME_UNITS_PER_SEC: u32 = 10_000;
 /// bruto que o Firebird transmite em [`Value::Date`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CivilDate {
+    /// Ano no calendário gregoriano.
     pub year: i32,
     /// Mês 1..=12.
     pub month: u32,
@@ -162,7 +167,9 @@ impl CivilTime {
 /// Um carimbo de data/hora civil decodificado de [`Value::Timestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CivilTimestamp {
+    /// Parte de data.
     pub date: CivilDate,
+    /// Parte de hora.
     pub time: CivilTime,
 }
 
@@ -180,7 +187,11 @@ fn civil_from_unix_days(z: i64) -> CivilDate {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     let year = if month <= 2 { y + 1 } else { y };
-    CivilDate { year: year as i32, month, day }
+    CivilDate {
+        year: year as i32,
+        month,
+        day,
+    }
 }
 
 /// Inverso de [`civil_from_unix_days`]: (ano, mês, dia) → dias desde 1970-01-01.
@@ -210,6 +221,7 @@ impl CivilTime {
 }
 
 impl Value {
+    /// Verdadeiro quando o valor é [`Value::Null`].
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -221,7 +233,15 @@ impl Value {
 
     /// Constrói um [`Value::Time`] a partir de uma hora civil (`frac` em 1/10000 s).
     pub fn time(hour: u32, minute: u32, second: u32, frac: u32) -> Value {
-        Value::Time(CivilTime { hour, minute, second, frac }.to_fb_time())
+        Value::Time(
+            CivilTime {
+                hour,
+                minute,
+                second,
+                frac,
+            }
+            .to_fb_time(),
+        )
     }
 
     /// Constrói um [`Value::Timestamp`] a partir de data + hora civis.
@@ -233,9 +253,9 @@ impl Value {
     /// uma data civil.
     pub fn as_civil_date(&self) -> Option<CivilDate> {
         match self {
-            Value::Date(d) | Value::Timestamp(d, _) => {
-                Some(civil_from_unix_days(*d as i64 - FB_EPOCH_TO_UNIX_DAYS as i64))
-            }
+            Value::Date(d) | Value::Timestamp(d, _) => Some(civil_from_unix_days(
+                *d as i64 - FB_EPOCH_TO_UNIX_DAYS as i64,
+            )),
             _ => None,
         }
     }
@@ -288,6 +308,72 @@ impl Value {
     }
 }
 
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+
+impl From<i16> for Value {
+    fn from(v: i16) -> Self {
+        Value::Short(v)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::Int(v)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(v: i64) -> Self {
+        Value::BigInt(v)
+    }
+}
+
+impl From<i128> for Value {
+    fn from(v: i128) -> Self {
+        Value::Int128(v)
+    }
+}
+
+impl From<f32> for Value {
+    fn from(v: f32) -> Self {
+        Value::Float(v)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::Double(v)
+    }
+}
+
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::Text(v)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::Text(v.to_string())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Self {
+        Value::Bytes(v)
+    }
+}
+
+impl From<&[u8]> for Value {
+    fn from(v: &[u8]) -> Self {
+        Value::Bytes(v.to_vec())
+    }
+}
+
 /// Metadados que descrevem uma coluna da saída de uma instrução preparada (ou um
 /// de seus parâmetros de entrada).
 #[derive(Debug, Clone, Default)]
@@ -296,23 +382,32 @@ pub struct ColumnMeta {
     pub index: usize,
     /// Tipo SQL base (`SQL_*`, com o bit anulável removido).
     pub sql_type: i32,
+    /// Sub-tipo Firebird. Para texto pode indicar charset; para BLOB indica o sub-tipo do BLOB.
     pub sub_type: i32,
+    /// Escala de tipos numéricos (`NUMERIC`/`DECIMAL`); valores negativos indicam casas decimais.
     pub scale: i32,
     /// Comprimento declarado em bytes (CHAR/VARCHAR) ou largura do tipo.
     pub length: i32,
+    /// Verdadeiro se a coluna ou parâmetro aceita `NULL`.
     pub nullable: bool,
     /// Nome subjacente da coluna.
     pub field: String,
+    /// Nome da relação/tabela de origem, quando o servidor informa.
     pub relation: String,
     /// Alias de saída (o nome que a lista SELECT deu a ela).
     pub alias: String,
+    /// Dono da relação de origem, quando o servidor informa.
     pub owner: String,
 }
 
 impl ColumnMeta {
     /// O nome que os chamadores veem para esta coluna (alias se presente, senão field).
     pub fn name(&self) -> &str {
-        if self.alias.is_empty() { &self.field } else { &self.alias }
+        if self.alias.is_empty() {
+            &self.field
+        } else {
+            &self.alias
+        }
     }
 
     /// Bytes que esta coluna ocupa em uma mensagem de linha XDR quando não-nula.
@@ -353,12 +448,20 @@ mod tests {
         // A época do Firebird (dia 0) é 1858-11-17.
         assert_eq!(
             Value::Date(0).as_civil_date(),
-            Some(CivilDate { year: 1858, month: 11, day: 17 })
+            Some(CivilDate {
+                year: 1858,
+                month: 11,
+                day: 17
+            })
         );
         // A época Unix em dias do Firebird = 40587.
         assert_eq!(
             Value::Date(40_587).as_civil_date(),
-            Some(CivilDate { year: 1970, month: 1, day: 1 })
+            Some(CivilDate {
+                year: 1970,
+                month: 1,
+                day: 1
+            })
         );
         // Ida e volta por várias datas, incluindo um ano bissexto e fim de ano.
         for (y, m, d) in [
@@ -370,7 +473,14 @@ mod tests {
             (2400, 12, 31),
         ] {
             let v = Value::date(y, m, d);
-            assert_eq!(v.as_civil_date(), Some(CivilDate { year: y, month: m, day: d }));
+            assert_eq!(
+                v.as_civil_date(),
+                Some(CivilDate {
+                    year: y,
+                    month: m,
+                    day: d
+                })
+            );
         }
     }
 
@@ -379,13 +489,23 @@ mod tests {
         // Meia-noite.
         assert_eq!(
             Value::Time(0).as_civil_time(),
-            Some(CivilTime { hour: 0, minute: 0, second: 0, frac: 0 })
+            Some(CivilTime {
+                hour: 0,
+                minute: 0,
+                second: 0,
+                frac: 0
+            })
         );
         // 23:59:59 e 0.9999 s = (23*3600+59*60+59)*10000 + 9999.
         let raw = (23 * 3600 + 59 * 60 + 59) * 10_000 + 9999;
         assert_eq!(
             Value::Time(raw).as_civil_time(),
-            Some(CivilTime { hour: 23, minute: 59, second: 59, frac: 9999 })
+            Some(CivilTime {
+                hour: 23,
+                minute: 59,
+                second: 59,
+                frac: 9999
+            })
         );
         let v = Value::time(13, 45, 30, 1234);
         let ct = v.as_civil_time().unwrap();
@@ -395,8 +515,17 @@ mod tests {
 
     #[test]
     fn timestamp_splits_date_and_time() {
-        let date = CivilDate { year: 2026, month: 6, day: 20 };
-        let time = CivilTime { hour: 9, minute: 30, second: 15, frac: 0 };
+        let date = CivilDate {
+            year: 2026,
+            month: 6,
+            day: 20,
+        };
+        let time = CivilTime {
+            hour: 9,
+            minute: 30,
+            second: 15,
+            frac: 0,
+        };
         let v = Value::timestamp(date, time);
         let ts = v.as_civil_timestamp().unwrap();
         assert_eq!(ts.date, date);
@@ -406,5 +535,23 @@ mod tests {
         // Mas a parte de data de um Timestamp é acessível por as_civil_date.
         assert_eq!(v.as_civil_date(), Some(date));
         assert_eq!(v.as_civil_time(), Some(time));
+    }
+
+    #[test]
+    fn value_from_rust_primitives() {
+        assert_eq!(Value::from(true), Value::Bool(true));
+        assert_eq!(Value::from(7_i16), Value::Short(7));
+        assert_eq!(Value::from(42_i32), Value::Int(42));
+        assert_eq!(Value::from(99_i64), Value::BigInt(99));
+        assert_eq!(Value::from(123_i128), Value::Int128(123));
+        assert_eq!(Value::from(1.5_f32), Value::Float(1.5));
+        assert_eq!(Value::from(2.5_f64), Value::Double(2.5));
+        assert_eq!(Value::from("Ana"), Value::Text("Ana".to_string()));
+        assert_eq!(
+            Value::from("Bruno".to_string()),
+            Value::Text("Bruno".to_string())
+        );
+        assert_eq!(Value::from(vec![1_u8, 2, 3]), Value::Bytes(vec![1, 2, 3]));
+        assert_eq!(Value::from(&[4_u8, 5][..]), Value::Bytes(vec![4, 5]));
     }
 }

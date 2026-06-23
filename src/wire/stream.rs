@@ -9,12 +9,14 @@
 //! dependentes de posição, a cifra é aplicada aos bytes brutos exatamente uma vez, em
 //! ordem, conforme atravessam o socket.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+#![allow(missing_docs)]
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
 use crate::error::{Error, Result};
-use crate::wire::consts::{op, INFO_END};
-use crate::wire::xdr::{pad4, XdrWriter};
+use crate::wire::consts::{INFO_END, op};
+use crate::wire::xdr::{XdrWriter, pad4};
 
 /// Uma cifra de fluxo (stream) simétrica aplicada ao protocolo de comunicação (wire protocol) após `op_crypt`.
 ///
@@ -90,18 +92,18 @@ impl FbStream {
     }
 
     /// Descarrega (flush) toda a saida em buffer, criptografando se uma cifra estiver instalada.
-    pub async fn flush(&mut self) -> Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         if self.wbuf.is_empty() {
             return Ok(());
         }
         if let Some(c) = self.write_cipher.as_mut() {
             c.process(&mut self.wbuf);
         }
-        if let Err(e) = self.sock.write_all(&self.wbuf).await {
+        if let Err(e) = self.sock.write_all(&self.wbuf) {
             self.broken = true;
             return Err(e.into());
         }
-        if let Err(e) = self.sock.flush().await {
+        if let Err(e) = self.sock.flush() {
             self.broken = true;
             return Err(e.into());
         }
@@ -110,16 +112,16 @@ impl FbStream {
     }
 
     /// Enfileira e imediatamente descarrega (flush) uma operação.
-    pub async fn send(&mut self, w: &XdrWriter) -> Result<()> {
+    pub fn send(&mut self, w: &XdrWriter) -> Result<()> {
         self.enqueue(w);
-        self.flush().await
+        self.flush()
     }
 
     // -- leitura -----------------------------------------------------------
 
     /// Garante que pelo menos `n` bytes descriptografados estejam disponíveis no cursor de leitura,
     /// extraindo (e descriptografando) mais do socket conforme necessário.
-    async fn fill(&mut self, n: usize) -> Result<()> {
+    fn fill(&mut self, n: usize) -> Result<()> {
         // Compacta ocasionalmente para que o buffer não cresça indefinidamente.
         if self.rpos > 0 && self.rpos == self.rbuf.len() {
             self.rbuf.clear();
@@ -131,7 +133,7 @@ impl FbStream {
 
         while self.rbuf.len() - self.rpos < n {
             let mut chunk = [0u8; 8192];
-            let got = match self.sock.read(&mut chunk).await {
+            let got = match self.sock.read(&mut chunk) {
                 Ok(n) => n,
                 Err(e) => {
                     self.broken = true;
@@ -152,55 +154,55 @@ impl FbStream {
     }
 
     /// Consome `n` bytes do cursor de leitura (sem preenchimento (padding) XDR).
-    pub async fn read_raw(&mut self, n: usize) -> Result<Vec<u8>> {
-        self.fill(n).await?;
+    pub fn read_raw(&mut self, n: usize) -> Result<Vec<u8>> {
+        self.fill(n)?;
         let start = self.rpos;
         self.rpos += n;
         Ok(self.rbuf[start..start + n].to_vec())
     }
 
-    pub async fn read_i32(&mut self) -> Result<i32> {
-        self.fill(4).await?;
+    pub fn read_i32(&mut self) -> Result<i32> {
+        self.fill(4)?;
         let b = &self.rbuf[self.rpos..self.rpos + 4];
         let v = i32::from_be_bytes(b.try_into().unwrap());
         self.rpos += 4;
         Ok(v)
     }
 
-    pub async fn read_i64(&mut self) -> Result<i64> {
-        self.fill(8).await?;
+    pub fn read_i64(&mut self) -> Result<i64> {
+        self.fill(8)?;
         let b = &self.rbuf[self.rpos..self.rpos + 8];
         let v = i64::from_be_bytes(b.try_into().unwrap());
         self.rpos += 8;
         Ok(v)
     }
 
-    pub async fn read_f64(&mut self) -> Result<f64> {
-        Ok(f64::from_bits(self.read_i64().await? as u64))
+    pub fn read_f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.read_i64()? as u64))
     }
 
     /// Pula o preenchimento (padding) XDR para que o deslocamento absoluto de bytes desde o início do
     /// fluxo (stream) caia em um limite de 4 bytes. Rastreamos o alinhamento via `data_len`, não `rpos`,
     /// então o chamador passa o comprimento do campo de dados recém-lido.
-    pub async fn read_pad(&mut self, data_len: usize) -> Result<()> {
+    pub fn read_pad(&mut self, data_len: usize) -> Result<()> {
         let pad = pad4(data_len) - data_len;
         if pad > 0 {
-            let _ = self.read_raw(pad).await?;
+            let _ = self.read_raw(pad)?;
         }
         Ok(())
     }
 
     /// Lê um buffer opaco com prefixo de comprimento, alinhado em 4 bytes.
-    pub async fn read_bytes(&mut self) -> Result<Vec<u8>> {
-        let len = self.read_i32().await? as usize;
-        let data = self.read_raw(len).await?;
-        self.read_pad(len).await?;
+    pub fn read_bytes(&mut self) -> Result<Vec<u8>> {
+        let len = self.read_i32()? as usize;
+        let data = self.read_raw(len)?;
+        self.read_pad(len)?;
         Ok(data)
     }
 
     /// Lê um quad do Firebird (id de blob/transação): duas palavras XDR, alta depois baixa.
-    pub async fn read_quad(&mut self) -> Result<u64> {
-        Ok(self.read_i64().await? as u64)
+    pub fn read_quad(&mut self) -> Result<u64> {
+        Ok(self.read_i64()? as u64)
     }
 }
 

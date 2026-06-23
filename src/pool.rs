@@ -2,11 +2,15 @@
 //!
 //! [`Pool`] mantém um conjunto de [`Connection`]s ociosas prontas para uso, limitando
 //! o total de conexões simultâneas ao servidor pelo campo [`PoolConfig::max_size`].
+//! O pool não executa `ping` antes de entregar uma conexão ociosa; ele só filtra
+//! conexões que já foram marcadas localmente como quebradas. Se o servidor fechar
+//! um socket em silêncio, a primeira operação real vai detectar o erro e a conexão
+//! será descartada ao retornar ao pool.
 //!
 //! ```text
 //! let pool = Pool::new(config, PoolConfig::default());
-//! let mut conn = pool.get().await?;   // pega do pool ou cria uma nova
-//! conn.ping().await?;                 // usa normalmente via Deref
+//! let mut conn = pool.get()?;   // pega do pool ou cria uma nova
+//! conn.ping()?;                 // usa normalmente via Deref
 //! drop(conn);                         // devolve ao pool automaticamente
 //! ```
 //!
@@ -22,10 +26,8 @@
 //! [`PooledConnection::discard`] antes de deixá-la cair.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::ConnectConfig;
 use crate::connection::Connection;
@@ -54,8 +56,80 @@ impl Default for PoolConfig {
 struct PoolState {
     config: ConnectConfig,
     idle: Mutex<VecDeque<Connection>>,
-    semaphore: Arc<Semaphore>,
+    permits: Arc<PermitPool>,
     acquisition_timeout: Option<Duration>,
+}
+
+struct PermitPool {
+    available: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl PermitPool {
+    fn new(max: usize) -> Self {
+        PermitPool {
+            available: Mutex::new(max),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, timeout: Option<Duration>) -> Result<Permit> {
+        let mut available = self
+            .available
+            .lock()
+            .map_err(|_| Error::Pool("pool lock poisoned".into()))?;
+
+        match timeout {
+            None => {
+                while *available == 0 {
+                    available = self
+                        .changed
+                        .wait(available)
+                        .map_err(|_| Error::Pool("pool lock poisoned".into()))?;
+                }
+            }
+            Some(timeout) => {
+                let deadline = Instant::now() + timeout;
+                while *available == 0 {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(Error::Timeout);
+                    }
+                    let wait = deadline.saturating_duration_since(now);
+                    let (guard, result) = self
+                        .changed
+                        .wait_timeout(available, wait)
+                        .map_err(|_| Error::Pool("pool lock poisoned".into()))?;
+                    available = guard;
+                    if result.timed_out() && *available == 0 {
+                        return Err(Error::Timeout);
+                    }
+                }
+            }
+        }
+
+        *available -= 1;
+        Ok(Permit {
+            permits: Arc::clone(self),
+        })
+    }
+
+    fn release(&self) {
+        if let Ok(mut available) = self.available.lock() {
+            *available += 1;
+            self.changed.notify_one();
+        }
+    }
+}
+
+struct Permit {
+    permits: Arc<PermitPool>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.permits.release();
+    }
 }
 
 /// Um pool de conexões ao Firebird. Clone livremente para compartilhar entre tarefas.
@@ -69,7 +143,7 @@ impl Pool {
         Pool(Arc::new(PoolState {
             config,
             idle: Mutex::new(VecDeque::new()),
-            semaphore: Arc::new(Semaphore::new(pool_config.max_size)),
+            permits: Arc::new(PermitPool::new(pool_config.max_size)),
             acquisition_timeout: pool_config.acquisition_timeout,
         }))
     }
@@ -79,20 +153,28 @@ impl Pool {
     ///
     /// Sempre que há uma conexão ociosa no pool, ela é reutilizada. Caso contrário,
     /// uma nova conexão é aberta. A conexão é devolvida ao pool ao cair fora de escopo.
-    pub async fn get(&self) -> Result<PooledConnection> {
-        let permit = self.acquire_permit().await?;
+    pub fn get(&self) -> Result<PooledConnection> {
+        let permit = self.acquire_permit()?;
 
         // Tenta reutilizar uma conexão ociosa, descartando as mortas.
         while let Some(conn) = self.pop_idle() {
             if conn_is_alive(&conn) {
-                return Ok(PooledConnection { conn: Some(conn), pool: self.clone(), permit: Some(permit) });
+                return Ok(PooledConnection {
+                    conn: Some(conn),
+                    pool: self.clone(),
+                    permit: Some(permit),
+                });
             }
             // Conexão morta — descarta e continua tentando; o permit permanece.
         }
 
         // Nenhuma ociosa disponível: abre uma nova.
-        let conn = Connection::connect(&self.0.config).await?;
-        Ok(PooledConnection { conn: Some(conn), pool: self.clone(), permit: Some(permit) })
+        let conn = Connection::connect(&self.0.config)?;
+        Ok(PooledConnection {
+            conn: Some(conn),
+            pool: self.clone(),
+            permit: Some(permit),
+        })
     }
 
     // Devolve uma conexão à fila de ociosas. Chamado pelo Drop de PooledConnection.
@@ -112,15 +194,8 @@ impl Pool {
         self.0.idle.lock().ok()?.pop_front()
     }
 
-    async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit> {
-        let sem = Arc::clone(&self.0.semaphore);
-        match self.0.acquisition_timeout {
-            None => sem.acquire_owned().await.map_err(|_| Error::protocol("pool fechado")),
-            Some(t) => tokio::time::timeout(t, sem.acquire_owned())
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::protocol("pool fechado")),
-        }
+    fn acquire_permit(&self) -> Result<Permit> {
+        self.0.permits.acquire(self.0.acquisition_timeout)
     }
 }
 
@@ -141,7 +216,7 @@ fn conn_is_alive(conn: &Connection) -> bool {
 pub struct PooledConnection {
     conn: Option<Connection>,
     pool: Pool,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<Permit>,
 }
 
 impl PooledConnection {

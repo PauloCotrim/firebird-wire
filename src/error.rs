@@ -52,15 +52,19 @@ pub enum Error {
 }
 
 impl Error {
+    /// Cria um erro de protocolo para validações internas do driver.
     pub fn protocol(msg: impl Into<String>) -> Self {
         Error::Protocol(msg.into())
     }
+    /// Cria um erro de autenticação ou negociação de criptografia.
     pub fn auth(msg: impl Into<String>) -> Self {
         Error::Auth(msg.into())
     }
+    /// Cria um erro de conversão de valor.
     pub fn conversion(msg: impl Into<String>) -> Self {
         Error::Conversion(msg.into())
     }
+    /// Cria um erro para recurso ainda não suportado.
     pub fn unsupported(msg: impl Into<String>) -> Self {
         Error::Unsupported(msg.into())
     }
@@ -100,7 +104,9 @@ pub enum StatusArg {
 /// Um status vector parseado mais uma mensagem legível por humanos com melhor esforço.
 #[derive(Debug, Clone)]
 pub struct StatusVector {
+    /// Argumentos crus enviados pelo Firebird no status vector.
     pub args: Vec<StatusArg>,
+    /// SQLSTATE de 5 caracteres, quando o servidor informa.
     pub sql_state: Option<String>,
 }
 
@@ -116,7 +122,9 @@ impl StatusVector {
     /// Verdadeiro quando o vetor representa uma falha real. Um `isc_arg_gds` com
     /// código `0` é o sentinela de "success" do Firebird e *não* é um erro.
     pub fn is_error(&self) -> bool {
-        self.args.iter().any(|a| matches!(a, StatusArg::Gds(c) if *c != 0))
+        self.args
+            .iter()
+            .any(|a| matches!(a, StatusArg::Gds(c) if *c != 0))
     }
 
     /// O primeiro código de erro GDS diferente de zero, se houver.
@@ -247,18 +255,26 @@ impl fmt::Display for StatusVector {
 /// Um erro do servidor: o status vector e sua mensagem renderizada.
 #[derive(Debug, Clone)]
 pub struct DatabaseError {
+    /// Status vector estruturado enviado pelo Firebird.
     pub status: StatusVector,
+    /// SQLSTATE de 5 caracteres, quando disponível.
     pub sql_state: Option<String>,
     message: String,
 }
 
 impl DatabaseError {
+    /// Cria um erro de banco a partir de um status vector já parseado.
     pub fn new(status: StatusVector) -> Self {
         let message = status.message();
         let sql_state = status.sql_state.clone();
-        DatabaseError { status, sql_state, message }
+        DatabaseError {
+            status,
+            sql_state,
+            message,
+        }
     }
 
+    /// O primeiro código GDS diferente de zero no status vector.
     pub fn gds_code(&self) -> Option<i32> {
         self.status.gds_code()
     }
@@ -289,7 +305,10 @@ mod tests {
     use super::*;
 
     fn sv(args: Vec<StatusArg>) -> StatusVector {
-        StatusVector { args, sql_state: None }
+        StatusVector {
+            args,
+            sql_state: None,
+        }
     }
 
     #[test]
@@ -315,7 +334,10 @@ mod tests {
             StatusArg::Number(1),
             StatusArg::Number(42),
         ]);
-        assert_eq!(v.message(), "Dynamic SQL Error; Token unknown - line 1, column 42");
+        assert_eq!(
+            v.message(),
+            "Dynamic SQL Error; Token unknown - line 1, column 42"
+        );
     }
 
     #[test]

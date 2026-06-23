@@ -115,6 +115,7 @@ impl SrpClient {
         SrpClient { hash, a, a_pub }
     }
 
+    /// Família de hash usada pelo cliente SRP (`Srp` = SHA-1, `Srp256` = SHA-256).
     pub fn hash(&self) -> SrpHash {
         self.hash
     }
@@ -265,7 +266,10 @@ mod tests {
         let server_secret = base.modpow(&b_priv, &n);
         let server_key = sha1_digest(&[&server_secret.to_bytes_be()]);
 
-        assert_eq!(client_key, server_key, "client and server session keys must match");
+        assert_eq!(
+            client_key, server_key,
+            "client and server session keys must match"
+        );
     }
 
     #[test]

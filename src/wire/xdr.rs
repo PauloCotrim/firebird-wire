@@ -5,6 +5,8 @@
 //! fornece auxiliares [`XdrWriter`]/[`XdrReader`] em memória mais construtores de clumplet
 //! para os vários buffers de parâmetros (DPB/TPB/SPB/BPB/batch PB).
 
+#![allow(missing_docs)]
+
 use crate::error::{Error, Result};
 
 /// Arredonda `n` para cima até o próximo múltiplo de 4.
@@ -22,12 +24,16 @@ pub struct XdrWriter {
 impl XdrWriter {
     #[inline]
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(64) }
+        Self {
+            buf: Vec::with_capacity(64),
+        }
     }
 
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
-        Self { buf: Vec::with_capacity(cap) }
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
     }
 
     #[inline]
@@ -285,7 +291,8 @@ impl ParameterBuffer {
     /// pelos itens de comprimento variável do batch parameter buffer.
     pub fn bytes_be_len4(&mut self, tag: u8, value: &[u8]) -> &mut Self {
         self.buf.push(tag);
-        self.buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(value);
         self
     }
@@ -335,7 +342,10 @@ mod tests {
     #[test]
     fn roundtrip_ints_and_bytes() {
         let mut w = XdrWriter::new();
-        w.put_i32(-7).put_i64(1 << 40).put_bytes(b"hello").put_str("hi");
+        w.put_i32(-7)
+            .put_i64(1 << 40)
+            .put_bytes(b"hello")
+            .put_str("hi");
         let bytes = w.into_vec();
 
         let mut r = XdrReader::new(&bytes);

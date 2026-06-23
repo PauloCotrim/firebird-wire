@@ -1,15 +1,14 @@
 [package]
-name = "fdb_driver"
+name = "firebird-wire"
 version = "0.1.0"
 edition = "2024"
-description = "Pure-Rust async driver for Firebird 5+ (wire protocol, SRP auth, batch/array DML)"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/PauloCotrim/fdb_driver"
-keywords = ["firebird", "database", "driver", "async", "sql"]
+description = "Pure-Rust sync driver for Firebird 5+ (wire protocol, SRP auth, batch/array DML)"
+license = "MIT"
+repository = "https://github.com/pinguixs/firebird-wire"
+keywords = ["firebird", "database"]
 categories = ["database"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
 bytes = "1"
 num-bigint = "0.4"
 num-traits = "0.2"
@@ -19,9 +18,6 @@ rand = "0.8"
 thiserror = "2"
 tracing = { version = "0.1", optional = true }
 encoding_rs = { version = "0.8", optional = true }
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
 
 [features]
 default = []

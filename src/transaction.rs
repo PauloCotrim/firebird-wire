@@ -34,24 +34,31 @@ pub enum IsolationLevel {
 /// Modo de acesso de leitura e escrita.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccessMode {
+    /// Permite leitura e escrita na transação.
     #[default]
     ReadWrite,
+    /// Permite apenas leitura; comandos que alteram dados falham.
     ReadOnly,
 }
 
 /// Comportamento em caso de conflito de bloqueio (lock).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LockResolution {
+    /// Aguarda quando outro usuário segura um bloqueio necessário.
     #[default]
     Wait,
+    /// Falha imediatamente quando há conflito de bloqueio.
     NoWait,
 }
 
 /// Construtor (builder) para o Transaction Parameter Buffer.
 #[derive(Debug, Clone, Default)]
 pub struct TransactionBuilder {
+    /// Nível de isolamento usado ao iniciar a transação.
     pub isolation: IsolationLevel,
+    /// Se a transação permite escrita ou apenas leitura.
     pub access: AccessMode,
+    /// O que fazer quando há conflito de bloqueio.
     pub lock_resolution: LockResolution,
     /// Timeout de bloqueio (lock) em segundos (só faz sentido com [`LockResolution::Wait`]).
     pub lock_timeout: Option<i32>,
@@ -62,25 +69,31 @@ pub struct TransactionBuilder {
 }
 
 impl TransactionBuilder {
+    /// Cria um builder com os padrões do driver: snapshot, leitura/escrita e wait.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Define o nível de isolamento.
     pub fn isolation(mut self, level: IsolationLevel) -> Self {
         self.isolation = level;
         self
     }
+    /// Marca a transação como somente leitura.
     pub fn read_only(mut self) -> Self {
         self.access = AccessMode::ReadOnly;
         self
     }
+    /// Marca a transação como leitura e escrita.
     pub fn read_write(mut self) -> Self {
         self.access = AccessMode::ReadWrite;
         self
     }
+    /// Faz conflitos de bloqueio falharem imediatamente.
     pub fn no_wait(mut self) -> Self {
         self.lock_resolution = LockResolution::NoWait;
         self
     }
+    /// Aguarda conflitos de bloqueio por até `seconds` segundos.
     pub fn lock_timeout(mut self, seconds: i32) -> Self {
         self.lock_resolution = LockResolution::Wait;
         self.lock_timeout = Some(seconds);
@@ -145,7 +158,10 @@ pub struct Transaction {
 
 impl Transaction {
     pub(crate) fn new(handle: i32) -> Self {
-        Transaction { handle, finished: false }
+        Transaction {
+            handle,
+            finished: false,
+        }
     }
 
     /// O handle da transação do lado do servidor.
@@ -154,39 +170,39 @@ impl Transaction {
     }
 
     /// Faz commit e libera a transação.
-    pub async fn commit(mut self, conn: &mut Connection) -> Result<()> {
-        self.finish(conn, op::COMMIT).await
+    pub fn commit(mut self, conn: &mut Connection) -> Result<()> {
+        self.finish(conn, op::COMMIT)
     }
 
     /// Faz rollback e libera a transação.
-    pub async fn rollback(mut self, conn: &mut Connection) -> Result<()> {
-        self.finish(conn, op::ROLLBACK).await
+    pub fn rollback(mut self, conn: &mut Connection) -> Result<()> {
+        self.finish(conn, op::ROLLBACK)
     }
 
     /// Faz commit mas mantém o contexto da transação (e o handle) ativo.
-    pub async fn commit_retaining(&self, conn: &mut Connection) -> Result<()> {
-        self.retain(conn, op::COMMIT_RETAINING).await
+    pub fn commit_retaining(&self, conn: &mut Connection) -> Result<()> {
+        self.retain(conn, op::COMMIT_RETAINING)
     }
 
     /// Faz rollback mas mantém o contexto da transação (e o handle) ativo.
-    pub async fn rollback_retaining(&self, conn: &mut Connection) -> Result<()> {
-        self.retain(conn, op::ROLLBACK_RETAINING).await
+    pub fn rollback_retaining(&self, conn: &mut Connection) -> Result<()> {
+        self.retain(conn, op::ROLLBACK_RETAINING)
     }
 
-    async fn finish(&mut self, conn: &mut Connection, opcode: i32) -> Result<()> {
+    fn finish(&mut self, conn: &mut Connection, opcode: i32) -> Result<()> {
         let mut w = op_packet(opcode);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         self.finished = true;
         Ok(())
     }
 
-    async fn retain(&self, conn: &mut Connection, opcode: i32) -> Result<()> {
+    fn retain(&self, conn: &mut Connection, opcode: i32) -> Result<()> {
         let mut w = op_packet(opcode);
         w.put_i32(self.handle);
-        conn.io().send(&w).await?;
-        read_response(conn.io()).await?;
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
         Ok(())
     }
 }
@@ -201,18 +217,18 @@ impl Drop for Transaction {
 
 impl Connection {
     /// Inicia uma transação com parâmetros padrão (snapshot, leitura e escrita, wait).
-    pub async fn begin(&mut self) -> Result<Transaction> {
-        self.begin_with(&TransactionBuilder::default()).await
+    pub fn begin(&mut self) -> Result<Transaction> {
+        self.begin_with(&TransactionBuilder::default())
     }
 
     /// Inicia uma transação com parâmetros explícitos.
-    pub async fn begin_with(&mut self, builder: &TransactionBuilder) -> Result<Transaction> {
+    pub fn begin_with(&mut self, builder: &TransactionBuilder) -> Result<Transaction> {
         let tpb = builder.build();
         let mut w = op_packet(op::TRANSACTION);
         w.put_i32(self.db_handle());
         w.put_bytes(&tpb);
-        self.io().send(&w).await?;
-        let resp = read_response(self.io()).await?;
+        self.io().send(&w)?;
+        let resp = read_response(self.io())?;
         Ok(Transaction::new(resp.handle))
     }
 }
@@ -224,7 +240,10 @@ mod tests {
     #[test]
     fn default_tpb_is_write_concurrency_wait() {
         let tpb = TransactionBuilder::default().build();
-        assert_eq!(tpb, vec![TPB_VERSION3, tpb::WRITE, tpb::CONCURRENCY, tpb::WAIT]);
+        assert_eq!(
+            tpb,
+            vec![TPB_VERSION3, tpb::WRITE, tpb::CONCURRENCY, tpb::WAIT]
+        );
     }
 
     #[test]
@@ -235,7 +254,13 @@ mod tests {
             .build();
         assert_eq!(
             tpb,
-            vec![TPB_VERSION3, tpb::READ, tpb::READ_COMMITTED, tpb::READ_CONSISTENCY, tpb::WAIT]
+            vec![
+                TPB_VERSION3,
+                tpb::READ,
+                tpb::READ_COMMITTED,
+                tpb::READ_CONSISTENCY,
+                tpb::WAIT
+            ]
         );
     }
 

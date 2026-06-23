@@ -50,10 +50,12 @@ impl DecFloat {
         self.kind == DecKind::Finite
     }
 
+    /// Se é `NaN` (not a number).
     pub fn is_nan(&self) -> bool {
         self.kind == DecKind::NaN
     }
 
+    /// Se é `Infinity` ou `-Infinity`.
     pub fn is_infinite(&self) -> bool {
         self.kind == DecKind::Infinity
     }
@@ -61,22 +63,38 @@ impl DecFloat {
     /// O coeficiente e o expoente de base 10 (`valor = ±coefficient·10^exponent`),
     /// para valores finitos.
     pub fn to_parts(&self) -> Option<(bool, u128, i32)> {
-        self.is_finite().then_some((self.negative, self.coefficient, self.exponent))
+        self.is_finite()
+            .then_some((self.negative, self.coefficient, self.exponent))
     }
 
     /// Constrói um valor finito `(-1)^negative · coefficient · 10^exponent`.
     pub fn from_parts(negative: bool, coefficient: u128, exponent: i32) -> DecFloat {
-        DecFloat { negative, kind: DecKind::Finite, coefficient, exponent }
+        DecFloat {
+            negative,
+            kind: DecKind::Finite,
+            coefficient,
+            exponent,
+        }
     }
 
     /// `±Infinity`.
     pub fn infinity(negative: bool) -> DecFloat {
-        DecFloat { negative, kind: DecKind::Infinity, coefficient: 0, exponent: 0 }
+        DecFloat {
+            negative,
+            kind: DecKind::Infinity,
+            coefficient: 0,
+            exponent: 0,
+        }
     }
 
     /// `NaN` (quiet).
     pub fn nan() -> DecFloat {
-        DecFloat { negative: false, kind: DecKind::NaN, coefficient: 0, exponent: 0 }
+        DecFloat {
+            negative: false,
+            kind: DecKind::NaN,
+            coefficient: 0,
+            exponent: 0,
+        }
     }
 
     /// Codifica como `DECFLOAT(16)` (decimal64, 8 bytes big-endian, como o
@@ -206,7 +224,11 @@ fn encode(negative: bool, coefficient: u128, exponent: i32, width: u32) -> Optio
 impl fmt::Display for DecFloat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            DecKind::Infinity => f.write_str(if self.negative { "-Infinity" } else { "Infinity" }),
+            DecKind::Infinity => f.write_str(if self.negative {
+                "-Infinity"
+            } else {
+                "Infinity"
+            }),
             DecKind::NaN => f.write_str("NaN"),
             DecKind::Finite => {
                 if self.negative {
@@ -255,8 +277,17 @@ fn decode(bits: u128, width: u32) -> DecFloat {
     let (msd, exp_top2) = if combo >> 3 == 0b11 {
         if (combo >> 1) & 0b1111 == 0b1111 {
             // 11110 = Infinity, 11111 = NaN.
-            let kind = if combo & 1 == 0 { DecKind::Infinity } else { DecKind::NaN };
-            return DecFloat { negative, kind, coefficient: 0, exponent: 0 };
+            let kind = if combo & 1 == 0 {
+                DecKind::Infinity
+            } else {
+                DecKind::NaN
+            };
+            return DecFloat {
+                negative,
+                kind,
+                coefficient: 0,
+                exponent: 0,
+            };
         }
         // MSD é 8 ou 9; os 2 bits altos do expoente são (combo>>1)&0b11.
         (8 + (combo & 1), (combo >> 1) & 0b11)
@@ -278,7 +309,12 @@ fn decode(bits: u128, width: u32) -> DecFloat {
         coefficient = coefficient * 1000 + dpd_to_int(dpd) as u128;
     }
 
-    DecFloat { negative, kind: DecKind::Finite, coefficient, exponent }
+    DecFloat {
+        negative,
+        kind: DecKind::Finite,
+        coefficient,
+        exponent,
+    }
 }
 
 /// Decodifica um declet DPD de 10 bits nos seus três dígitos decimais (0..=999),
@@ -318,7 +354,16 @@ fn bcd_to_dpd(d2: u16, d1: u16, d0: u16) -> u16 {
         0b110 => (j, k, dd, 0, 0, h, 1, 1, 1, m),
         _ => (0, 0, dd, 1, 1, h, 1, 1, 1, m), // 0b111
     };
-    (p << 9) | (q << 8) | (r << 7) | (s << 6) | (t << 5) | (u << 4) | (v << 3) | (x << 2) | (y << 1) | z
+    (p << 9)
+        | (q << 8)
+        | (r << 7)
+        | (s << 6)
+        | (t << 5)
+        | (u << 4)
+        | (v << 3)
+        | (x << 2)
+        | (y << 1)
+        | z
 }
 
 #[cfg(test)]
@@ -358,7 +403,17 @@ mod tests {
     #[test]
     fn parse_and_roundtrip_encode_decode() {
         use std::str::FromStr;
-        for s in ["0", "1", "123.45", "-3.14159", "100.00", "0.0005", "5000", "-0.0", "9999999999999999"] {
+        for s in [
+            "0",
+            "1",
+            "123.45",
+            "-3.14159",
+            "100.00",
+            "0.0005",
+            "5000",
+            "-0.0",
+            "9999999999999999",
+        ] {
             let d = DecFloat::from_str(s).unwrap();
             // decimal128 sempre cabe nestes exemplos; relê o mesmo texto.
             let back = DecFloat::from_decimal128(d.to_decimal128().unwrap());
@@ -394,7 +449,11 @@ mod tests {
 
     #[test]
     fn encode_specials_roundtrip() {
-        for d in [DecFloat::infinity(false), DecFloat::infinity(true), DecFloat::nan()] {
+        for d in [
+            DecFloat::infinity(false),
+            DecFloat::infinity(true),
+            DecFloat::nan(),
+        ] {
             let back = DecFloat::from_decimal128(d.to_decimal128().unwrap());
             assert_eq!(back.is_infinite(), d.is_infinite());
             assert_eq!(back.is_nan(), d.is_nan());

@@ -94,10 +94,18 @@ fn push_type(b: &mut Vec<u8>, col: &ColumnMeta, for_output: bool) {
         sql_type::DEC16 => b.push(blr::DEC64),
         sql_type::DEC34 => b.push(blr::DEC128),
         sql_type::TIME_TZ | sql_type::TIME_TZ_EX => {
-            b.push(if for_output { blr::EX_TIME_TZ } else { blr::SQL_TIME_TZ });
+            b.push(if for_output {
+                blr::EX_TIME_TZ
+            } else {
+                blr::SQL_TIME_TZ
+            });
         }
         sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => {
-            b.push(if for_output { blr::EX_TIMESTAMP_TZ } else { blr::TIMESTAMP_TZ });
+            b.push(if for_output {
+                blr::EX_TIMESTAMP_TZ
+            } else {
+                blr::TIMESTAMP_TZ
+            });
         }
         other => {
             // Recorre a um quad para que a mensagem continue parseável; o
@@ -152,8 +160,16 @@ mod tests {
     #[test]
     fn blr_for_smallint_and_varchar() {
         let cols = vec![
-            ColumnMeta { sql_type: sql_type::SHORT, scale: 0, ..Default::default() },
-            ColumnMeta { sql_type: sql_type::VARYING, length: 15, ..Default::default() },
+            ColumnMeta {
+                sql_type: sql_type::SHORT,
+                scale: 0,
+                ..Default::default()
+            },
+            ColumnMeta {
+                sql_type: sql_type::VARYING,
+                length: 15,
+                ..Default::default()
+            },
         ];
         let blr_bytes = message_blr(&cols);
         // version5, begin, message, msg#0, count=4(LE), short/0, short/0(null),
