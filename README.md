@@ -35,6 +35,9 @@ fn main() -> firebird_wire::Result<()> {
 - **[GUIA-DE-USO.md](GUIA-DE-USO.md)** — guia completo de uso, com exemplos de
   conexão, query, execute, transações, batch, BLOBs, pool, charsets, wire-crypt
   e mais, além do checklist de recursos.
+- **[DIAGRAMA-INTERNO.md](DIAGRAMA-INTERNO.md)** — diagrama/fluxograma do
+  funcionamento interno: conexão, handshake, transação, prepare, execute, fetch
+  e camadas do wire protocol.
 - **[PROTOCOL-NOTES.md](PROTOCOL-NOTES.md)** — notas de engenharia reversa dos
   layouts do wire protocol.
 
