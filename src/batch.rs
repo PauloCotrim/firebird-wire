@@ -162,6 +162,14 @@ impl Batch {
         self.pending_count
     }
 
+    /// Tamanho (alinhado) do stream de BLOBs acumulado mas ainda não enviado, em
+    /// bytes. Zera após [`Batch::execute`]/[`Batch::cancel`]. Útil para o chamador
+    /// drenar o lote por *volume de blob* (e não só por contagem de linhas) e assim
+    /// não estourar o buffer de batch do servidor (`TAG_BUFFER_BYTES_SIZE`).
+    pub fn blob_stream_len(&self) -> usize {
+        self.blob_stream_len
+    }
+
     /// Os metadados dos parâmetros de entrada (a forma de cada linha esperada).
     pub fn params(&self) -> &[ColumnMeta] {
         &self.params
@@ -398,6 +406,12 @@ pub struct BatchOptions {
     /// Se `true` (**padrão**), o servidor reporta a contagem de linhas afetadas por
     /// mensagem em [`BatchResult::update_counts`] (e portanto [`BatchResult::total_affected`]).
     pub record_counts: bool,
+    /// Tamanho máximo (em bytes) do buffer de batch que o servidor aloca
+    /// (`TAG_BUFFER_BYTES_SIZE`). `None` (**padrão**) deixa o servidor usar o seu
+    /// default. Aumentar permite acumular mais mensagens/blobs por `execute` sem
+    /// estourar o buffer (o estouro aparece como "invalid BLOB ID"); o servidor
+    /// impõe um teto próprio (256 MiB no Firebird).
+    pub buffer_bytes: Option<u32>,
 }
 
 impl Default for BatchOptions {
@@ -408,6 +422,7 @@ impl Default for BatchOptions {
         BatchOptions {
             multierror: false,
             record_counts: true,
+            buffer_bytes: None,
         }
     }
 }
@@ -427,6 +442,15 @@ impl BatchOptions {
     /// Liga/desliga o reporte de contagens de linhas afetadas por mensagem.
     pub fn record_counts(mut self, on: bool) -> Self {
         self.record_counts = on;
+        self
+    }
+
+    /// Define o tamanho do buffer de batch do servidor (`TAG_BUFFER_BYTES_SIZE`),
+    /// em bytes. Use para acomodar lotes maiores (mais mensagens/blobs por
+    /// `execute`) sem estourar o buffer. O servidor impõe um teto (256 MiB no
+    /// Firebird); valores acima são limitados por ele.
+    pub fn buffer_bytes(mut self, bytes: u32) -> Self {
+        self.buffer_bytes = Some(bytes);
         self
     }
 }
@@ -475,6 +499,9 @@ impl Connection {
         }
         if opts.multierror {
             pb.bytes_be_len4(batch_tag::MULTIERROR, &1u32.to_le_bytes());
+        }
+        if let Some(bytes) = opts.buffer_bytes {
+            pb.bytes_be_len4(batch_tag::BUFFER_BYTES_SIZE, &bytes.to_le_bytes());
         }
         if blob_stream {
             pb.bytes_be_len4(
@@ -610,4 +637,87 @@ fn read_batch_cs(conn: &mut Connection) -> Result<BatchResult> {
         update_counts,
         errors: batch_errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cria um `Batch` "de mentira" (sem conexão/servidor) só para exercitar a
+    /// contabilidade EM MEMÓRIA de `add_blob`. `closed: true` evita o aviso de Drop.
+    fn fake_blob_batch() -> Batch {
+        Batch {
+            handle: 0,
+            params: Vec::new(),
+            pending: Vec::new(),
+            pending_count: 0,
+            pending_blobs: Vec::new(),
+            blob_stream_len: 0,
+            pending_regblobs: Vec::new(),
+            next_blob_id: 1,
+            blob_stream: true,
+            charset: crate::charset::Charset::Utf8,
+            default_bpb: None,
+            blob_segmented: false,
+            closed: true,
+        }
+    }
+
+    /// Bytes que cada blob (não-segmentado) ocupa no buffer do servidor:
+    /// `align4(16 + dados)` (cabeçalho de 16 B + dados, alinhado a `BLOB_ALIGN`).
+    fn entry_len(data_len: usize) -> usize {
+        align_up(16 + data_len, BLOB_ALIGN)
+    }
+
+    #[test]
+    fn add_blob_atribui_ids_sequenciais_a_partir_de_1() {
+        let mut b = fake_blob_batch();
+        assert_eq!(b.add_blob(b"a").unwrap(), 1);
+        assert_eq!(b.add_blob(b"bb").unwrap(), 2);
+        assert_eq!(b.add_blob(b"ccc").unwrap(), 3);
+    }
+
+    #[test]
+    fn add_blob_exige_coluna_blob() {
+        let mut b = fake_blob_batch();
+        b.blob_stream = false;
+        assert!(b.add_blob(b"x").is_err());
+    }
+
+    /// O invariante do qual o flush por bytes depende: `blob_stream_len()` é a soma
+    /// de `align4(16 + dados)` de cada blob — inclusive (e principalmente) para
+    /// tamanhos NÃO múltiplos de 4, que arredondam pra cima.
+    #[test]
+    fn blob_stream_len_acumula_tamanhos_alinhados() {
+        let mut b = fake_blob_batch();
+        for data in [&b"x"[..], &b"yy"[..], &b"zzz"[..], &b"wwww"[..]] {
+            b.add_blob(data).unwrap();
+        }
+        let esperado = entry_len(1) + entry_len(2) + entry_len(3) + entry_len(4);
+        assert_eq!(b.blob_stream_len(), esperado);
+        // A soma é sempre múltipla de BLOB_ALIGN (cada parcela é).
+        assert_eq!(b.blob_stream_len() % BLOB_ALIGN, 0);
+    }
+
+    /// Casos pontuais do tamanho declarado para um único blob (cabeçalho 16 B +
+    /// dados, alinhado a 4): 30 -> align4(46)=48; 33 -> align4(49)=52.
+    #[test]
+    fn blob_stream_len_de_um_unico_blob() {
+        let mut b = fake_blob_batch();
+        b.add_blob(&[0u8; 30]).unwrap();
+        assert_eq!(b.blob_stream_len(), 48);
+
+        let mut b = fake_blob_batch();
+        b.add_blob(&[0u8; 33]).unwrap();
+        assert_eq!(b.blob_stream_len(), 52);
+    }
+
+    /// `BatchOptions` por padrão não fixa o buffer (deixa o default do servidor); o
+    /// builder `buffer_bytes` registra o limite a enviar como `TAG_BUFFER_BYTES_SIZE`.
+    #[test]
+    fn batch_options_buffer_bytes() {
+        assert_eq!(BatchOptions::new().buffer_bytes, None);
+        let opts = BatchOptions::new().buffer_bytes(16 * 1024 * 1024);
+        assert_eq!(opts.buffer_bytes, Some(16 * 1024 * 1024));
+    }
 }
