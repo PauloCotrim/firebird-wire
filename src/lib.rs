@@ -97,7 +97,9 @@ pub use statement::{RowStream, RowsAffected, Statement};
 pub use transaction::{
     AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder,
 };
-pub use value::{CivilDate, CivilTime, CivilTimestamp, ColumnMeta, TimeTz, TimestampTz, Value};
+pub use value::{
+    CivilDate, CivilTime, CivilTimestamp, ColumnMeta, TimeTz, TimestampTz, Value, ValueRef,
+};
 
 /// Emite um aviso (apenas em builds de debug) quando um recurso com estado no
 /// servidor (`Statement`, `Transaction`, `Blob`, `BlobWriter`) é solto sem ser

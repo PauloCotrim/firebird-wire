@@ -20,9 +20,9 @@
 use crate::blr::{input_blr, message_blr, prepare_info_items};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
-use crate::message::{decode_row, encode_row};
+use crate::message::{decode_row, encode_row, encode_row_ref};
 use crate::transaction::Transaction;
-use crate::value::{ColumnMeta, Value};
+use crate::value::{ColumnMeta, Value, ValueRef};
 use crate::wire::consts::*;
 use crate::wire::response::{read_op, read_response, read_response_body};
 use crate::wire::stream::{op_name, op_packet};
@@ -150,14 +150,40 @@ impl Statement {
         tx: &Transaction,
         params: &[Value],
     ) -> Result<()> {
+        let message = if self.params.is_empty() {
+            Vec::new()
+        } else {
+            encode_row(&self.params, params, conn.charset())?
+        };
+        self.execute_message(conn, tx, &message)
+    }
+
+    /// Executa a instrução usando parâmetros emprestados. É a variante de
+    /// [`Self::execute`] para evitar materializar [`Value::Text`] ou
+    /// [`Value::Bytes`] quando o chamador já tem `&str`/`&[u8]`.
+    pub fn execute_ref(
+        &mut self,
+        conn: &mut Connection,
+        tx: &Transaction,
+        params: &[ValueRef<'_>],
+    ) -> Result<()> {
+        let message = if self.params.is_empty() {
+            Vec::new()
+        } else {
+            encode_row_ref(&self.params, params, conn.charset())?
+        };
+        self.execute_message(conn, tx, &message)
+    }
+
+    fn execute_message(
+        &mut self,
+        conn: &mut Connection,
+        tx: &Transaction,
+        message: &[u8],
+    ) -> Result<()> {
         let has_params = !self.params.is_empty();
         let in_blr = if has_params {
             input_blr(&self.params)
-        } else {
-            Vec::new()
-        };
-        let message = if has_params {
-            encode_row(&self.params, params, conn.charset())?
         } else {
             Vec::new()
         };
@@ -172,7 +198,7 @@ impl Statement {
         // e antes dos campos de saída (confirmado por captura strace do fbclient:
         // bitmap de nulos + valores XDR, formato compacto). Sem parâmetros, nada.
         if has_params {
-            w.put_raw(&message);
+            w.put_raw(message);
             w.align();
         }
         // O op_execute da v19 carrega campos de saída no estilo execute2 mesmo

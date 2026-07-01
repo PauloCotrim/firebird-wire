@@ -9,7 +9,7 @@
 
 use crate::charset::Charset;
 use crate::error::{Error, Result};
-use crate::value::{ColumnMeta, Value, align4};
+use crate::value::{ColumnMeta, Value, ValueRef, align4};
 use crate::wire::consts::sql_type;
 use crate::wire::stream::FbStream;
 
@@ -76,6 +76,19 @@ pub fn encode_row(columns: &[ColumnMeta], values: &[Value], charset: Charset) ->
     Ok(out)
 }
 
+/// Codifica uma linha de parâmetros emprestados. Diferente de [`encode_row`],
+/// aceita [`ValueRef`], permitindo enviar `&str`/`&[u8]` sem criar [`Value`]
+/// owned.
+pub fn encode_row_ref(
+    columns: &[ColumnMeta],
+    values: &[ValueRef<'_>],
+    charset: Charset,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_row_ref_into(&mut out, columns, values, charset)?;
+    Ok(out)
+}
+
 /// Como [`encode_row`], mas **anexa** a mensagem ao fim de `out`, sem alocar um buffer
 /// temporário por linha — útil para acumular muitas linhas (ver [`crate::Batch::add`]).
 ///
@@ -88,11 +101,37 @@ pub fn encode_row_into(
     values: &[Value],
     charset: Charset,
 ) -> Result<()> {
-    if values.len() != columns.len() {
+    encode_row_values_into(
+        out,
+        columns,
+        values.len(),
+        values.iter().map(ValueRef::from),
+        charset,
+    )
+}
+
+/// Como [`encode_row_ref`], mas anexa ao buffer de saída.
+pub fn encode_row_ref_into(
+    out: &mut Vec<u8>,
+    columns: &[ColumnMeta],
+    values: &[ValueRef<'_>],
+    charset: Charset,
+) -> Result<()> {
+    encode_row_values_into(out, columns, values.len(), values.iter().copied(), charset)
+}
+
+fn encode_row_values_into<'a>(
+    out: &mut Vec<u8>,
+    columns: &[ColumnMeta],
+    values_len: usize,
+    values: impl IntoIterator<Item = ValueRef<'a>>,
+    charset: Charset,
+) -> Result<()> {
+    if values_len != columns.len() {
         return Err(Error::protocol(format!(
             "parameter count mismatch: statement expects {}, got {}",
             columns.len(),
-            values.len()
+            values_len
         )));
     }
     let inicio = out.len();
@@ -118,26 +157,31 @@ fn put_pad(out: &mut Vec<u8>, data_len: usize) {
     }
 }
 
-fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Charset) -> Result<()> {
+fn encode_value(
+    out: &mut Vec<u8>,
+    col: &ColumnMeta,
+    val: ValueRef<'_>,
+    charset: Charset,
+) -> Result<()> {
     let mismatch = || Error::protocol(format!("value does not fit column type {}", col.sql_type));
     match sql_type::base(col.sql_type) {
         sql_type::SHORT => put_i32_be(out, i32::from(val.as_i64().ok_or_else(mismatch)? as i16)),
         sql_type::LONG => put_i32_be(out, val.as_i64().ok_or_else(mismatch)? as i32),
         sql_type::INT64 => out.extend_from_slice(&val.as_i64().ok_or_else(mismatch)?.to_be_bytes()),
         sql_type::INT128 => match val {
-            Value::Int128(v) => out.extend_from_slice(&v.to_be_bytes()),
+            ValueRef::Int128(v) => out.extend_from_slice(&v.to_be_bytes()),
             _ => {
                 out.extend_from_slice(&i128::from(val.as_i64().ok_or_else(mismatch)?).to_be_bytes())
             }
         },
         sql_type::FLOAT => match val {
-            Value::Float(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
-            Value::Double(f) => out.extend_from_slice(&(*f as f32).to_bits().to_be_bytes()),
+            ValueRef::Float(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
+            ValueRef::Double(f) => out.extend_from_slice(&(f as f32).to_bits().to_be_bytes()),
             _ => return Err(mismatch()),
         },
         sql_type::DOUBLE | sql_type::D_FLOAT => match val {
-            Value::Double(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
-            Value::Float(f) => out.extend_from_slice(&(f64::from(*f)).to_bits().to_be_bytes()),
+            ValueRef::Double(f) => out.extend_from_slice(&f.to_bits().to_be_bytes()),
+            ValueRef::Float(f) => out.extend_from_slice(&(f64::from(f)).to_bits().to_be_bytes()),
             _ => return Err(mismatch()),
         },
         sql_type::VARYING => {
@@ -159,44 +203,46 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
         sql_type::TYPE_DATE => put_i32_be(out, expect_date(val)?),
         sql_type::TYPE_TIME => put_i32_be(out, expect_time(val)? as i32),
         sql_type::TIMESTAMP => match val {
-            Value::Timestamp(d, t) => {
-                put_i32_be(out, *d);
-                put_i32_be(out, *t as i32);
+            ValueRef::Timestamp(d, t) => {
+                put_i32_be(out, d);
+                put_i32_be(out, t as i32);
             }
             _ => return Err(mismatch()),
         },
         sql_type::BOOLEAN => {
-            out.push(matches!(val, Value::Bool(true)) as u8);
+            out.push(matches!(val, ValueRef::Bool(true)) as u8);
             put_pad(out, 1);
         }
         sql_type::DEC16 => match val {
-            Value::DecFloat(d) => out.extend_from_slice(&d.to_decimal64().ok_or_else(mismatch)?),
+            ValueRef::DecFloat(d) => out.extend_from_slice(&d.to_decimal64().ok_or_else(mismatch)?),
             _ => return Err(mismatch()),
         },
         sql_type::DEC34 => match val {
-            Value::DecFloat(d) => out.extend_from_slice(&d.to_decimal128().ok_or_else(mismatch)?),
+            ValueRef::DecFloat(d) => {
+                out.extend_from_slice(&d.to_decimal128().ok_or_else(mismatch)?)
+            }
             _ => return Err(mismatch()),
         },
         sql_type::BLOB | sql_type::QUAD => match val {
-            Value::Blob(id) => out.extend_from_slice(&id.to_be_bytes()),
+            ValueRef::Blob(id) => out.extend_from_slice(&id.to_be_bytes()),
             _ => return Err(mismatch()),
         },
         // Coluna ARRAY como parâmetro: passa um id de array existente (quad 8 B).
         sql_type::ARRAY => match val {
-            Value::Array(id) => out.extend_from_slice(&id.to_be_bytes()),
+            ValueRef::Array(id) => out.extend_from_slice(&id.to_be_bytes()),
             _ => return Err(mismatch()),
         },
         // WITH TIME ZONE como parâmetro: o BLR de entrada usa o formato base
         // (não-`_EX`), então enviamos UTC + zona; o servidor recalcula o offset.
         sql_type::TIME_TZ | sql_type::TIME_TZ_EX => match val {
-            Value::TimeTz(t) => {
+            ValueRef::TimeTz(t) => {
                 put_i32_be(out, t.utc_time as i32);
                 put_i32_be(out, i32::from(t.zone));
             }
             _ => return Err(mismatch()),
         },
         sql_type::TIMESTAMP_TZ | sql_type::TIMESTAMP_TZ_EX => match val {
-            Value::TimestampTz(t) => {
+            ValueRef::TimestampTz(t) => {
                 put_i32_be(out, t.utc_date);
                 put_i32_be(out, t.utc_time as i32);
                 put_i32_be(out, i32::from(t.zone));
@@ -213,28 +259,31 @@ fn encode_value(out: &mut Vec<u8>, col: &ColumnMeta, val: &Value, charset: Chars
     Ok(())
 }
 
-fn text_bytes(val: &Value, charset: Charset) -> Result<std::borrow::Cow<'_, [u8]>> {
+fn text_bytes(val: ValueRef<'_>, charset: Charset) -> Result<std::borrow::Cow<'_, [u8]>> {
     use std::borrow::Cow;
     match val {
         // Texto é transcodificado para o charset da conexão; bytes/OCTETS vão crus.
-        Value::Text(s) => Ok(Cow::Owned(charset.encode(s))),
-        Value::Bytes(b) => Ok(Cow::Borrowed(b)),
+        ValueRef::Text(s) if matches!(charset, Charset::Utf8 | Charset::Unknown) => {
+            Ok(Cow::Borrowed(s.as_bytes()))
+        }
+        ValueRef::Text(s) => Ok(Cow::Owned(charset.encode(s))),
+        ValueRef::Bytes(b) => Ok(Cow::Borrowed(b)),
         _ => Err(Error::protocol("expected a text/bytes value")),
     }
 }
 
-fn expect_date(val: &Value) -> Result<i32> {
+fn expect_date(val: ValueRef<'_>) -> Result<i32> {
     match val {
-        Value::Date(d) => Ok(*d),
-        Value::Timestamp(d, _) => Ok(*d),
+        ValueRef::Date(d) => Ok(d),
+        ValueRef::Timestamp(d, _) => Ok(d),
         _ => Err(Error::protocol("expected a DATE value")),
     }
 }
 
-fn expect_time(val: &Value) -> Result<u32> {
+fn expect_time(val: ValueRef<'_>) -> Result<u32> {
     match val {
-        Value::Time(t) => Ok(*t),
-        Value::Timestamp(_, t) => Ok(*t),
+        ValueRef::Time(t) => Ok(t),
+        ValueRef::Timestamp(_, t) => Ok(t),
         _ => Err(Error::protocol("expected a TIME value")),
     }
 }
@@ -401,5 +450,23 @@ mod tests {
         .unwrap();
         assert_eq!(msg.len() % 4, 0);
         assert_eq!(msg.len(), 16); // bitmap(4) + int(4) + len(4)+"um"+pad(2)=8
+    }
+
+    #[test]
+    fn encode_row_ref_matches_owned_values() {
+        let cols = [col(sql_type::LONG, 4), col(sql_type::VARYING, 20)];
+        let owned = encode_row(
+            &cols,
+            &[Value::Int(1), Value::Text("um".into())],
+            Charset::Utf8,
+        )
+        .unwrap();
+        let borrowed = encode_row_ref(
+            &cols,
+            &[ValueRef::Int(1), ValueRef::Text("um")],
+            Charset::Utf8,
+        )
+        .unwrap();
+        assert_eq!(borrowed, owned);
     }
 }

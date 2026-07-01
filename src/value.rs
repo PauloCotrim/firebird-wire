@@ -47,6 +47,51 @@ pub enum Value {
     TimestampTz(TimestampTz),
 }
 
+/// Valor SQL emprestado para envio de parâmetros sem materializar um [`Value`]
+/// owned. Útil principalmente para texto e bytes (`&str`/`&[u8]`).
+///
+/// Valores recebidos do servidor continuam usando [`Value`], porque o buffer de
+/// rede não vive além da decodificação da linha.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueRef<'a> {
+    /// Valor SQL `NULL`.
+    Null,
+    /// Booleano SQL (`BOOLEAN`).
+    Bool(bool),
+    /// SMALLINT.
+    Short(i16),
+    /// INTEGER.
+    Int(i32),
+    /// BIGINT.
+    BigInt(i64),
+    /// Número de ponto flutuante de 32 bits (`FLOAT`).
+    Float(f32),
+    /// Número de ponto flutuante de 64 bits (`DOUBLE PRECISION`).
+    Double(f64),
+    /// Texto CHAR/VARCHAR emprestado.
+    Text(&'a str),
+    /// Bytes brutos emprestados.
+    Bytes(&'a [u8]),
+    /// Identificador de blob.
+    Blob(u64),
+    /// Identificador de ARRAY.
+    Array(u64),
+    /// Dias desde 1858-11-17.
+    Date(i32),
+    /// Hora em décimos de milésimo de segundo desde a meia-noite.
+    Time(u32),
+    /// Par (data, hora).
+    Timestamp(i32, u32),
+    /// Inteiro de 128 bits.
+    Int128(i128),
+    /// `DECFLOAT(16)`/`DECFLOAT(34)`.
+    DecFloat(crate::decfloat::DecFloat),
+    /// `TIME WITH TIME ZONE`.
+    TimeTz(TimeTz),
+    /// `TIMESTAMP WITH TIME ZONE`.
+    TimestampTz(TimestampTz),
+}
+
 /// `TIME WITH TIME ZONE`: a hora é armazenada em UTC; a zona é um id do Firebird
 /// (veja [`crate::tz`]). O `offset` (minutos a leste de UTC) é o offset RESOLVIDO
 /// para este instante — o servidor o calcula (já aplicando horário de verão) e o
@@ -305,6 +350,147 @@ impl Value {
             Value::Text(s) => Some(s),
             _ => None,
         }
+    }
+}
+
+impl<'a> ValueRef<'a> {
+    /// Verdadeiro quando o valor é [`ValueRef::Null`].
+    pub fn is_null(self) -> bool {
+        matches!(self, ValueRef::Null)
+    }
+
+    /// Visão `i64` de melhor esforço de um valor inteiro.
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            ValueRef::Short(v) => Some(v as i64),
+            ValueRef::Int(v) => Some(v as i64),
+            ValueRef::BigInt(v) => Some(v),
+            ValueRef::Int128(v) => i64::try_from(v).ok(),
+            _ => None,
+        }
+    }
+
+    /// Empresta o texto de um valor de string.
+    pub fn as_str(self) -> Option<&'a str> {
+        match self {
+            ValueRef::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> From<&'a Value> for ValueRef<'a> {
+    fn from(v: &'a Value) -> Self {
+        match v {
+            Value::Null => ValueRef::Null,
+            Value::Bool(v) => ValueRef::Bool(*v),
+            Value::Short(v) => ValueRef::Short(*v),
+            Value::Int(v) => ValueRef::Int(*v),
+            Value::BigInt(v) => ValueRef::BigInt(*v),
+            Value::Float(v) => ValueRef::Float(*v),
+            Value::Double(v) => ValueRef::Double(*v),
+            Value::Text(v) => ValueRef::Text(v),
+            Value::Bytes(v) => ValueRef::Bytes(v),
+            Value::Blob(v) => ValueRef::Blob(*v),
+            Value::Array(v) => ValueRef::Array(*v),
+            Value::Date(v) => ValueRef::Date(*v),
+            Value::Time(v) => ValueRef::Time(*v),
+            Value::Timestamp(d, t) => ValueRef::Timestamp(*d, *t),
+            Value::Int128(v) => ValueRef::Int128(*v),
+            Value::DecFloat(v) => ValueRef::DecFloat(*v),
+            Value::TimeTz(v) => ValueRef::TimeTz(*v),
+            Value::TimestampTz(v) => ValueRef::TimestampTz(*v),
+        }
+    }
+}
+
+impl From<bool> for ValueRef<'_> {
+    fn from(v: bool) -> Self {
+        ValueRef::Bool(v)
+    }
+}
+
+impl From<i16> for ValueRef<'_> {
+    fn from(v: i16) -> Self {
+        ValueRef::Short(v)
+    }
+}
+
+impl From<i32> for ValueRef<'_> {
+    fn from(v: i32) -> Self {
+        ValueRef::Int(v)
+    }
+}
+
+impl From<i64> for ValueRef<'_> {
+    fn from(v: i64) -> Self {
+        ValueRef::BigInt(v)
+    }
+}
+
+impl From<i128> for ValueRef<'_> {
+    fn from(v: i128) -> Self {
+        ValueRef::Int128(v)
+    }
+}
+
+impl From<f32> for ValueRef<'_> {
+    fn from(v: f32) -> Self {
+        ValueRef::Float(v)
+    }
+}
+
+impl From<f64> for ValueRef<'_> {
+    fn from(v: f64) -> Self {
+        ValueRef::Double(v)
+    }
+}
+
+impl<'a> From<&'a str> for ValueRef<'a> {
+    fn from(v: &'a str) -> Self {
+        ValueRef::Text(v)
+    }
+}
+
+impl<'a> From<&'a String> for ValueRef<'a> {
+    fn from(v: &'a String) -> Self {
+        ValueRef::Text(v)
+    }
+}
+
+impl<'a> From<&'a [u8]> for ValueRef<'a> {
+    fn from(v: &'a [u8]) -> Self {
+        ValueRef::Bytes(v)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for ValueRef<'a> {
+    fn from(v: &'a [u8; N]) -> Self {
+        ValueRef::Bytes(v)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for ValueRef<'a> {
+    fn from(v: &'a Vec<u8>) -> Self {
+        ValueRef::Bytes(v)
+    }
+}
+
+impl From<crate::decfloat::DecFloat> for ValueRef<'_> {
+    fn from(v: crate::decfloat::DecFloat) -> Self {
+        ValueRef::DecFloat(v)
+    }
+}
+
+impl From<TimeTz> for ValueRef<'_> {
+    fn from(v: TimeTz) -> Self {
+        ValueRef::TimeTz(v)
+    }
+}
+
+impl From<TimestampTz> for ValueRef<'_> {
+    fn from(v: TimestampTz) -> Self {
+        ValueRef::TimestampTz(v)
     }
 }
 
@@ -684,6 +870,18 @@ mod tests {
         );
         assert_eq!(Value::from(vec![1_u8, 2, 3]), Value::Bytes(vec![1, 2, 3]));
         assert_eq!(Value::from(&[4_u8, 5][..]), Value::Bytes(vec![4, 5]));
+    }
+
+    #[test]
+    fn value_ref_borrows_text_and_bytes() {
+        let text = String::from("Ana");
+        let bytes = vec![1_u8, 2, 3];
+        let owned = Value::Text(text.clone());
+
+        assert_eq!(ValueRef::from("Ana"), ValueRef::Text("Ana"));
+        assert_eq!(ValueRef::from(&text), ValueRef::Text("Ana"));
+        assert_eq!(ValueRef::from(&bytes), ValueRef::Bytes(&[1, 2, 3]));
+        assert_eq!(ValueRef::from(&owned), ValueRef::Text("Ana"));
     }
 
     #[cfg(feature = "chrono")]

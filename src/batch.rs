@@ -64,9 +64,9 @@
 use crate::blr::message_blr;
 use crate::connection::Connection;
 use crate::error::{DatabaseError, Error, Result, StatusVector};
-use crate::message::{encode_row_into, message_buffer_len};
+use crate::message::{encode_row_into, encode_row_ref_into, message_buffer_len};
 use crate::transaction::Transaction;
-use crate::value::{ColumnMeta, Value};
+use crate::value::{ColumnMeta, Value, ValueRef};
 use crate::wire::consts::*;
 use crate::wire::response::{read_op, read_response, read_response_body, read_status_vector};
 use crate::wire::stream::{op_name, op_packet};
@@ -284,6 +284,15 @@ impl Batch {
         // Codifica direto no buffer pendente (sem Vec temporário por linha). Em erro,
         // `encode_row_into` restaura o tamanho de `pending`, então não corrompe o lote.
         encode_row_into(&mut self.pending, &self.params, values, self.charset)?;
+        self.pending_count += 1;
+        Ok(())
+    }
+
+    /// Adiciona uma linha usando valores emprestados. É a variante de
+    /// [`Self::add`] para evitar materializar [`Value::Text`] ou [`Value::Bytes`]
+    /// quando o chamador já tem `&str`/`&[u8]`.
+    pub fn add_ref(&mut self, values: &[ValueRef<'_>]) -> Result<()> {
+        encode_row_ref_into(&mut self.pending, &self.params, values, self.charset)?;
         self.pending_count += 1;
         Ok(())
     }

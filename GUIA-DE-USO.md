@@ -270,6 +270,16 @@ stmt.execute(&mut conn, &tx, &[id.into(), nome.into(), ativo.into()])?;
 Conversões disponíveis: `bool`, `i16`, `i32`, `i64`, `i128`, `f32`, `f64`,
 `String`, `&str`, `Vec<u8>` e `&[u8]`.
 
+Quando você já tem dados emprestados e quer evitar criar `Value::Text(String)`
+ou `Value::Bytes(Vec<u8>)`, use `ValueRef` com `execute_ref`:
+
+```rust
+use firebird_wire::ValueRef;
+
+let nome = "Ana";
+stmt.execute_ref(&mut conn, &tx, &[42_i32.into(), ValueRef::from(nome)])?;
+```
+
 Acessores convenientes (devolvem `Option`):
 
 ```rust
