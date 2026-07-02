@@ -1,6 +1,6 @@
 [package]
 name = "firebird-wire"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "Pure-Rust sync driver for Firebird 5+ (wire protocol, SRP auth, batch, services, events)"
 license = "MIT"

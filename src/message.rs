@@ -164,9 +164,23 @@ fn encode_value(
     charset: Charset,
 ) -> Result<()> {
     let mismatch = || Error::protocol(format!("value does not fit column type {}", col.sql_type));
+    let out_of_range = |v: i64| {
+        Error::protocol(format!(
+            "value {v} out of range for column type {}",
+            col.sql_type
+        ))
+    };
     match sql_type::base(col.sql_type) {
-        sql_type::SHORT => put_i32_be(out, i32::from(val.as_i64().ok_or_else(mismatch)? as i16)),
-        sql_type::LONG => put_i32_be(out, val.as_i64().ok_or_else(mismatch)? as i32),
+        sql_type::SHORT => {
+            let v = val.as_i64().ok_or_else(mismatch)?;
+            let v = i16::try_from(v).map_err(|_| out_of_range(v))?;
+            put_i32_be(out, i32::from(v));
+        }
+        sql_type::LONG => {
+            let v = val.as_i64().ok_or_else(mismatch)?;
+            let v = i32::try_from(v).map_err(|_| out_of_range(v))?;
+            put_i32_be(out, v);
+        }
         sql_type::INT64 => out.extend_from_slice(&val.as_i64().ok_or_else(mismatch)?.to_be_bytes()),
         sql_type::INT128 => match val {
             ValueRef::Int128(v) => out.extend_from_slice(&v.to_be_bytes()),
@@ -468,5 +482,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(borrowed, owned);
+    }
+
+    #[test]
+    fn encode_short_out_of_range_is_an_error() {
+        let cols = [col(sql_type::SHORT, 2)];
+        // 70000 não cabe em um SMALLINT (i16); antes era truncado silenciosamente.
+        let err = encode_row(&cols, &[Value::Int(70_000)], Charset::Utf8).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "esperava erro, veio {err:?}");
+    }
+
+    #[test]
+    fn encode_long_out_of_range_is_an_error() {
+        let cols = [col(sql_type::LONG, 4)];
+        // i64::MAX não cabe em um INTEGER (i32); antes era truncado silenciosamente.
+        let err = encode_row(&cols, &[Value::BigInt(i64::MAX)], Charset::Utf8).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "esperava erro, veio {err:?}");
+    }
+
+    #[test]
+    fn encode_short_and_long_within_range_still_work() {
+        let cols = [col(sql_type::SHORT, 2), col(sql_type::LONG, 4)];
+        let msg = encode_row(
+            &cols,
+            &[Value::Int(-32_768), Value::Int(2_147_483_647)],
+            Charset::Utf8,
+        )
+        .unwrap();
+        assert!(!msg.is_empty());
     }
 }

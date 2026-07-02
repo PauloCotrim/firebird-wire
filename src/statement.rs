@@ -28,10 +28,6 @@ use crate::wire::response::{read_op, read_response, read_response_body};
 use crate::wire::stream::{op_name, op_packet};
 use crate::wire::xdr::{read_le_int, read_le_int_signed};
 
-/// Dialeto SQL enviado com `op_prepare_statement`. O dialeto 3 é o padrão
-/// moderno e o alvo deste driver.
-const SQL_DIALECT: i32 = 3;
-
 /// Tamanho do buffer de resposta de info de descrição (describe-info) solicitado
 /// ao servidor. Generoso para que uma lista SELECT ampla nunca seja truncada; o
 /// servidor só retorna o que precisa.
@@ -538,7 +534,7 @@ impl Connection {
         let mut w = op_packet(op::PREPARE_STATEMENT);
         w.put_i32(tx.handle());
         w.put_i32(handle);
-        w.put_i32(SQL_DIALECT);
+        w.put_i32(self.dialect());
         w.put_str(sql);
         w.put_bytes(prepare_info_items());
         w.put_i32(INFO_BUFFER_LEN);

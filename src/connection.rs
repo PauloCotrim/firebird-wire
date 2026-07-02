@@ -13,14 +13,25 @@ use crate::wire::stream::{FbStream, op_name, op_packet};
 use crate::wire::xdr::{ParameterBuffer, XdrWriter};
 
 /// Versões de protocolo que oferecemos, em preferência ascendente (`weight`).
+///
+/// Restrito a `>= 16` (o piso onde FB4/FB5 introduziram batch e os campos de
+/// `op_execute`/`op_prepare_statement` que este driver assume incondicionalmente
+/// — ex.: `cursor_flags` em `Statement::execute_message`). Versões mais antigas
+/// (FB2/FB3, protocolo <= 15) podem ter um layout de `op_execute` diferente; como
+/// a crate documenta suporte a "Firebird 5+", não as ofertamos para evitar uma
+/// dessincronia de wire caso um servidor antigo aceitasse uma delas.
 const OFFERED_PROTOCOLS: &[i32] = &[
-    PROTOCOL_VERSION13,
-    PROTOCOL_VERSION15,
     PROTOCOL_VERSION16,
     PROTOCOL_VERSION17,
     PROTOCOL_VERSION18,
     PROTOCOL_VERSION19,
 ];
+
+/// Lista de plugins de autenticação que anunciamos ao servidor — usada tanto no
+/// bloco `p_cnct_user_id` (connect) quanto no DPB de attach e na continuação
+/// `op_cont_auth`. Mantida como uma única constante para que os três pontos
+/// nunca fiquem dessincronizados entre si.
+const AUTH_PLUGIN_LIST: &str = "Srp256,Srp";
 
 /// Um anexo (attachment) autenticado a um banco de dados.
 pub struct Connection {
@@ -28,6 +39,9 @@ pub struct Connection {
     db_handle: i32,
     protocol_version: i32,
     charset: crate::charset::Charset,
+    /// Dialeto SQL configurado em [`ConnectConfig::dialect`], usado por
+    /// [`Statement::prepare`](crate::Statement) e [`Self::exec_immediate`].
+    dialect: i32,
     /// Contador para atribuir ids únicos de registro de eventos nesta conexão.
     event_seq: i32,
 }
@@ -72,6 +86,7 @@ impl Connection {
             db_handle: resp.handle,
             protocol_version,
             charset: crate::charset::Charset::from_name(&config.charset),
+            dialect: config.dialect,
             event_seq: 0,
         };
 
@@ -100,6 +115,12 @@ impl Connection {
     /// O charset da conexão, usado para decodificar texto vindo do servidor.
     pub fn charset(&self) -> crate::charset::Charset {
         self.charset
+    }
+
+    /// O dialeto SQL configurado em [`ConnectConfig::dialect`], usado por
+    /// [`Self::prepare`](crate::Connection::prepare) e [`Self::exec_immediate`].
+    pub fn dialect(&self) -> i32 {
+        self.dialect
     }
 
     /// Desanexa (detach) do banco de dados e fecha o socket.
@@ -168,7 +189,7 @@ impl Connection {
         let mut w = op_packet(op::EXEC_IMMEDIATE);
         w.put_i32(tx_handle); // campo 1: transação
         w.put_i32(self.db_handle); // campo 2: banco de dados
-        w.put_i32(3); // dialeto SQL (3 = padrão)
+        w.put_i32(self.dialect); // dialeto SQL configurado em ConnectConfig
         w.put_str(sql);
         w.put_bytes(&[]); // itens de info vazios
         w.put_i32(0); // buffer_length = 0
@@ -448,7 +469,7 @@ fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>> {
     let mut w = op_packet(op::CONT_AUTH);
     w.put_str(&auth.proof_hex);
     w.put_str(&auth.plugin);
-    w.put_str("Srp256,Srp,Legacy_Auth");
+    w.put_str(AUTH_PLUGIN_LIST);
     w.put_bytes(&[]);
     stream.send(&w)?;
     let resp = read_response(stream)?;
@@ -559,7 +580,7 @@ fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
 
     push_cnct(&mut b, cnct::LOGIN, user.as_bytes());
     push_cnct(&mut b, cnct::PLUGIN_NAME, b"Srp256");
-    push_cnct(&mut b, cnct::PLUGIN_LIST, b"Srp256,Srp");
+    push_cnct(&mut b, cnct::PLUGIN_LIST, AUTH_PLUGIN_LIST.as_bytes());
 
     // Usuário / host do SO, para monitoramento no lado do servidor (espelha fbclient).
     if let Some(os_user) = os_user() {
@@ -611,7 +632,7 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> 
     match auth {
         AuthState::Proof(a) => {
             pb.string(dpb::AUTH_PLUGIN_NAME, &a.plugin);
-            pb.string(dpb::AUTH_PLUGIN_LIST, "Srp256,Srp");
+            pb.string(dpb::AUTH_PLUGIN_LIST, AUTH_PLUGIN_LIST);
             pb.string(dpb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
         AuthState::Legacy => {
@@ -647,12 +668,27 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> 
     pb.into_vec()
 }
 
+/// Trunca `s` para no máximo `max` bytes, recuando até a fronteira de char
+/// válida mais próxima. `String::truncate` puro entraria em pânico se `max`
+/// caísse no meio de um caractere multibyte (ex.: um nome de usuário/host/
+/// executável em UTF-8 cujo byte 255 divide um caractere).
+fn truncate_at_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    s.truncate(idx);
+}
+
 fn process_name() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
         .map(|mut s| {
-            s.truncate(255);
+            truncate_at_char_boundary(&mut s, 255);
             s
         })
         .unwrap_or_else(|| "firebird-wire".to_string())
@@ -678,7 +714,7 @@ fn os_user() -> Option<String> {
         .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .map(|mut s| {
-            s.truncate(255);
+            truncate_at_char_boundary(&mut s, 255);
             s
         })
 }
@@ -693,7 +729,7 @@ fn host_name() -> Option<String> {
         })
         .filter(|s| !s.is_empty())
         .map(|mut s| {
-            s.truncate(255);
+            truncate_at_char_boundary(&mut s, 255);
             s
         })
 }
@@ -757,5 +793,25 @@ mod tests {
     fn subslice_search() {
         assert!(contains_subslice(b"xxArc4yy", b"Arc4"));
         assert!(!contains_subslice(b"xxChaChayy", b"Arc4"));
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_does_not_panic_mid_char() {
+        // "é" (0xC3 0xA9) repetido cruza o byte 255 no meio de um caractere;
+        // String::truncate(255) puro entraria em pânico aqui.
+        let mut s: String = "é".repeat(150);
+        assert_eq!(s.len(), 300); // 2 bytes por caractere
+        truncate_at_char_boundary(&mut s, 255);
+        assert!(s.len() <= 255);
+        assert!(s.is_char_boundary(s.len()));
+        // Nenhum byte foi cortado no meio: o resultado ainda é UTF-8 válido.
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_is_noop_when_already_short() {
+        let mut s = "curto".to_string();
+        truncate_at_char_boundary(&mut s, 255);
+        assert_eq!(s, "curto");
     }
 }
