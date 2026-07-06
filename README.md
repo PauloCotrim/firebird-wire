@@ -18,7 +18,8 @@ fn main() -> firebird_wire::Result<()> {
     let mut stmt = conn.prepare(&tx, "SELECT first_name FROM employee WHERE emp_no = ?")?;
     stmt.execute(&mut conn, &tx, &[2_i32.into()])?;
     if let Some(row) = stmt.fetch(&mut conn)? {
-        println!("{:?}", row[0].as_str());
+        let nome: &str = row.get("first_name")?; // ou row.get(0), por posição
+        println!("{nome:?}");
     }
     stmt.drop_statement(&mut conn)?;
 

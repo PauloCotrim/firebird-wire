@@ -181,12 +181,53 @@ tx.commit(&mut conn)?;
 Ou tudo de uma vez com `fetch_all`:
 
 ```rust
-let rows: Vec<Vec<firebird_wire::Value>> = stmt.fetch_all(&mut conn)?;
+let rows: Vec<firebird_wire::Row> = stmt.fetch_all(&mut conn)?;
 println!("{} linhas", rows.len());
 ```
 
 Metadados das colunas/parâmetros estão em `stmt.columns()` e `stmt.params()`
 (`&[ColumnMeta]`, com `.name()`, `.sql_type`, `.length`, etc.).
+
+### Acesso por posição ou por nome de coluna (`Row`)
+
+`fetch`/`fetch_all`/`rows()` devolvem [`Row`], não um `Vec<Value>` cru. `Row`
+aceita indexação por posição (`row[0]`, igual antes) **e** por nome de coluna
+(alias se houver, senão o nome do campo — `ColumnMeta::name()`), sem diferenciar
+maiúsculas/minúsculas — `row[0]`/`row["nome"]` devolvem `&Value` (entram em
+pânico se a posição/nome não existir, como indexar um `Vec` fora do intervalo).
+
+Para pegar o tipo Rust já convertido (como em `tokio-postgres`/`oracle`), use
+`Row::get`, com o tipo pedido inferido do `let` (via a trait [`FromValue`]):
+
+```rust
+let mut stmt = conn.prepare(&tx, "SELECT id, nome, apelido FROM t ORDER BY id")?;
+stmt.execute(&mut conn, &tx, &[])?;
+
+while let Some(row) = stmt.fetch(&mut conn)? {
+    let id: i64 = row.get(0)?;             // por posição
+    let nome: &str = row.get("nome")?;     // por nome — casa com a coluna NOME
+    let apelido: Option<String> = row.get("apelido")?; // NULL -> None
+    println!("{id} -> {nome} ({apelido:?})");
+}
+```
+
+`row.get::<_, T>(idx)` devolve `Result<T, Error>` (use `?`): erra se `idx` não
+existir na linha (nome desconhecido ou posição fora do intervalo), ou se o
+valor guardado não bater com `T` — o que inclui `NULL` quando `T` não é um
+`Option`; peça `Option<T>` para tratar `NULL` como `None` em vez de erro. Tipos
+com `FromValue` prontos: inteiros (`i8`..`i128`), `f32`/`f64`, `bool`,
+`&str`/`String`, `&[u8]`/`Vec<u8>`, `CivilDate`/`CivilTime`/`CivilTimestamp`,
+`DecFloat`, `TimeTz`, `TimestampTz`, o próprio `Value`/`&Value`, e — com a
+feature `chrono` — `chrono::Naive{Date,Time,DateTime}`.
+
+Cada `Row` compartilha os metadados de coluna com as demais linhas do mesmo
+`fetch` via `Arc` — criar uma `Row` não clona `ColumnMeta`, só o vetor de
+`Value` já decodificado. O lookup por nome (em `row["nome"]` ou
+`row.get("nome")`) é uma busca linear nessa lista de colunas (irrelevante para
+queries com dezenas de colunas). Em um laço muito quente com milhões de
+linhas, resolva o índice uma vez fora do laço com `row.column_index("nome")`
+(ou `stmt.columns()`) e use `row.get(indice)` dentro dele, para não repetir a
+busca por nome a cada linha.
 
 ### Consulta com parâmetros
 

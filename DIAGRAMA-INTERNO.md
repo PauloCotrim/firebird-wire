@@ -124,7 +124,7 @@ sequenceDiagram
         Stmt->>FB: op_fetch(stmt_handle, out_blr, fetch_size)
         FB-->>Stmt: op_fetch_response(status, count, row bytes)
         Stmt->>Msg: decode_row(columns, charset)
-        Stmt-->>App: Vec<Value>
+        Stmt-->>App: Row (Vec<Value> + colunas compartilhadas via Arc)
     end
 ```
 

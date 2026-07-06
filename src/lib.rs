@@ -13,6 +13,9 @@
 //! - [`Transaction`]: o bloco de trabalho confirmado por `commit` ou desfeito
 //!   por `rollback`.
 //! - [`Statement`]: um SQL preparado para executar e buscar linhas.
+//! - [`Row`]: uma linha buscada, indexável por posição (`row[0]`) ou por nome
+//!   de coluna (`row["nome"]`, sem diferenciar maiúsculas/minúsculas); ou
+//!   convertida direto pro tipo desejado com `row.get::<_, T>(idx)`.
 //! - [`Value`]: valores enviados como parâmetros ou recebidos em linhas.
 //!
 //! Um primeiro uso costuma seguir esta ordem:
@@ -75,6 +78,7 @@ pub mod error;
 pub mod events;
 pub mod message;
 pub mod pool;
+pub mod row;
 pub mod service;
 pub mod statement;
 pub mod transaction;
@@ -92,13 +96,15 @@ pub use decfloat::{DecFloat, ParseDecFloatError};
 pub use error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 pub use events::EventListener;
 pub use pool::{Pool, PoolConfig, PooledConnection};
+pub use row::{Row, RowIndex};
 pub use service::{ServiceManager, UserInfo, UserParams};
 pub use statement::{RowStream, RowsAffected, Statement};
 pub use transaction::{
     AccessMode, IsolationLevel, LockResolution, Transaction, TransactionBuilder,
 };
 pub use value::{
-    CivilDate, CivilTime, CivilTimestamp, ColumnMeta, TimeTz, TimestampTz, Value, ValueRef,
+    CivilDate, CivilTime, CivilTimestamp, ColumnMeta, FromValue, TimeTz, TimestampTz, Value,
+    ValueRef,
 };
 
 /// Emite um aviso (apenas em builds de debug) quando um recurso com estado no

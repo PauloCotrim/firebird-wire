@@ -161,6 +161,19 @@ impl FbStream {
         Ok(self.rbuf[start..start + n].to_vec())
     }
 
+    /// Como [`Self::read_raw`], mas empresta a fatia do buffer interno em vez
+    /// de copiá-la para um `Vec` novo. Útil para dados de vida curta que o
+    /// chamador só precisa inspecionar (ou copiar para um buffer próprio,
+    /// como uma pilha) antes da próxima chamada a este stream — o buffer
+    /// interno pode ser realocado/compactado por `fill`, então o empréstimo
+    /// não pode atravessar outra leitura.
+    pub fn read_raw_ref(&mut self, n: usize) -> Result<&[u8]> {
+        self.fill(n)?;
+        let start = self.rpos;
+        self.rpos += n;
+        Ok(&self.rbuf[start..start + n])
+    }
+
     pub fn read_i32(&mut self) -> Result<i32> {
         self.fill(4)?;
         let b = &self.rbuf[self.rpos..self.rpos + 4];

@@ -508,12 +508,12 @@ fn text_or_bytes(desc: &ArrayDesc, raw: Vec<u8>, charset: Charset, is_char: bool
     if desc.sub_type == CS_OCTETS {
         Value::Bytes(raw)
     } else {
-        let s = charset.decode(&raw);
+        let mut s = charset.decode_owned(raw);
         if is_char {
-            Value::Text(s.trim_end_matches(' ').to_string())
-        } else {
-            Value::Text(s)
+            let trimmed_len = s.trim_end_matches(' ').len();
+            s.truncate(trimmed_len);
         }
+        Value::Text(s)
     }
 }
 

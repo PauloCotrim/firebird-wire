@@ -95,6 +95,22 @@ impl Charset {
         }
     }
 
+    /// Como [`Self::decode`], mas toma bytes já possuídos (em vez de emprestados):
+    /// em UTF-8 (o caso comum — é o padrão do driver e da maioria dos bancos),
+    /// reaproveita o próprio buffer via `String::from_utf8` sem copiar, em vez de
+    /// alocar uma `String` nova como `decode`/`from_utf8_lossy` sempre fazem.
+    /// Os demais charsets decodificam char a char de qualquer forma (já alocam
+    /// uma `String` nova), então caem de volta em [`Self::decode`].
+    pub fn decode_owned(self, raw: Vec<u8>) -> String {
+        match self {
+            Charset::Utf8 | Charset::Unknown => match String::from_utf8(raw) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            },
+            _ => self.decode(&raw),
+        }
+    }
+
     /// Codifica uma `&str` para bytes conforme o charset (o inverso de
     /// [`Self::decode`]), para enviar parâmetros de texto ao servidor numa conexão
     /// não-UTF8. Para Latin-1/Win-1252, caracteres não representáveis viram `?`;

@@ -1,5 +1,6 @@
 //! Valores SQL e metadados de coluna.
 
+use crate::error::Error;
 use crate::wire::consts::sql_type;
 
 /// Um valor SQL decodificado. Tipos numéricos com escala diferente de zero
@@ -688,6 +689,204 @@ impl TryFrom<Value> for chrono::NaiveDateTime {
 
     fn try_from(v: Value) -> Result<Self, Self::Error> {
         chrono::NaiveDateTime::try_from(&v)
+    }
+}
+
+/// Conversão tipada de um [`Value`] emprestado para um tipo Rust concreto,
+/// usada por [`crate::Row::get`] para permitir `let nome: &str = row.get("nome")?;`
+/// em vez de casar manualmente a variante do enum.
+///
+/// Implementada para os inteiros, ponto flutuante, `bool`, texto/bytes
+/// (emprestados como `&str`/`&[u8]`, ou próprios como `String`/`Vec<u8>`),
+/// [`CivilDate`]/[`CivilTime`]/[`CivilTimestamp`], [`crate::decfloat::DecFloat`],
+/// `TimeTz`, `TimestampTz`, o próprio [`Value`] (clonado) e, com a feature `chrono`, os
+/// tipos `chrono::Naive*`. `Option<T>` mapeia `NULL` para `None` em vez de
+/// devolver erro — use `Option<T>` para colunas anuláveis.
+pub trait FromValue<'a>: Sized {
+    /// Converte `value`, ou devolve erro se a variante não bater com `Self`
+    /// (o que inclui receber `NULL` quando `Self` não é um `Option`).
+    fn from_value(value: &'a Value) -> crate::Result<Self>;
+}
+
+fn type_mismatch(expected: &str, got: &Value) -> Error {
+    Error::protocol(format!("esperava {expected}, coluna tem {got:?}"))
+}
+
+impl<'a, T: FromValue<'a>> FromValue<'a> for Option<T> {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            T::from_value(value).map(Some)
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for &'a Value {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        Ok(value)
+    }
+}
+
+impl<'a> FromValue<'a> for Value {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        Ok(value.clone())
+    }
+}
+
+impl<'a> FromValue<'a> for &'a str {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        value.as_str().ok_or_else(|| type_mismatch("texto", value))
+    }
+}
+
+impl<'a> FromValue<'a> for String {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        <&str>::from_value(value).map(str::to_owned)
+    }
+}
+
+impl<'a> FromValue<'a> for &'a [u8] {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::Bytes(b) => Ok(b),
+            _ => Err(type_mismatch("bytes", value)),
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for Vec<u8> {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        <&[u8]>::from_value(value).map(<[u8]>::to_vec)
+    }
+}
+
+impl<'a> FromValue<'a> for bool {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::Bool(b) => Ok(*b),
+            _ => Err(type_mismatch("boolean", value)),
+        }
+    }
+}
+
+macro_rules! impl_from_value_int {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl<'a> FromValue<'a> for $t {
+                fn from_value(value: &'a Value) -> crate::Result<Self> {
+                    value
+                        .as_i64()
+                        .and_then(|v| <$t>::try_from(v).ok())
+                        .ok_or_else(|| type_mismatch(stringify!($t), value))
+                }
+            }
+        )+
+    };
+}
+
+impl_from_value_int!(i8, i16, i32, i64);
+
+impl<'a> FromValue<'a> for i128 {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::Short(v) => Ok(*v as i128),
+            Value::Int(v) => Ok(*v as i128),
+            Value::BigInt(v) => Ok(*v as i128),
+            Value::Int128(v) => Ok(*v),
+            _ => Err(type_mismatch("i128", value)),
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for f32 {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::Float(v) => Ok(*v),
+            _ => Err(type_mismatch("f32", value)),
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for f64 {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::Float(v) => Ok(*v as f64),
+            Value::Double(v) => Ok(*v),
+            _ => Err(type_mismatch("f64", value)),
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for CivilDate {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        value
+            .as_civil_date()
+            .ok_or_else(|| type_mismatch("DATE/TIMESTAMP", value))
+    }
+}
+
+impl<'a> FromValue<'a> for CivilTime {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        value
+            .as_civil_time()
+            .ok_or_else(|| type_mismatch("TIME/TIMESTAMP", value))
+    }
+}
+
+impl<'a> FromValue<'a> for CivilTimestamp {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        value
+            .as_civil_timestamp()
+            .ok_or_else(|| type_mismatch("TIMESTAMP", value))
+    }
+}
+
+impl<'a> FromValue<'a> for crate::decfloat::DecFloat {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::DecFloat(d) => Ok(*d),
+            _ => Err(type_mismatch("DECFLOAT", value)),
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for TimeTz {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::TimeTz(v) => Ok(*v),
+            _ => Err(type_mismatch("TIME WITH TIME ZONE", value)),
+        }
+    }
+}
+
+impl<'a> FromValue<'a> for TimestampTz {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        match value {
+            Value::TimestampTz(v) => Ok(*v),
+            _ => Err(type_mismatch("TIMESTAMP WITH TIME ZONE", value)),
+        }
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl<'a> FromValue<'a> for chrono::NaiveDate {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        chrono::NaiveDate::try_from(value)
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl<'a> FromValue<'a> for chrono::NaiveTime {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        chrono::NaiveTime::try_from(value)
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl<'a> FromValue<'a> for chrono::NaiveDateTime {
+    fn from_value(value: &'a Value) -> crate::Result<Self> {
+        chrono::NaiveDateTime::try_from(value)
     }
 }
 

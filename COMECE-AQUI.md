@@ -73,8 +73,8 @@ fn main() -> firebird_wire::Result<()> {
     sel.execute(&mut conn, &tx, &[])?;
 
     while let Some(row) = sel.fetch(&mut conn)? {
-        let id = row[0].as_i64().unwrap_or_default();
-        let nome = row[1].as_str().unwrap_or("");
+        let id: i64 = row.get(0)?;        // por posição
+        let nome: &str = row.get("nome")?; // ou por nome da coluna (como em outros drivers)
         println!("{id}: {nome}");
     }
 

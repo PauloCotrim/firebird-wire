@@ -312,6 +312,11 @@ fn expect_time(val: ValueRef<'_>) -> Result<u32> {
     }
 }
 
+/// Bitmap de nulos até essa largura (256 colunas) cabe na pilha — cobre a
+/// esmagadora maioria das consultas reais, evitando uma alocação de `Vec` por
+/// linha buscada só para guardar alguns bytes de flags.
+const INLINE_BITMAP_BYTES: usize = 32;
+
 /// Decodifica uma linha do stream a partir dos metadados das colunas de saída.
 /// `charset` é o charset da conexão, usado para decodificar CHAR/VARCHAR.
 pub fn decode_row(
@@ -319,7 +324,17 @@ pub fn decode_row(
     columns: &[ColumnMeta],
     charset: Charset,
 ) -> Result<Vec<Value>> {
-    let bitmap = stream.read_raw(null_bitmap_len(columns.len()))?;
+    let bitmap_len = null_bitmap_len(columns.len());
+    let mut inline_bitmap = [0u8; INLINE_BITMAP_BYTES];
+    let heap_bitmap;
+    let bitmap: &[u8] = if bitmap_len <= INLINE_BITMAP_BYTES {
+        inline_bitmap[..bitmap_len].copy_from_slice(stream.read_raw_ref(bitmap_len)?);
+        &inline_bitmap[..bitmap_len]
+    } else {
+        heap_bitmap = stream.read_raw(bitmap_len)?;
+        &heap_bitmap
+    };
+
     let mut values = Vec::with_capacity(columns.len());
     for (i, col) in columns.iter().enumerate() {
         let is_null = bitmap[i / 8] & (1 << (i % 8)) != 0;
@@ -422,14 +437,15 @@ fn text_or_bytes(col: &ColumnMeta, raw: Vec<u8>, charset: Charset) -> Value {
     if col.sub_type == CS_OCTETS {
         Value::Bytes(raw)
     } else {
-        let s = charset.decode(&raw);
+        let mut s = charset.decode_owned(raw);
         // Remove o preenchimento (padding) à direita do CHAR; VARCHAR já carrega
-        // seus bytes exatos.
+        // seus bytes exatos. `truncate` só ajusta o comprimento (sem realocar),
+        // ao contrário de `trim_end_matches(..).to_string()`.
         if sql_type::base(col.sql_type) == sql_type::TEXT {
-            Value::Text(s.trim_end_matches(' ').to_string())
-        } else {
-            Value::Text(s)
+            let trimmed_len = s.trim_end_matches(' ').len();
+            s.truncate(trimmed_len);
         }
+        Value::Text(s)
     }
 }
 
@@ -520,5 +536,59 @@ mod tests {
         )
         .unwrap();
         assert!(!msg.is_empty());
+    }
+
+    /// Envia `bytes` por um loopback TCP local e devolve o `FbStream` do lado
+    /// que lê, para exercitar `decode_row` (que só sabe ler de um `FbStream`
+    /// real, não de um buffer em memória) sem depender de um servidor Firebird.
+    fn loopback_reader(bytes: Vec<u8>) -> FbStream {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut sock = TcpStream::connect(addr).unwrap();
+            sock.write_all(&bytes).unwrap();
+        });
+        let (sock, _) = listener.accept().unwrap();
+        writer.join().unwrap();
+        FbStream::new(sock)
+    }
+
+    #[test]
+    fn decode_row_roundtrips_through_encode_row() {
+        // encode_row produz exatamente o formato que decode_row consome
+        // (bitmap de nulos + valores); usamos um pra construir a entrada do
+        // outro e conferir que a leitura via `read_raw_ref` (bitmap na pilha)
+        // bate byte a byte com o `Vec<Value>` original.
+        let cols = [col(sql_type::LONG, 4), col(sql_type::VARYING, 20)];
+        let values = vec![Value::Int(42), Value::Null];
+        let encoded = encode_row(&cols, &values, Charset::Utf8).unwrap();
+
+        let mut stream = loopback_reader(encoded);
+        let row = decode_row(&mut stream, &cols, Charset::Utf8).unwrap();
+        assert_eq!(row, values);
+    }
+
+    #[test]
+    fn decode_row_falls_back_to_heap_bitmap_past_256_columns() {
+        // 300 colunas -> bitmap de ceil(300/8)=38, alinhado a 40 bytes, acima
+        // de INLINE_BITMAP_BYTES (32): exercita o branch que aloca no heap.
+        let cols: Vec<ColumnMeta> = (0..300).map(|_| col(sql_type::SHORT, 2)).collect();
+        let values: Vec<Value> = (0..300)
+            .map(|i| {
+                if i % 3 == 0 {
+                    Value::Null
+                } else {
+                    Value::Short(i as i16)
+                }
+            })
+            .collect();
+        let encoded = encode_row(&cols, &values, Charset::Utf8).unwrap();
+
+        let mut stream = loopback_reader(encoded);
+        let row = decode_row(&mut stream, &cols, Charset::Utf8).unwrap();
+        assert_eq!(row, values);
     }
 }

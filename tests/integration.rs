@@ -1322,7 +1322,7 @@ fn scrollable_cursor() -> Result<()> {
     seq.drop_statement(&mut conn)?;
     assert!(all.len() >= 3, "precisa de ao menos 3 funcionários");
 
-    let emp = |row: Option<Vec<Value>>| -> Option<i16> {
+    let emp = |row: Option<firebird_wire::Row>| -> Option<i16> {
         row.map(|r| match r[0] {
             Value::Short(v) => v,
             ref o => panic!("emp_no inesperado: {o:?}"),

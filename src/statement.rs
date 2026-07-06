@@ -17,10 +17,13 @@
 //! um handle cujos métodos de I/O emprestam a [`Connection`] dona, então apenas
 //! um empréstimo mutável fica ativo por vez.
 
+use std::sync::Arc;
+
 use crate::blr::{input_blr, message_blr, prepare_info_items};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::message::{decode_row, encode_row, encode_row_ref};
+use crate::row::Row;
 use crate::transaction::Transaction;
 use crate::value::{ColumnMeta, Value, ValueRef};
 use crate::wire::consts::*;
@@ -70,7 +73,13 @@ pub struct Statement {
     handle: i32,
     stmt_type: i32,
     params: Vec<ColumnMeta>,
-    columns: Vec<ColumnMeta>,
+    /// `Arc` para compartilhar os metadados de coluna com cada [`Row`] entregue
+    /// sem cloná-los — criar uma `Row` custa só um incremento de refcount.
+    columns: Arc<[ColumnMeta]>,
+    /// `message_blr(&columns)` pré-computado no `prepare`: as colunas de saída
+    /// não mudam depois disso, então não há por que remontar este BLR a cada
+    /// `op_fetch`/`op_fetch_scroll` (ele hoje é enviado em todo lote).
+    out_blr: Vec<u8>,
     /// Verdadeiro após `execute` abrir um cursor SELECT, até ser esgotado/fechado.
     cursor_open: bool,
     /// Linhas já recebidas do servidor mas ainda não entregues ao chamador.
@@ -229,10 +238,10 @@ impl Statement {
 
     /// Busca a próxima linha, ou `None` no fim do cursor. Retorna `None` para uma
     /// instrução que não tem cursor aberto (que não é SELECT, ou já esgotada).
-    pub fn fetch(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+    pub fn fetch(&mut self, conn: &mut Connection) -> Result<Option<Row>> {
         loop {
             if let Some(row) = self.buffered.pop_front() {
-                return Ok(Some(row));
+                return Ok(Some(Row::new(row, self.columns.clone())));
             }
             if self.exhausted || !self.cursor_open {
                 self.cursor_open = false;
@@ -246,10 +255,9 @@ impl Statement {
     /// buffer, até o pacote terminador (count 0). Define `exhausted` quando o
     /// servidor sinaliza fim de cursor (status 100).
     fn fetch_batch(&mut self, conn: &mut Connection) -> Result<()> {
-        let out_blr = message_blr(&self.columns);
         let mut w = op_packet(op::FETCH);
         w.put_i32(self.handle);
-        w.put_bytes(&out_blr);
+        w.put_bytes(&self.out_blr);
         w.put_i32(0); // message number
         w.put_i32(self.fetch_size);
         conn.io().send(&w)?;
@@ -287,7 +295,7 @@ impl Statement {
     }
 
     /// Esvazia o cursor para um vetor de linhas.
-    pub fn fetch_all(&mut self, conn: &mut Connection) -> Result<Vec<Vec<Value>>> {
+    pub fn fetch_all(&mut self, conn: &mut Connection) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         while let Some(row) = self.fetch(conn)? {
             rows.push(row);
@@ -322,17 +330,16 @@ impl Statement {
         conn: &mut Connection,
         direction: i32,
         offset: i32,
-    ) -> Result<Option<Vec<Value>>> {
+    ) -> Result<Option<Row>> {
         if !self.cursor_open {
             return Ok(None);
         }
         // Um salto invalida qualquer linha pré-buscada pelo fetch sequencial.
         self.buffered.clear();
 
-        let out_blr = message_blr(&self.columns);
         let mut w = op_packet(op::FETCH_SCROLL);
         w.put_i32(self.handle);
-        w.put_bytes(&out_blr);
+        w.put_bytes(&self.out_blr);
         w.put_i32(0); // message number
         w.put_i32(1); // fetch count: uma linha por salto (como faz o fbclient)
         w.put_i32(direction);
@@ -369,44 +376,36 @@ impl Statement {
         }
         // O cursor continua aberto e reposicionável após qualquer salto.
         self.exhausted = false;
-        Ok(row)
+        Ok(row.map(|r| Row::new(r, self.columns.clone())))
     }
 
     /// Próxima linha (rolável). Equivale a [`Self::fetch`] num cursor rolável.
-    pub fn fetch_next(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+    pub fn fetch_next(&mut self, conn: &mut Connection) -> Result<Option<Row>> {
         self.fetch_scroll(conn, scroll::NEXT, 0)
     }
 
     /// Linha anterior.
-    pub fn fetch_prior(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+    pub fn fetch_prior(&mut self, conn: &mut Connection) -> Result<Option<Row>> {
         self.fetch_scroll(conn, scroll::PRIOR, 0)
     }
 
     /// Primeira linha do conjunto de resultados.
-    pub fn fetch_first(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+    pub fn fetch_first(&mut self, conn: &mut Connection) -> Result<Option<Row>> {
         self.fetch_scroll(conn, scroll::FIRST, 0)
     }
 
     /// Última linha do conjunto de resultados.
-    pub fn fetch_last(&mut self, conn: &mut Connection) -> Result<Option<Vec<Value>>> {
+    pub fn fetch_last(&mut self, conn: &mut Connection) -> Result<Option<Row>> {
         self.fetch_scroll(conn, scroll::LAST, 0)
     }
 
     /// Linha na posição absoluta `pos` (1-based; negativa conta a partir do fim).
-    pub fn fetch_absolute(
-        &mut self,
-        conn: &mut Connection,
-        pos: i32,
-    ) -> Result<Option<Vec<Value>>> {
+    pub fn fetch_absolute(&mut self, conn: &mut Connection, pos: i32) -> Result<Option<Row>> {
         self.fetch_scroll(conn, scroll::ABSOLUTE, pos)
     }
 
     /// Linha `offset` posições à frente (positivo) ou atrás (negativo) da atual.
-    pub fn fetch_relative(
-        &mut self,
-        conn: &mut Connection,
-        offset: i32,
-    ) -> Result<Option<Vec<Value>>> {
+    pub fn fetch_relative(&mut self, conn: &mut Connection, offset: i32) -> Result<Option<Row>> {
         self.fetch_scroll(conn, scroll::RELATIVE, offset)
     }
 
@@ -485,7 +484,7 @@ pub struct RowStream<'a> {
 
 impl RowStream<'_> {
     /// A próxima linha, ou `None` no fim do cursor.
-    pub fn try_next(&mut self) -> Result<Option<Vec<Value>>> {
+    pub fn try_next(&mut self) -> Result<Option<Row>> {
         self.stmt.fetch(self.conn)
     }
 
@@ -494,13 +493,13 @@ impl RowStream<'_> {
     /// Prefera [`Self::try_next`] em código novo; este método fica como alias
     /// compatível para exemplos/código existentes.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<Vec<Value>>> {
+    pub fn next(&mut self) -> Result<Option<Row>> {
         self.try_next()
     }
 
     /// Coleta todas as linhas restantes num vetor (equivalente a
     /// [`Statement::fetch_all`], mas consumindo o stream).
-    pub fn try_collect(mut self) -> Result<Vec<Vec<Value>>> {
+    pub fn try_collect(mut self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         while let Some(row) = self.try_next()? {
             rows.push(row);
@@ -511,7 +510,7 @@ impl RowStream<'_> {
     /// Aplica `f` a cada linha restante, parando no primeiro erro.
     pub fn try_for_each<F>(mut self, mut f: F) -> Result<()>
     where
-        F: FnMut(Vec<Value>) -> Result<()>,
+        F: FnMut(Row) -> Result<()>,
     {
         while let Some(row) = self.try_next()? {
             f(row)?;
@@ -546,7 +545,8 @@ impl Connection {
             handle,
             stmt_type: info.stmt_type,
             params: info.params,
-            columns: info.columns,
+            out_blr: message_blr(&info.columns),
+            columns: info.columns.into(),
             cursor_open: false,
             buffered: std::collections::VecDeque::new(),
             exhausted: false,
