@@ -163,18 +163,23 @@ fn encode_value(
     val: ValueRef<'_>,
     charset: Charset,
 ) -> Result<()> {
-    let mismatch = || {
-        Error::protocol(format!(
-            "value does not fit column '{}' (index {}, type {})",
-            col.field, col.index, col.sql_type
-        ))
+    // O servidor nem sempre associa um parâmetro de entrada a um nome de coluna
+    // (ex.: parâmetro dentro de uma expressão ou chamada de procedure), então
+    // 'field' pode vir vazio — nesse caso identificamos pela posição.
+    let col_desc = || {
+        let type_desc = format!("{} ({})", col.sql_type, sql_type::name(col.sql_type));
+        if col.field.is_empty() {
+            format!("parameter at index {} (type {})", col.index, type_desc)
+        } else {
+            format!(
+                "column '{}' (index {}, type {})",
+                col.field, col.index, type_desc
+            )
+        }
     };
-    let out_of_range = |v: i64| {
-        Error::protocol(format!(
-            "value {v} out of range for column '{}' (index {}, type {})",
-            col.field, col.index, col.sql_type
-        ))
-    };
+    let mismatch = || Error::protocol(format!("value does not fit {}", col_desc()));
+    let out_of_range =
+        |v: i64| Error::protocol(format!("value {v} out of range for {}", col_desc()));
     match sql_type::base(col.sql_type) {
         sql_type::SHORT => {
             let v = val.as_i64().ok_or_else(mismatch)?;

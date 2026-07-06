@@ -632,6 +632,35 @@ pub mod sql_type {
     pub const fn is_nullable(t: i32) -> bool {
         t & 1 != 0
     }
+
+    /// Nome legível do tipo SQL base, para mensagens de erro/diagnóstico.
+    pub const fn name(t: i32) -> &'static str {
+        match base(t) {
+            TEXT => "CHAR",
+            VARYING => "VARCHAR",
+            SHORT => "SMALLINT",
+            LONG => "INTEGER",
+            FLOAT => "FLOAT",
+            DOUBLE | D_FLOAT => "DOUBLE PRECISION",
+            TIMESTAMP => "TIMESTAMP",
+            BLOB => "BLOB",
+            ARRAY => "ARRAY",
+            QUAD => "QUAD",
+            TYPE_TIME => "TIME",
+            TYPE_DATE => "DATE",
+            INT64 => "BIGINT",
+            INT128 => "INT128",
+            TIMESTAMP_TZ_EX => "TIMESTAMP WITH TIME ZONE (ext)",
+            TIME_TZ_EX => "TIME WITH TIME ZONE (ext)",
+            TIMESTAMP_TZ => "TIMESTAMP WITH TIME ZONE",
+            TIME_TZ => "TIME WITH TIME ZONE",
+            DEC16 => "DECFLOAT(16)",
+            DEC34 => "DECFLOAT(34)",
+            BOOLEAN => "BOOLEAN",
+            NULL => "NULL",
+            _ => "UNKNOWN",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
