@@ -833,6 +833,25 @@ O backlog funcional está fechado; o que resta é opcional/ergonômico:
 - ⬜ Escalar a largura do elemento de arrays de texto pelo charset da conexão
   (para ler arrays `NONE` por conexão `UTF8` sem casar os charsets)
 
+### Melhorias de performance (opcionais)
+
+A arquitetura já acerta o que mais importa (round trips minimizados via
+prefetch em `Statement::fetch_size`, I/O bufferizado com `TCP_NODELAY`,
+caminho sem alocação em `execute_ref`/`ValueRef`). O que resta são
+micro-otimizações que só importam em result sets muito grandes:
+
+- ⬜ `decode_row`/`decode_value` (`message.rs`) alocam um `Vec<u8>`/`String` novo
+  por campo lido; para SELECTs de milhões de linhas, ler emprestando do buffer
+  interno do `FbStream` em vez de copiar reduziria pressão no alocador.
+- ⬜ `text_or_bytes` (`message.rs:419`) faz uma alocação extra em
+  `trim_end_matches(' ').to_string()` para colunas `CHAR`; dá para aparar o
+  padding antes de decodificar o charset e evitar a cópia dupla.
+- ⬜ `Statement::fetch_batch` (`statement.rs:249`) reconstrói o BLR de saída
+  (`message_blr(&self.columns)`) a cada `op_fetch`; poderia ser calculado uma
+  vez em `execute` e cacheado no `Statement`.
+- ⬜ Não há `cargo bench` no repo comparando com `fbclient`/rsfbclient; se
+  performance virar requisito formal, vale medir antes de otimizar.
+
 Veja `PROTOCOL-NOTES.md` para os layouts de wire já decodificados.
 
 ---

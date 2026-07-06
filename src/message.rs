@@ -163,11 +163,16 @@ fn encode_value(
     val: ValueRef<'_>,
     charset: Charset,
 ) -> Result<()> {
-    let mismatch = || Error::protocol(format!("value does not fit column type {}", col.sql_type));
+    let mismatch = || {
+        Error::protocol(format!(
+            "value does not fit column '{}' (index {}, type {})",
+            col.field, col.index, col.sql_type
+        ))
+    };
     let out_of_range = |v: i64| {
         Error::protocol(format!(
-            "value {v} out of range for column type {}",
-            col.sql_type
+            "value {v} out of range for column '{}' (index {}, type {})",
+            col.field, col.index, col.sql_type
         ))
     };
     match sql_type::base(col.sql_type) {
