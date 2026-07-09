@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "firebird-wire"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "bytes",
  "chrono",
