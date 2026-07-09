@@ -197,10 +197,16 @@ impl FbStream {
     /// Pula o preenchimento (padding) XDR para que o deslocamento absoluto de bytes desde o início do
     /// fluxo (stream) caia em um limite de 4 bytes. Rastreamos o alinhamento via `data_len`, não `rpos`,
     /// então o chamador passa o comprimento do campo de dados recém-lido.
+    ///
+    /// Só avança o cursor (sem copiar os bytes de padding para um `Vec`, ao
+    /// contrário de um `read_raw(pad)`): esta função é chamada uma vez por
+    /// valor TEXT/VARYING/BOOLEAN decodificado, então evitar a alocação
+    /// importa em SELECTs com muitas linhas.
     pub fn read_pad(&mut self, data_len: usize) -> Result<()> {
         let pad = pad4(data_len) - data_len;
         if pad > 0 {
-            let _ = self.read_raw(pad)?;
+            self.fill(pad)?;
+            self.rpos += pad;
         }
         Ok(())
     }

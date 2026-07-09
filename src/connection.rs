@@ -33,6 +33,24 @@ const OFFERED_PROTOCOLS: &[i32] = &[
 /// nunca fiquem dessincronizados entre si.
 const AUTH_PLUGIN_LIST: &str = "Srp256,Srp";
 
+/// Verdadeiro quando a variável de ambiente `FB_DEBUG` está definida; avaliado
+/// uma única vez por processo.
+fn dbg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FB_DEBUG").is_some())
+}
+
+/// Loga em stderr quando `FB_DEBUG` está definido. É uma macro para que os
+/// argumentos (`format!`, `hexdump`…) só sejam avaliados com o debug ativo —
+/// como função, cada conexão pagaria a formatação mesmo com o debug desligado.
+macro_rules! dbg_log {
+    ($($arg:tt)*) => {
+        if dbg_enabled() {
+            eprintln!("[fdb] {}", format_args!($($arg)*));
+        }
+    };
+}
+
 /// Um anexo (attachment) autenticado a um banco de dados.
 pub struct Connection {
     stream: FbStream,
@@ -93,13 +111,45 @@ impl Connection {
         // Opcional: pede os tipos nativos (INT128/DECFLOAT/WITH TIME ZONE) caso o
         // servidor esteja coagindo-os via DataTypeCompatibility. São features de
         // FB4+ (protocolo >= 16); ignoradas em servidores mais antigos.
+        //
+        // As três instruções são independentes entre si — nenhuma depende da
+        // resposta das outras — então usamos uma única transação implícita
+        // (em vez de 3, uma por `exec_immediate(None, ..)`) e enfileiramos os
+        // 3 `op_exec_immediate` num único flush antes de ler qualquer
+        // resposta: de 9 round-trips (3× begin+exec+commit) para 2 (o flush
+        // dos 3 execs + o commit/rollback final). Isso importa porque roda em
+        // toda conexão nova — sensível sobretudo com um [`crate::Pool`], onde
+        // a criação de conexão já é o ponto mais custoso.
         if config.native_data_types && protocol_version >= 16 {
-            for stmt in [
+            const NATIVE_BIND_STMTS: [&str; 3] = [
                 "SET BIND OF INT128 TO NATIVE",
                 "SET BIND OF DECFLOAT TO NATIVE",
                 "SET BIND OF TIME ZONE TO NATIVE",
-            ] {
-                conn.exec_immediate(None, stmt)?;
+            ];
+            let tx = conn.begin()?;
+            let tx_handle = tx.handle();
+            let db_handle = conn.db_handle;
+            let dialect = conn.dialect;
+            let result = crate::wire::response::pipeline_requests(
+                conn.io(),
+                NATIVE_BIND_STMTS.iter(),
+                NATIVE_BIND_STMTS.len(),
+                |w, sql| {
+                    w.put_i32(op::EXEC_IMMEDIATE);
+                    w.put_i32(tx_handle);
+                    w.put_i32(db_handle);
+                    w.put_i32(dialect);
+                    w.put_str(sql);
+                    w.put_bytes(&[]); // itens de info vazios
+                    w.put_i32(0); // buffer_length = 0
+                },
+            );
+            match result {
+                Ok(()) => tx.commit(&mut conn)?,
+                Err(e) => {
+                    let _ = tx.rollback(&mut conn);
+                    return Err(e);
+                }
             }
         }
 
@@ -333,8 +383,8 @@ pub(crate) fn handshake(
     // --- op_connect --------------------------------------------------------
     let pubkey = srp.public_key_hex();
     let cnct = build_cnct_block(config, &pubkey);
-    dbg_log(&format!("pubkey hex ({} chars)", pubkey.len()));
-    dbg_log(&format!("cnct ({} bytes): {}", cnct.len(), hexdump(&cnct)));
+    dbg_log!("pubkey hex ({} chars)", pubkey.len());
+    dbg_log!("cnct ({} bytes): {}", cnct.len(), hexdump(&cnct));
     let mut w = op_packet(op::CONNECT);
     w.put_i32(connect_op); // p_cnct_operation (operação)
     w.put_i32(CONNECT_VERSION3);
@@ -350,26 +400,26 @@ pub(crate) fn handshake(
         w.put_i32((i + 1) as i32); // weight (peso)
     }
     stream.send(&w)?;
-    dbg_log("sent op_connect");
+    dbg_log!("sent op_connect");
 
     // --- accept / autenticação ---------------------------------------------
     let accept = read_accept(&mut stream)?;
     // A versão chega como um USHORT com sinal estendido (ex.: 0xffff8013);
     // mantemos os 15 bits baixos para recuperar a versão base (flag removida).
     let protocol_version = accept.version & 0x7fff;
-    dbg_log(&format!(
+    dbg_log!(
         "accept: proto={protocol_version} plugin={:?} authenticated={} data_len={} keys_len={}",
         accept.plugin,
         accept.authenticated,
         accept.data.len(),
         accept.keys.len()
-    ));
+    );
 
     // Calcula a prova SRP; no caminho comum ela viaja dentro do PB de attach
     // (isc_*_specific_auth_data), o caminho que fbclient/isql usam.
     let auth = compute_auth(config, &mut srp, &accept)?;
     let session_key = auth.as_ref().map(|a| a.session_key.clone());
-    dbg_log(&format!("auth computed; have_proof={}", auth.is_some()));
+    dbg_log!("auth computed; have_proof={}", auth.is_some());
 
     // --- criptografia de comunicação (wire) --------------------------------
     // Quando o servidor pede continuação (`op_cond_accept`, típico de
@@ -391,10 +441,7 @@ pub(crate) fn handshake(
             AuthState::Legacy
         }
     };
-    dbg_log(&format!(
-        "crypt negotiated; encrypted={}",
-        stream.is_encrypted()
-    ));
+    dbg_log!("crypt negotiated; encrypted={}", stream.is_encrypted());
 
     Ok(Handshake {
         stream,
@@ -411,6 +458,12 @@ fn connect_socket(config: &ConnectConfig) -> Result<TcpStream> {
         return Err(Error::protocol("host resolution returned no addresses"));
     }
 
+    // Um timeout num endereço (ex.: IPv6 filtrado por firewall) não deve
+    // encerrar a busca: tenta os demais endereços resolvidos (tipicamente o
+    // IPv4 de um host dual-stack) antes de desistir. Só reporta timeout se
+    // for o único tipo de falha observado; caso contrário, o último erro de
+    // conexão (recusada, sem rota, etc.) é mais informativo.
+    let mut timed_out = false;
     let mut last_err = None;
     for addr in addrs {
         let result = match config.connect_timeout {
@@ -419,16 +472,20 @@ fn connect_socket(config: &ConnectConfig) -> Result<TcpStream> {
         };
         match result {
             Ok(sock) => return Ok(sock),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(Error::Timeout),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => timed_out = true,
             Err(e) => last_err = Some(e),
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no socket address resolved")
-        })
-        .into())
+    match last_err {
+        Some(e) => Err(e.into()),
+        None if timed_out => Err(Error::Timeout),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no socket address resolved",
+        )
+        .into()),
+    }
 }
 
 /// Calcula a prova SRP a partir do salt/B do servidor. Retorna `None` para um
@@ -692,12 +749,6 @@ fn process_name() -> String {
             s
         })
         .unwrap_or_else(|| "firebird-wire".to_string())
-}
-
-fn dbg_log(msg: &str) {
-    if std::env::var_os("FB_DEBUG").is_some() {
-        eprintln!("[fdb] {msg}");
-    }
 }
 
 fn hexdump(b: &[u8]) -> String {

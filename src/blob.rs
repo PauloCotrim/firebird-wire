@@ -31,14 +31,26 @@
 //! [`Value::Blob`]: crate::value::Value::Blob
 
 use crate::connection::Connection;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::transaction::Transaction;
 use crate::wire::consts::op;
-use crate::wire::response::read_response;
+use crate::wire::response::{pipeline_requests, read_response};
 use crate::wire::stream::op_packet;
 
 /// Tamanho máximo de um segmento por chamada de `op_put_segment` (limite do protocolo).
 const MAX_SEGMENT: usize = 65_535;
+
+/// Quantos `op_get_segment`/`op_put_segment` manter em voo ao transferir um blob
+/// inteiro. Cada round-trip move até ~64 KiB; sem pipeline, a latência da rede
+/// domina em blobs grandes. 8 × 64 KiB ≈ 512 KiB em voo cobre o produto
+/// banda × atraso de redes típicas sem estourar buffers TCP.
+const PIPELINE_WINDOW: usize = 8;
+
+/// Código GDS `isc_segstr_eof`: resposta do servidor a um `op_get_segment` num
+/// blob já esgotado. A leitura em pipeline pode pedir segmentos além do fim
+/// (só se sabe do EOF ao ler a resposta); esses pedidos excedentes recebem este
+/// erro, que é esperado e descartado.
+const ISC_SEGSTR_EOF: i32 = 335_544_367;
 
 /// Status de `op_get_segment` em `p_resp_object`: 0 = segmento(s) lido(s) e pode
 /// haver mais; 1 = `isc_segment` (o último segmento não coube no buffer, continua
@@ -91,20 +103,72 @@ impl Blob {
     }
 
     /// Lê o blob inteiro até o fim, concatenando todos os segmentos.
+    ///
+    /// Os `op_get_segment` são enviados em pipeline (até [`PIPELINE_WINDOW`] em
+    /// voo) para não pagar um round-trip por bloco de 64 KiB. Como o EOF só é
+    /// conhecido ao ler uma resposta, os pedidos que já estavam em voo além do
+    /// fim voltam como `isc_segstr_eof` (ou vazios) e são descartados. A janela
+    /// começa em 1 — um blob que cabe numa única resposta (o caso comum) custa
+    /// exatamente um round-trip, como antes — e abre ao confirmar que há mais.
     pub fn read_to_end(&mut self, conn: &mut Connection) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        if self.eof {
+            return Ok(out);
+        }
+        let mut window = 1usize;
+        let mut outstanding = 0usize;
+        // Verdadeiro quando não há mais o que pedir (EOF, bloco vazio ou erro);
+        // as respostas ainda em voo continuam sendo drenadas.
+        let mut stop = false;
+        let mut first_err: Option<Error> = None;
         loop {
-            let chunk = self.read_segment(conn)?;
-            out.extend_from_slice(&chunk);
-            if self.eof {
+            while !stop && outstanding < window {
+                let mut w = op_packet(op::GET_SEGMENT);
+                w.put_i32(self.handle);
+                w.put_i32(SEGMENT_BUFFER);
+                w.put_bytes(&[]); // campo de segmento (cstring vazia na leitura)
+                conn.io().enqueue(&w);
+                outstanding += 1;
+            }
+            conn.io().flush()?;
+            if outstanding == 0 {
                 break;
             }
-            // Um bloco vazio sem EOF não deveria ocorrer; evita laço infinito.
-            if chunk.is_empty() {
-                break;
+            match read_response(conn.io()) {
+                Ok(resp) => {
+                    outstanding -= 1;
+                    if stop {
+                        continue; // resposta excedente pós-EOF/erro: descarta
+                    }
+                    let got = unpack_segments_into(&resp.data, &mut out);
+                    if resp.handle == SEG_EOF {
+                        self.eof = true;
+                        stop = true;
+                    } else if got == 0 {
+                        // Um bloco vazio sem EOF não deveria ocorrer; evita laço infinito.
+                        stop = true;
+                    } else {
+                        window = PIPELINE_WINDOW;
+                    }
+                }
+                Err(e) => {
+                    outstanding -= 1;
+                    if conn.io().is_broken() {
+                        return Err(e); // sem sincronia não há como drenar o restante
+                    }
+                    // `isc_segstr_eof` num pedido excedente pós-EOF é esperado.
+                    let benign = stop && e.gds_code() == Some(ISC_SEGSTR_EOF);
+                    stop = true;
+                    if !benign {
+                        first_err.get_or_insert(e);
+                    }
+                }
             }
         }
-        Ok(out)
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 
     /// Fecha o blob (`op_close_blob`), consumindo o handle.
@@ -153,17 +217,22 @@ impl BlobWriter {
 
     /// Envia `data` para o servidor em segmentos de no máximo `MAX_SEGMENT`
     /// bytes, usando `op_put_segment`. Pode ser chamado várias vezes.
+    ///
+    /// Os segmentos vão em pipeline (até [`PIPELINE_WINDOW`] em voo antes de
+    /// drenar as respostas), em vez de um round-trip por segmento.
     pub fn write(&self, conn: &mut Connection, data: &[u8]) -> Result<()> {
-        for chunk in data.chunks(MAX_SEGMENT) {
-            // O servidor armazena o conteúdo do cstring verbatim — sem prefixo de 2 bytes.
-            let mut w = op_packet(op::PUT_SEGMENT);
-            w.put_i32(self.handle);
-            w.put_i32(chunk.len() as i32); // comprimento bruto do segmento
-            w.put_bytes(chunk); // cstring: bytes brutos + padding XDR
-            conn.io().send(&w)?;
-            read_response(conn.io())?;
-        }
-        Ok(())
+        pipeline_requests(
+            conn.io(),
+            data.chunks(MAX_SEGMENT),
+            PIPELINE_WINDOW,
+            |w, chunk| {
+                // O servidor armazena o conteúdo do cstring verbatim — sem prefixo de 2 bytes.
+                w.put_i32(op::PUT_SEGMENT);
+                w.put_i32(self.handle);
+                w.put_i32(chunk.len() as i32); // comprimento bruto do segmento
+                w.put_bytes(chunk); // cstring: bytes brutos + padding XDR
+            },
+        )
     }
 
     /// Cancela o blob (`op_cancel_blob`), descartando o conteúdo já enviado.
@@ -263,6 +332,15 @@ impl Connection {
 /// segmentos, cada um precedido por seu comprimento (2 bytes, little-endian).
 fn unpack_segments(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
+    unpack_segments_into(data, &mut out);
+    out
+}
+
+/// Como [`unpack_segments`], mas anexa direto em `out` — evita um `Vec`
+/// intermediário por bloco em [`Blob::read_to_end`]. Retorna quantos bytes
+/// foram anexados.
+fn unpack_segments_into(data: &[u8], out: &mut Vec<u8>) -> usize {
+    let before = out.len();
     let mut i = 0;
     while i + 2 <= data.len() {
         let len = u16::from_le_bytes([data[i], data[i + 1]]) as usize;
@@ -271,7 +349,7 @@ fn unpack_segments(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&data[i..end]);
         i = end;
     }
-    out
+    out.len() - before
 }
 
 #[cfg(test)]
@@ -288,5 +366,15 @@ mod tests {
     #[test]
     fn unpacks_empty_buffer() {
         assert!(unpack_segments(&[]).is_empty());
+    }
+
+    #[test]
+    fn unpack_into_appends_and_counts() {
+        let mut out = b"pre".to_vec();
+        let buf = [2, 0, b'H', b'i', 5, 0, b't', b'h', b'e', b'r', b'e'];
+        assert_eq!(unpack_segments_into(&buf, &mut out), 7);
+        assert_eq!(out, b"preHithere");
+        assert_eq!(unpack_segments_into(&[], &mut out), 0);
+        assert_eq!(out, b"preHithere");
     }
 }

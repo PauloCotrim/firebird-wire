@@ -353,17 +353,17 @@ fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset) -> Re
         sql_type::LONG => Value::Int(stream.read_i32()?),
         sql_type::INT64 => Value::BigInt(stream.read_i64()?),
         sql_type::INT128 => {
-            let b = stream.read_raw(16)?;
+            let b = stream.read_raw_ref(16)?;
             Value::Int128(i128::from_be_bytes(b.try_into().unwrap()))
         }
         sql_type::DEC16 => {
-            let b = stream.read_raw(8)?;
+            let b = stream.read_raw_ref(8)?;
             Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(
                 b.try_into().unwrap(),
             ))
         }
         sql_type::DEC34 => {
-            let b = stream.read_raw(16)?;
+            let b = stream.read_raw_ref(16)?;
             Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(
                 b.try_into().unwrap(),
             ))
@@ -417,9 +417,9 @@ fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset) -> Re
         // elementos são buscados à parte via op_get_slice (ver [`crate::array`]).
         sql_type::ARRAY => Value::Array(stream.read_quad()?),
         sql_type::BOOLEAN => {
-            let b = stream.read_raw(1)?;
+            let b = stream.read_raw_ref(1)?[0];
             stream.read_pad(1)?;
-            Value::Bool(b[0] != 0)
+            Value::Bool(b != 0)
         }
         _ => {
             // Tipo desconhecido: consome sua largura declarada como bytes opacos.

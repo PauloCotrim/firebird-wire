@@ -20,9 +20,10 @@
 use std::sync::Arc;
 
 use crate::blr::{input_blr, message_blr, prepare_info_items};
+use crate::charset::Charset;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
-use crate::message::{decode_row, encode_row, encode_row_ref};
+use crate::message::{decode_row, encode_row_into, encode_row_ref_into};
 use crate::row::Row;
 use crate::transaction::Transaction;
 use crate::value::{ColumnMeta, Value, ValueRef};
@@ -80,9 +81,26 @@ pub struct Statement {
     /// não mudam depois disso, então não há por que remontar este BLR a cada
     /// `op_fetch`/`op_fetch_scroll` (ele hoje é enviado em todo lote).
     out_blr: Vec<u8>,
+    /// `input_blr(&params)` pré-computado no `prepare` (vazio sem parâmetros),
+    /// pelo mesmo motivo de `out_blr`: os parâmetros não mudam depois do
+    /// prepare, então remontar esse BLR a cada `execute` seria trabalho
+    /// repetido sem necessidade.
+    in_blr: Vec<u8>,
     /// Verdadeiro após `execute` abrir um cursor SELECT, até ser esgotado/fechado.
     cursor_open: bool,
     /// Linhas já recebidas do servidor mas ainda não entregues ao chamador.
+    ///
+    /// Um lote inteiro (até [`Self::fetch_size`] linhas) é sempre drenado do
+    /// socket de uma vez em [`Self::fetch_batch`], mesmo que o chamador só
+    /// consuma uma linha antes de fazer outra coisa na mesma [`Connection`]
+    /// (ex.: ler um BLOB referenciado pela linha via [`Connection::read_blob`]
+    /// — ver `read_blob_content` nos testes de integração). Entregar as linhas
+    /// uma a uma conforme o pacote chega (sem esse dreno) foi tentado e
+    /// descartado: deixaria `op_fetch_response` pendentes no socket entre
+    /// chamadas de `fetch`, e qualquer operação alheia à `Statement` nesse
+    /// meio-tempo (que não sabe desse estado) leria essas sobras como se
+    /// fossem a resposta dela, dessincronizando o stream — confirmado contra
+    /// um Firebird 5 real.
     buffered: std::collections::VecDeque<Vec<Value>>,
     /// Verdadeiro quando o servidor sinalizou fim de cursor (status 100).
     exhausted: bool,
@@ -155,12 +173,9 @@ impl Statement {
         tx: &Transaction,
         params: &[Value],
     ) -> Result<()> {
-        let message = if self.params.is_empty() {
-            Vec::new()
-        } else {
-            encode_row(&self.params, params, conn.charset())?
-        };
-        self.execute_message(conn, tx, &message)
+        self.execute_message(conn, tx, |out, cols, charset| {
+            encode_row_into(out, cols, params, charset)
+        })
     }
 
     /// Executa a instrução usando parâmetros emprestados. É a variante de
@@ -172,38 +187,34 @@ impl Statement {
         tx: &Transaction,
         params: &[ValueRef<'_>],
     ) -> Result<()> {
-        let message = if self.params.is_empty() {
-            Vec::new()
-        } else {
-            encode_row_ref(&self.params, params, conn.charset())?
-        };
-        self.execute_message(conn, tx, &message)
+        self.execute_message(conn, tx, |out, cols, charset| {
+            encode_row_ref_into(out, cols, params, charset)
+        })
     }
 
+    /// Monta e envia o `op_execute`. `encode` recebe o buffer do pacote já
+    /// posicionado no ponto certo para a mensagem de parâmetros — codifica
+    /// direto nele (sem um `Vec` intermediário que depois seria copiado via
+    /// `put_raw`), e só é chamado quando a instrução tem parâmetros.
     fn execute_message(
         &mut self,
         conn: &mut Connection,
         tx: &Transaction,
-        message: &[u8],
+        encode: impl FnOnce(&mut Vec<u8>, &[ColumnMeta], Charset) -> Result<()>,
     ) -> Result<()> {
         let has_params = !self.params.is_empty();
-        let in_blr = if has_params {
-            input_blr(&self.params)
-        } else {
-            Vec::new()
-        };
 
         let mut w = op_packet(op::EXECUTE);
         w.put_i32(self.handle);
         w.put_i32(tx.handle());
-        w.put_bytes(&in_blr); // in_blr
+        w.put_bytes(&self.in_blr); // in_blr (pré-computado no prepare)
         w.put_i32(0); // in_message_number
         w.put_i32(if has_params { 1 } else { 0 }); // in_message_count
         // A mensagem de parâmetros de entrada vem AQUI, logo após in_message_count
         // e antes dos campos de saída (confirmado por captura strace do fbclient:
         // bitmap de nulos + valores XDR, formato compacto). Sem parâmetros, nada.
         if has_params {
-            w.put_raw(message);
+            encode(w.buf_mut(), &self.params, conn.charset())?;
             w.align();
         }
         // O op_execute da v19 carrega campos de saída no estilo execute2 mesmo
@@ -523,6 +534,16 @@ impl Connection {
     /// Prepara uma instrução SQL dentro da transação informada.
     pub fn prepare(&mut self, tx: &Transaction, sql: &str) -> Result<Statement> {
         // 1. Aloca um handle de instrução.
+        //
+        // O protocolo documenta um handle "diferido" (-1, usa o do allocate
+        // anterior no mesmo envio) que permitiria fundir os dois round-trips
+        // abaixo — mas ele só funciona sob PTYPE_LAZY_SEND. Testado
+        // empiricamente contra um Firebird 5 real sob PTYPE_BATCH_SEND (o
+        // teto que negociamos, ver AUTH_PLUGIN_LIST/OFFERED_PROTOCOLS em
+        // connection.rs): o servidor rejeita e todo prepare falha. Fundir
+        // exigiria negociar lazy send, uma mudança bem mais ampla no cliente
+        // (adiar envios, sincronizar respostas em batches) — fora de escopo
+        // aqui; os dois round-trips seriais abaixo são necessários.
         let mut w = op_packet(op::ALLOCATE_STATEMENT);
         w.put_i32(self.db_handle());
         self.io().send(&w)?;
@@ -541,11 +562,17 @@ impl Connection {
         let resp = read_response(self.io())?;
 
         let info = parse_prepare_response(&resp.data)?;
+        let in_blr = if info.params.is_empty() {
+            Vec::new()
+        } else {
+            input_blr(&info.params)
+        };
         Ok(Statement {
             handle,
             stmt_type: info.stmt_type,
             params: info.params,
             out_blr: message_blr(&info.columns),
+            in_blr,
             columns: info.columns.into(),
             cursor_open: false,
             buffered: std::collections::VecDeque::new(),

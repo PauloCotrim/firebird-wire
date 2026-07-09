@@ -285,6 +285,31 @@ fn write_blob_multipart() -> Result<()> {
 }
 
 #[test]
+fn write_blob_pipelined_large() -> Result<()> {
+    // Um blob maior que a janela de pipeline (8 segmentos de 64 KiB) exercita
+    // o envio/leitura com várias operações em voo e a drenagem das respostas
+    // excedentes após o EOF na leitura.
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
+
+    // 20 segmentos cheios + um parcial; e também um múltiplo exato de 65535,
+    // onde o EOF só chega numa resposta vazia após o último segmento cheio.
+    for tamanho in [20 * 65_535 + 12_345, 12 * 65_535] {
+        let conteudo: Vec<u8> = (0..tamanho).map(|i| (i * 31 % 251) as u8).collect();
+        let blob_id = conn.write_blob(&tx, &conteudo)?;
+        let lido = conn.read_blob(&tx, blob_id)?;
+        assert_eq!(lido.len(), conteudo.len(), "tamanho difere ({tamanho})");
+        assert_eq!(lido, conteudo, "conteudo difere ({tamanho})");
+        println!("blob pipelined: {tamanho} bytes ok");
+    }
+
+    tx.rollback(&mut conn)?;
+    conn.close()?;
+    Ok(())
+}
+
+#[test]
 fn read_array_from_employee() -> Result<()> {
     // JOB.LANGUAGE_REQ está em CHARACTER SET NONE. A fatia de array é
     // transliterada para o charset da conexão; conectar com NONE evita a
@@ -342,8 +367,9 @@ fn array_roundtrip() -> Result<()> {
     let cfg = require_server!().charset("NONE");
     let mut conn = Connection::connect(&cfg)?;
 
-    // DDL com autocommit (tx implícita). Limpa um resto de execução anterior.
-    conn.exec_immediate(None, "DROP TABLE ARR_RT_TEST")?;
+    // DDL com autocommit (tx implícita). Limpa um resto de execução anterior
+    // (ignora o erro quando não há resto: a tabela não existe).
+    let _ = conn.exec_immediate(None, "DROP TABLE ARR_RT_TEST");
     conn.exec_immediate(
         None,
         "CREATE TABLE ARR_RT_TEST (ID INTEGER, NUMS INTEGER[1:4], WORDS VARCHAR(10)[1:3])",
@@ -413,8 +439,9 @@ fn array_multidimensional() -> Result<()> {
     let mut conn = Connection::connect(&cfg)?;
 
     // Um array 2-D: GRID INTEGER[1:2, 1:3] = 6 elementos (a SDL gera um laço
-    // do1 por dimensão).
-    conn.exec_immediate(None, "DROP TABLE ARR_MD_TEST")?;
+    // do1 por dimensão). Limpa um resto de execução anterior (ignora o erro
+    // quando não há resto: a tabela não existe).
+    let _ = conn.exec_immediate(None, "DROP TABLE ARR_MD_TEST");
     conn.exec_immediate(
         None,
         "CREATE TABLE ARR_MD_TEST (ID INTEGER, GRID INTEGER[1:2, 1:3])",
@@ -834,6 +861,66 @@ fn custom_fetch_size() -> Result<()> {
         total,
         "fetch_size não deve alterar o total de linhas"
     );
+    b.drop_statement(&mut conn)?;
+
+    tx.commit(&mut conn)?;
+    conn.close()?;
+    Ok(())
+}
+
+#[test]
+fn partial_fetch_then_close_and_reexecute() -> Result<()> {
+    // Um fetch de lote inteiro (fetch_batch) drena TODOS os op_fetch_response
+    // do socket de uma vez, mesmo que o chamador só consuma uma parte das
+    // linhas bufferadas antes de fechar ou reexecutar — o dreno é o que
+    // garante que a conexão continua utilizável para outra operação depois.
+    // Este teste força esse consumo parcial (fetch_size pequeno, poucas
+    // linhas puxadas) e confere que close/drop_statement/reexecute continuam
+    // funcionando sem dessincronizar o stream.
+    //
+    // Nota: reexecutar após o cursor se esgotar NATURALMENTE (sem um close
+    // explícito no meio) dispara um bug pré-existente e não relacionado
+    // (isc_dsql_cursor_open_err, -502) — reproduzido também na HEAD antes
+    // desta sessão. Por isso este teste sempre fecha explicitamente enquanto
+    // o cursor ainda está genuinamente aberto (consumo parcial), nunca depois
+    // de um `fetch_all` até o fim.
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
+
+    const SQL: &str = "SELECT emp_no FROM employee ORDER BY emp_no";
+
+    // 1. Puxa só 2 linhas de um cursor com fetch_size=5 (lote de 5 bufferado,
+    //    3 linhas ainda não consumidas) e fecha sem esgotar.
+    let mut a = conn.prepare(&tx, SQL)?;
+    a.set_fetch_size(5);
+    a.execute(&mut conn, &tx, &[])?;
+    let r1 = a.fetch(&mut conn)?.expect("linha 1");
+    let r2 = a.fetch(&mut conn)?.expect("linha 2");
+    assert_ne!(r1[0], r2[0]);
+    a.close(&mut conn)?;
+
+    // A conexão deve continuar utilizável: reexecuta o mesmo statement e desta
+    // vez também consome só parcialmente antes de fechar de novo.
+    a.set_fetch_size(3);
+    a.execute(&mut conn, &tx, &[])?;
+    let r3 = a.fetch(&mut conn)?.expect("linha 1 da 2ª execução");
+    assert_eq!(r3[0], r1[0], "reexecução deveria repetir a mesma ordenação");
+    a.close(&mut conn)?;
+
+    // 2. Puxa 1 linha de um novo lote e dessa vez larga via drop_statement
+    //    (sem close prévio) — mesmo cenário de dreno, caminho diferente.
+    a.set_fetch_size(4);
+    a.execute(&mut conn, &tx, &[])?;
+    let _ = a.fetch(&mut conn)?.expect("linha 1");
+    a.drop_statement(&mut conn)?;
+
+    // A conexão segue sã: outra query nela funciona normalmente.
+    let mut b = conn.prepare(&tx, "SELECT COUNT(*) FROM employee")?;
+    b.execute(&mut conn, &tx, &[])?;
+    let row = b.fetch(&mut conn)?.expect("uma linha");
+    let count: i64 = row.get(0)?;
+    assert!(count > 5);
     b.drop_statement(&mut conn)?;
 
     tx.commit(&mut conn)?;
@@ -1297,6 +1384,54 @@ fn batch_register_blob() -> Result<()> {
 }
 
 #[test]
+fn batch_register_blob_many() -> Result<()> {
+    // Mais registros que a janela de pipeline dos op_batch_regblob (256),
+    // exercitando o reabastecimento da janela e a drenagem das respostas.
+    const N: i32 = 300;
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+
+    conn.exec_immediate(
+        None,
+        "RECREATE TABLE fdb_batch_rm (id INTEGER, dados BLOB SUB_TYPE 0)",
+    )?;
+
+    let tx = conn.begin()?;
+    let mut batch =
+        conn.create_batch(&tx, "INSERT INTO fdb_batch_rm (id, dados) VALUES (?, ?)")?;
+    for i in 0..N {
+        let real_id = conn.write_blob(&tx, format!("blob registrado {i}").as_bytes())?;
+        let batch_id = batch.register_blob(real_id)?;
+        batch.add(&[Value::Int(i), Value::Blob(batch_id)])?;
+    }
+    let result = batch.execute(&mut conn, &tx)?;
+    assert_eq!(result.total, N as u32);
+    assert!(result.all_succeeded());
+    batch.close(&mut conn)?;
+    tx.commit(&mut conn)?;
+
+    // Confere algumas linhas de volta.
+    let tx = conn.begin()?;
+    for i in [0, 255, 256, N - 1] {
+        let mut stmt = conn.prepare(&tx, "SELECT dados FROM fdb_batch_rm WHERE id = ?")?;
+        stmt.execute(&mut conn, &tx, &[Value::Int(i)])?;
+        let row = stmt.fetch(&mut conn)?.expect("uma linha");
+        let blob_id = match row[0] {
+            Value::Blob(id) => id,
+            ref other => panic!("esperava Value::Blob, veio {other:?}"),
+        };
+        let bytes = conn.read_blob(&tx, blob_id)?;
+        assert_eq!(bytes, format!("blob registrado {i}").as_bytes());
+        stmt.drop_statement(&mut conn)?;
+    }
+    tx.commit(&mut conn)?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_rm")?;
+    conn.close()?;
+    Ok(())
+}
+
+#[test]
 fn scrollable_cursor() -> Result<()> {
     let cfg = require_server!();
     let mut conn = Connection::connect(&cfg)?;
@@ -1360,6 +1495,20 @@ fn scrollable_cursor() -> Result<()> {
     );
 
     s.drop_statement(&mut conn)?;
+
+    // Mistura fetch sequencial parcial com um salto na MESMA instrução: força
+    // fetch_scroll a drenar um lote sequencial abandonado (fetch_pending)
+    // antes do op_fetch_scroll, em vez de só limpar um buffer em memória.
+    let mut mixed = conn.prepare(&tx, SQL)?;
+    mixed.set_scrollable(true);
+    mixed.set_fetch_size(5);
+    mixed.execute(&mut conn, &tx, &[])?;
+    let seq1 = emp(mixed.fetch(&mut conn)?);
+    assert_eq!(seq1, Some(all[0]));
+    let scrolled = emp(mixed.fetch_absolute(&mut conn, 2)?);
+    assert_eq!(scrolled, Some(all[1]));
+    mixed.drop_statement(&mut conn)?;
+
     tx.commit(&mut conn)?;
     conn.close()?;
     Ok(())

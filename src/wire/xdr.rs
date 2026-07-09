@@ -56,6 +56,21 @@ impl XdrWriter {
         self.buf
     }
 
+    /// Esvazia o buffer mantendo a capacidade, para reutilizar o writer ao
+    /// construir vários pacotes em sequência.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Acesso ao buffer interno, para codificar dados diretamente no pacote sem
+    /// passar por um `Vec` intermediário. O chamador é responsável por manter o
+    /// alinhamento XDR (use [`Self::align`] ao final, se necessário).
+    #[inline]
+    pub fn buf_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
     /// Anexa um inteiro big-endian de 32 bits.
     #[inline]
     pub fn put_i32(&mut self, v: i32) -> &mut Self {

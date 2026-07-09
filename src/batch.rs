@@ -68,7 +68,9 @@ use crate::message::{encode_row_into, encode_row_ref_into, message_buffer_len};
 use crate::transaction::Transaction;
 use crate::value::{ColumnMeta, Value, ValueRef};
 use crate::wire::consts::*;
-use crate::wire::response::{read_op, read_response, read_response_body, read_status_vector};
+use crate::wire::response::{
+    pipeline_requests, read_op, read_response, read_response_body, read_status_vector,
+};
 use crate::wire::stream::{op_name, op_packet};
 use crate::wire::xdr::ParameterBuffer;
 
@@ -300,21 +302,32 @@ impl Batch {
     /// Envia as mensagens acumuladas e executa o lote, retornando o estado de
     /// conclusão (contagens por linha e erros por linha). Esvazia o buffer
     /// pendente; o batch pode então ser reutilizado.
+    ///
+    /// As operações preparatórias (set_bpb, blob_stream, msg) e o exec final
+    /// são agrupadas em no máximo dois envios de rede em vez de um round-trip
+    /// por operação: o caso comum (sem BLOBs pendentes) faz só o `msg`+`exec`
+    /// num único flush, ou seja, 1 RTT no total. Só os `regblobs` — cuja
+    /// quantidade não tem limite fixo — continuam numa janela deslizante
+    /// separada (evita acumular respostas ilimitadas nos buffers TCP).
     pub fn execute(&mut self, conn: &mut Connection, tx: &Transaction) -> Result<BatchResult> {
         if self.closed {
             return Err(Error::protocol("batch já foi fechado"));
         }
-        // 0a. Define o BPB padrão (op_batch_set_bpb), se houver, antes dos blobs.
-        if let Some(bpb) = self.default_bpb.take() {
+
+        // 0. BPB padrão (op_batch_set_bpb) e stream de BLOBs novos
+        //    (op_batch_blob_stream), enfileirados juntos num único flush — ambos
+        //    precisam ir antes das mensagens (que referenciam os ids), mas não
+        //    dependem um do outro nem de suas respostas.
+        let has_bpb = self.default_bpb.is_some();
+        let has_blob_stream = !self.pending_blobs.is_empty();
+        if has_bpb {
+            let bpb = self.default_bpb.take().unwrap();
             let mut w = op_packet(op::BATCH_SET_BPB);
             w.put_i32(self.handle);
             w.put_bytes(&bpb); // cstring: len(4) + bpb + pad
-            conn.io().send(&w)?;
-            read_response(conn.io())?;
+            conn.io().enqueue(&w);
         }
-        // 0b. Envia os BLOBs pendentes (op_batch_blob_stream) ANTES das mensagens,
-        //    pois cada mensagem referencia um id de blob já registrado.
-        if !self.pending_blobs.is_empty() {
+        if has_blob_stream {
             let mut w = op_packet(op::BATCH_BLOB_STREAM);
             w.put_i32(self.handle);
             // Comprimento alinhado (≥ bytes no wire), depois os blobs crus. Não
@@ -322,41 +335,88 @@ impl Batch {
             // e a próxima op pode começar em offset não múltiplo de 4.
             w.put_i32(self.blob_stream_len as i32);
             w.put_raw(&self.pending_blobs);
-            conn.io().send(&w)?;
-            read_response(conn.io())?;
-            self.pending_blobs.clear();
-            self.blob_stream_len = 0;
+            conn.io().enqueue(&w);
         }
-        // 0b. Registra BLOBs pré-existentes (op_batch_regblob), também antes das
-        //     mensagens. Layout: stmt | id_existente(quad 8B BE) | id_batch(quad).
-        if !self.pending_regblobs.is_empty() {
-            for (existing_id, batch_id) in std::mem::take(&mut self.pending_regblobs) {
-                let mut w = op_packet(op::BATCH_REGBLOB);
-                w.put_i32(self.handle);
-                w.put_raw(&existing_id.to_be_bytes());
-                w.put_raw(&batch_id.to_be_bytes());
-                conn.io().send(&w)?;
-                read_response(conn.io())?;
+        if has_bpb || has_blob_stream {
+            conn.io().flush()?;
+            // Lê as duas respostas antes de propagar qualquer erro — ambos os
+            // pacotes já foram enviados no mesmo flush, então o servidor
+            // responde aos dois independentemente do resultado do primeiro; se
+            // parássemos no primeiro erro sem drenar o segundo, o stream
+            // ficaria fora de sincronia para a próxima operação.
+            let bpb_result = if has_bpb {
+                Some(read_response(conn.io()))
+            } else {
+                None
+            };
+            let blob_result = if has_blob_stream && !conn.io().is_broken() {
+                self.pending_blobs.clear();
+                self.blob_stream_len = 0;
+                Some(read_response(conn.io()))
+            } else {
+                None
+            };
+            if let Some(Err(e)) = bpb_result {
+                return Err(e);
+            }
+            if let Some(Err(e)) = blob_result {
+                return Err(e);
             }
         }
-        // 1. Envia as mensagens pendentes (op_batch_msg), se houver.
-        if self.pending_count > 0 {
+
+        // 0b. Registra BLOBs pré-existentes (op_batch_regblob), também antes das
+        //     mensagens. Layout: stmt | id_existente(quad 8B BE) | id_batch(quad).
+        //     Quantidade sem limite fixo — mantém a janela deslizante em vez de
+        //     enfileirar tudo de uma vez (evitaria estourar os buffers TCP em
+        //     batches com dezenas de milhares de blobs registrados).
+        if !self.pending_regblobs.is_empty() {
+            let handle = self.handle;
+            pipeline_requests(
+                conn.io(),
+                std::mem::take(&mut self.pending_regblobs).into_iter(),
+                256,
+                |w, (existing_id, batch_id)| {
+                    w.put_i32(op::BATCH_REGBLOB);
+                    w.put_i32(handle);
+                    w.put_raw(&existing_id.to_be_bytes());
+                    w.put_raw(&batch_id.to_be_bytes());
+                },
+            )?;
+        }
+
+        // 1-2. Mensagens pendentes (op_batch_msg) e exec (op_batch_exec) num
+        // único flush: a resposta do exec (op_batch_cs) só é lida depois de
+        // termos enviado ambos, então este é o caso comum reduzido a 1 RTT.
+        let has_msg = self.pending_count > 0;
+        if has_msg {
             let mut w = op_packet(op::BATCH_MSG);
             w.put_i32(self.handle);
             w.put_i32(self.pending_count as i32);
             w.put_raw(&self.pending);
             w.align();
-            conn.io().send(&w)?;
-            read_response(conn.io())?;
-            self.pending.clear();
-            self.pending_count = 0;
+            conn.io().enqueue(&w);
         }
-
-        // 2. Executa o lote (op_batch_exec) e lê o estado de conclusão.
         let mut w = op_packet(op::BATCH_EXEC);
         w.put_i32(self.handle);
         w.put_i32(tx.handle());
-        conn.io().send(&w)?;
+        conn.io().enqueue(&w);
+        conn.io().flush()?;
+
+        if has_msg {
+            if let Err(e) = read_response(conn.io()) {
+                // op_batch_exec já foi enviado no mesmo flush (o servidor o
+                // processa de qualquer forma); drena sua resposta antes de
+                // propagar o erro da mensagem, para manter o stream em
+                // sincronia. Erro de I/O/desync já deixou o stream marcado
+                // como quebrado — nada a drenar nesse caso.
+                if !conn.io().is_broken() {
+                    let _ = read_batch_cs(conn);
+                }
+                return Err(e);
+            }
+            self.pending.clear();
+            self.pending_count = 0;
+        }
         read_batch_cs(conn)
     }
 

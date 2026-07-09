@@ -3,6 +3,7 @@
 use crate::error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 use crate::wire::consts::{arg, op};
 use crate::wire::stream::{FbStream, op_name};
+use crate::wire::xdr::XdrWriter;
 
 /// Um pacote `op_response` analisado (`P_RESP`).
 #[derive(Debug, Clone)]
@@ -101,4 +102,57 @@ pub fn read_response(stream: &mut FbStream) -> Result<Response> {
         )));
     }
     read_response_body(stream)?.into_result()
+}
+
+/// Envia uma sequência de operações em pipeline: mantém até `window` pacotes em
+/// voo antes de drenar as respostas, em vez de esperar um round-trip por pacote.
+/// Cada item de `items` vira um pacote via `build` (o writer chega vazio).
+///
+/// A janela limita quanto acumula nos buffers TCP dos dois lados (as respostas
+/// só são drenadas aqui): sem ela, o servidor poderia bloquear escrevendo
+/// respostas que ninguém lê e parar de ler nossos pedidos — deadlock.
+///
+/// Se uma resposta trouxer erro de banco, o stream continua em sincronia; os
+/// pedidos restantes deixam de ser enviados, as respostas já em voo são
+/// drenadas e o primeiro erro é retornado. Erros de I/O/desync abortam
+/// imediatamente (o stream já está marcado como quebrado).
+pub fn pipeline_requests<T>(
+    stream: &mut FbStream,
+    mut items: impl Iterator<Item = T>,
+    window: usize,
+    mut build: impl FnMut(&mut XdrWriter, T),
+) -> Result<()> {
+    debug_assert!(window > 0);
+    let mut w = XdrWriter::new();
+    let mut outstanding = 0usize;
+    let mut first_err: Option<Error> = None;
+    loop {
+        // Reabastece a janela enquanto houver itens e nenhum erro registrado.
+        while first_err.is_none() && outstanding < window {
+            let Some(item) = items.next() else { break };
+            w.clear();
+            build(&mut w, item);
+            stream.enqueue(&w);
+            outstanding += 1;
+        }
+        stream.flush()?;
+        if outstanding == 0 {
+            break;
+        }
+        match read_response(stream) {
+            Ok(_) => outstanding -= 1,
+            Err(e) => {
+                outstanding -= 1;
+                if stream.is_broken() {
+                    // Sem sincronia não há como drenar o restante.
+                    return Err(e);
+                }
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }

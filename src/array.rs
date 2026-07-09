@@ -314,12 +314,6 @@ impl Connection {
         let sdl = desc.to_sdl();
         let charset = self.charset();
 
-        // Serializa os elementos no formato xdr_datum (mesmo do op_slice de leitura).
-        let mut data = Vec::new();
-        for v in values {
-            encode_element(&mut data, desc, v, charset)?;
-        }
-
         let mut w = op_packet(op::PUT_SLICE);
         w.put_i32(tx.handle());
         w.put_i64(0); // id 0 ⇒ o servidor aloca um array novo
@@ -327,7 +321,13 @@ impl Connection {
         w.put_bytes(&sdl);
         w.put_bytes(&[]); // parâmetros: nenhum
         w.put_i32(desc.slice_len() as i32); // comprimento lógico da fatia
-        w.put_raw(&data);
+        // Serializa os elementos no formato xdr_datum (mesmo do op_slice de
+        // leitura), direto no pacote — sem um Vec intermediário, que para
+        // arrays grandes dobraria o pico de memória e as cópias.
+        w.buf_mut().reserve(desc.slice_len());
+        for v in values {
+            encode_element(w.buf_mut(), desc, v, charset)?;
+        }
         w.align();
         self.io().send(&w)?;
 
@@ -348,7 +348,7 @@ fn decode_element(stream: &mut FbStream, desc: &ArrayDesc, charset: Charset) -> 
         blr::LONG => Value::Int(stream.read_i32()?),
         blr::INT64 => Value::BigInt(stream.read_i64()?),
         blr::INT128 => {
-            let b = stream.read_raw(16)?;
+            let b = stream.read_raw_ref(16)?;
             Value::Int128(i128::from_be_bytes(b.try_into().unwrap()))
         }
         blr::FLOAT => Value::Float(f32::from_bits(stream.read_i32()? as u32)),
@@ -361,18 +361,18 @@ fn decode_element(stream: &mut FbStream, desc: &ArrayDesc, charset: Charset) -> 
             Value::Timestamp(date, time)
         }
         blr::BOOL => {
-            let b = stream.read_raw(1)?;
+            let b = stream.read_raw_ref(1)?[0];
             stream.read_pad(1)?;
-            Value::Bool(b[0] != 0)
+            Value::Bool(b != 0)
         }
         blr::DEC64 => {
-            let b = stream.read_raw(8)?;
+            let b = stream.read_raw_ref(8)?;
             Value::DecFloat(crate::decfloat::DecFloat::from_decimal64(
                 b.try_into().unwrap(),
             ))
         }
         blr::DEC128 => {
-            let b = stream.read_raw(16)?;
+            let b = stream.read_raw_ref(16)?;
             Value::DecFloat(crate::decfloat::DecFloat::from_decimal128(
                 b.try_into().unwrap(),
             ))
