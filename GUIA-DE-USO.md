@@ -31,12 +31,13 @@ Este guia é a referência completa, com mais opções e recursos avançados.
 17. [Pool de conexões](#pool-de-conexões)
 18. [Charsets](#charsets)
 19. [Gerenciador de serviços (backup/restore/usuários)](#gerenciador-de-serviços-backuprestoreusuários)
-20. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
-21. [Tratamento de erros](#tratamento-de-erros)
-22. [Boas práticas de fechamento](#boas-práticas-de-fechamento)
-23. [Recursos implementados](#recursos-implementados)
-24. [O que falta implementar](#o-que-falta-implementar)
-25. [Rodando os testes ao vivo](#rodando-os-testes-ao-vivo)
+20. [Autenticação](#autenticação)
+21. [Criptografia de comunicação (wire crypt)](#criptografia-de-comunicação-wire-crypt)
+22. [Tratamento de erros](#tratamento-de-erros)
+23. [Boas práticas de fechamento](#boas-práticas-de-fechamento)
+24. [Recursos implementados](#recursos-implementados)
+25. [O que falta implementar](#o-que-falta-implementar)
+26. [Rodando os testes ao vivo](#rodando-os-testes-ao-vivo)
 
 ---
 
@@ -88,7 +89,8 @@ conn.close()?;          // detach explícito
 
 Opções adicionais do builder: `.role(...)`, `.timezone("America/Sao_Paulo")`,
 `.parallel_workers(4)`, `.connect_timeout(Duration::from_secs(10))`,
-`.page_size(8192)` (para `create_database`), `.wire_crypt(WireCrypt::Required)`.
+`.page_size(8192)` (para `create_database`), `.wire_crypt(WireCrypt::Required)`,
+`.legacy_auth(false)` (ver [Autenticação](#autenticação)).
 
 ### Criar um banco
 
@@ -680,6 +682,13 @@ Tanto a leitura (`Value::Text`) quanto a escrita de parâmetros de texto são
 transcodificadas. Caracteres não representáveis no charset alvo viram `?` na
 escrita.
 
+O texto que vem no **vetor de status** — a mensagem de uma exceção do usuário, o
+nome do objeto que faltou — segue a mesma regra: é decodificado no charset da
+conexão. Numa conexão UTF-8 esse texto ainda pode chegar noutro charset (o da
+mensagem gravada no banco, o do sistema do servidor); quando os bytes não formam
+UTF-8 válido, o driver decodifica como Windows-1252 em vez de devolver
+caracteres de substituição, para a mensagem não chegar como `A��o` ao usuário.
+
 ### Charsets multibyte (feature `charset-full`)
 
 A feature opcional **`charset-full`** traz o `encoding_rs` e habilita os charsets
@@ -770,6 +779,49 @@ saída) e `svc.info(send, recv, buf_len)`.
 
 ---
 
+## Autenticação
+
+O handshake negocia **Srp256** ou **Srp** e, na maioria dos casos, a prova já vai
+dentro do PB do attach — uma viagem só. Não há nada a configurar para isso.
+
+O que às vezes precisa de atenção é o plugin **`Legacy_Auth`**: o `crypt(3)` DES
+que o Firebird usa desde sempre, com o sal fixo `9z`. Bases `security` migradas
+de versões antigas costumam ter usuários sem registro Srp, e para esses o
+servidor não oferece outro caminho. O sintoma é característico — o servidor
+responde o accept com o plugin Srp e **zero bytes** de desafio, que é a forma
+dele dizer "esse usuário não existe aqui", e logo depois pede a continuação por
+`op_cont_auth`:
+
+```
+$ FB_DEBUG=1 minha-app
+[fdb] accept: proto=19 plugin="Srp" authenticated=false data_len=0 keys_len=0
+[fdb] server asked to continue auth with "Legacy_Auth" (data_len=0)
+[fdb] answering cont_auth with Legacy_Auth
+```
+
+Isso funciona sem configuração: `legacy_auth` já vem ligado, como no `AuthClient`
+padrão do fbclient. Vale saber o que se aceita ao mantê-lo assim — o
+`Legacy_Auth` põe no fio um hash DES **equivalente à senha** e não produz chave
+de sessão, então uma conexão autenticada por ele **não terá criptografia de
+wire**. E, como o servidor percorre a lista de plugins até algum passar, uma
+senha errada faz o cliente chegar até ele mesmo quando o usuário *tem* registro
+Srp.
+
+Para recusar o downgrade e receber um `Error::Auth` no lugar:
+
+```rust
+let cfg = ConnectConfig::new()
+    /* ... */
+    .legacy_auth(false);
+```
+
+Um plugin que a crate não implementa (`Win_Sspi`, `Certificate`, `GostPassword`)
+falha na hora, nomeando o que o servidor pediu. É de propósito: quem apenas
+consome o `op_cont_auth` e volta a ler fica esperando um servidor que também
+está esperando — um travamento permanente, sem erro e sem timeout de socket.
+
+---
+
 ## Criptografia de comunicação (wire crypt)
 
 Negociada após o SRP. Plugins suportados: **ChaCha** (preferido), **ChaCha64** e
@@ -788,7 +840,9 @@ let cfg = ConnectConfig::new()
 - `WireCrypt::Required` — exige; aborta se não for possível.
 
 A chave vem da sessão SRP; para ChaCha, `chave = SHA-256(K)` e o *nonce* chega no
-handshake. Confira com `conn.is_encrypted()`.
+handshake. Confira com `conn.is_encrypted()`. Como a chave sai do SRP, o usuário
+que existe **só** no `Legacy_Auth` não gera chave nenhuma — com ele,
+`WireCrypt::Required` falha antes mesmo do attach.
 
 > Observação: a criptografia só é negociada quando o servidor a oferece
 > (tipicamente com `WireCrypt = Required`/`Enabled` no `firebird.conf`). Contra um
@@ -804,7 +858,7 @@ handshake. Confira com `conn.is_encrypted()`.
 |----------|--------|
 | `Database(DatabaseError)` | erro reportado pelo servidor (com vetor de status / gds codes) |
 | `Protocol(String)` | resposta inesperada / violação de protocolo |
-| `Auth(String)` | falha de autenticação ou de negociação de cripto |
+| `Auth(String)` | falha de autenticação, plugin não implementado, ou negociação de cripto |
 | `Io(std::io::Error)` | erro de socket |
 | `Conversion(String)` | conversão de tipo de valor inválida |
 | `Timeout` | estouro do timeout de conexão |
@@ -818,6 +872,34 @@ match conn.prepare(&tx, "SELECT * FROM inexistente") {
     Err(e) => eprintln!("outro erro: {e}"),
 }
 ```
+
+### Mensagens e o símbolo `isc_*`
+
+O servidor manda o status vector cru — códigos GDS mais os argumentos — e quase
+nunca o texto já pronto. A crate traz o catálogo completo do Firebird (`src/gds.rs`,
+**gerado** por `tools/gerar_gds.py` a partir dos cabeçalhos `impl/msg/*.h` da
+instalação) e preenche os `@N` com os argumentos de cada código. Sem isso, um
+erro como este chegaria como a string solta `"SYSDBA"`:
+
+```
+Your login SYSDBA is same as one of the SQL role name.
+Ask your database administrator to set up a valid Firebird login. (gds 335544745)
+```
+
+Para tratar um erro específico, prefira o símbolo ao número:
+
+```rust
+if let Err(Error::Database(db)) = conn.exec_immediate(None, sql) {
+    match db.gds_symbol() {
+        Some("isc_lock_conflict") => { /* repetir a transação */ }
+        Some("isc_no_dup") => { /* violação de índice único */ }
+        _ => return Err(Error::Database(db)),
+    }
+}
+```
+
+`db.gds_code()` continua disponível, e o `Display` sempre anexa o código (e o
+SQLSTATE, quando o servidor o envia) ao final da mensagem.
 
 ---
 
@@ -840,7 +922,8 @@ síncrono.)
 
 ## Recursos implementados
 
-- ✅ Handshake + autenticação **SRP / Srp256**
+- ✅ Handshake + autenticação **SRP / Srp256** e **Legacy_Auth**
+- ✅ Mensagens de erro pelo **catálogo GDS completo** do Firebird, com símbolo `isc_*`
 - ✅ Criptografia de comunicação **ChaCha / ChaCha64 / Arc4** (validada ao vivo)
 - ✅ Transações (begin/commit/rollback + *retaining*, `TransactionBuilder`)
 - ✅ `exec_immediate` (DDL/DML sem prepare)

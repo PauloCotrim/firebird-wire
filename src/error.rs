@@ -155,29 +155,44 @@ impl StatusVector {
             return interpreted.join("; ");
         }
 
-        // Valores que preenchem @1, @2, … na ordem em que aparecem.
-        let fill: Vec<String> = self
-            .args
-            .iter()
-            .filter_map(|a| match a {
-                StatusArg::Number(n) => Some(n.to_string()),
-                StatusArg::Str(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        // (2) Formata cada código GDS com template conhecido.
-        let templated: Vec<String> = self
-            .args
-            .iter()
-            .filter_map(|a| match a {
-                StatusArg::Gds(c) if *c != 0 => gds_template(*c).map(|t| fill_template(t, &fill)),
-                _ => None,
-            })
-            .collect();
-        if !templated.is_empty() {
-            return templated.join("; ");
+        // (2) Cada código GDS formata o próprio template.
+        //
+        // Os argumentos pertencem ao código que vem **antes** deles: o vetor é
+        // uma sequência `gds, code, args…, gds, code, args…`. Preencher todos os
+        // templates a partir de uma lista única de argumentos trocava os valores
+        // entre os códigos encadeados — invisível enquanto quase nenhum código
+        // tinha template, gritante agora que o catálogo cobre todos.
+        let mut partes: Vec<String> = Vec::new();
+        let mut sobras: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < self.args.len() {
+            let codigo = match &self.args[i] {
+                StatusArg::Gds(c) if *c != 0 => *c,
+                outro => {
+                    if let Some(v) = valor_de(outro) {
+                        sobras.push(v);
+                    }
+                    i += 1;
+                    continue;
+                }
+            };
+            let mut fill = Vec::new();
+            i += 1;
+            while let Some(v) = self.args.get(i).and_then(valor_de) {
+                fill.push(v);
+                i += 1;
+            }
+            match gds_template(codigo) {
+                Some(t) => partes.push(fill_template(t, &fill)),
+                // Código fora do catálogo: os argumentos crus ainda dizem algo.
+                None if !fill.is_empty() => partes.push(fill.join(" ")),
+                None => {}
+            }
         }
+        if !partes.is_empty() {
+            return partes.join("; ");
+        }
+        let fill = sobras;
 
         // (3)/(4) Argumentos crus, senão o código.
         if !fill.is_empty() {
@@ -187,6 +202,16 @@ impl StatusVector {
             Some(c) => format!("Firebird error (gds code {c})"),
             None => "unknown Firebird error".to_string(),
         }
+    }
+}
+
+/// O valor com que um argumento preenche um `@N`; `None` para os elementos que
+/// não são parâmetros (códigos e texto já interpretado).
+fn valor_de(arg: &StatusArg) -> Option<String> {
+    match arg {
+        StatusArg::Number(n) => Some(n.to_string()),
+        StatusArg::Str(s) => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -202,48 +227,9 @@ fn fill_template(template: &str, fill: &[String]) -> String {
     out
 }
 
-/// Texto dos códigos de erro GDS mais comuns (extraído do `firebird.msg` do FB5
-/// via `fb_interpret`). Os `@N` são preenchidos por [`fill_template`]. Cobre os
-/// erros que aplicações realmente encontram; o resto recai no código bruto.
+/// Texto do código GDS, vindo do catálogo completo em [`crate::gds`].
 fn gds_template(code: i32) -> Option<&'static str> {
-    Some(match code {
-        335544321 => "arithmetic exception, numeric overflow, or string truncation",
-        335544324 => "invalid database handle (no active connection)",
-        335544328 => "invalid BLOB handle",
-        335544329 => "invalid BLOB ID",
-        335544333 => "internal Firebird consistency check (@1)",
-        335544334 => "conversion error from string \"@1\"",
-        335544336 => "deadlock",
-        335544344 => "I/O error during \"@1\" operation for file \"@2\"",
-        335544345 => "lock conflict on no wait transaction",
-        335544347 => "validation error for column @1, value \"@2\"",
-        335544348 => "no current record for fetch operation",
-        335544349 => {
-            "attempt to store duplicate value (visible to active transactions) in unique index \"@1\""
-        }
-        335544351 => "unsuccessful metadata update",
-        335544352 => "no permission for @1 access to @2 @3",
-        335544359 => "attempted update of read-only column @1",
-        335544361 => "attempted update during read-only transaction",
-        335544380 => "wrong number of arguments on call",
-        335544395 => "table @1 is not defined",
-        335544396 => "column @1 is not defined in table @2",
-        335544421 => "connection rejected by remote interface",
-        335544451 => "update conflicts with concurrent update",
-        335544466 => "violation of FOREIGN KEY constraint \"@1\" on table \"@2\"",
-        335544472 => {
-            "Your user name and password are not defined. Ask your database administrator to set up a Firebird login."
-        }
-        335544510 => "lock time-out on wait transaction",
-        335544558 => "Operation violates CHECK constraint @1 on view or table @2",
-        335544569 => "Dynamic SQL Error",
-        335544578 => "Column unknown",
-        335544580 => "Table unknown",
-        335544606 => "expression evaluation not supported",
-        335544634 => "Token unknown - line @1, column @2",
-        335544665 => "violation of PRIMARY or UNIQUE KEY constraint \"@1\" on table \"@2\"",
-        _ => return None,
-    })
+    crate::gds::message_template(code)
 }
 
 impl fmt::Display for StatusVector {
@@ -277,6 +263,13 @@ impl DatabaseError {
     /// O primeiro código GDS diferente de zero no status vector.
     pub fn gds_code(&self) -> Option<i32> {
         self.status.gds_code()
+    }
+
+    /// O símbolo `isc_*` do erro (ex.: `isc_login_same_as_role_name`), quando o
+    /// catálogo o conhece. Permite tratar um erro específico sem espalhar o
+    /// número mágico pelo código de chamada.
+    pub fn gds_symbol(&self) -> Option<&'static str> {
+        self.gds_code().and_then(crate::gds::symbol)
     }
 }
 
@@ -359,5 +352,41 @@ mod tests {
     #[test]
     fn deadlock_has_no_placeholders() {
         assert_eq!(sv(vec![StatusArg::Gds(335544336)]).message(), "deadlock");
+    }
+
+    /// Cada código consome só os argumentos que vêm depois dele. A versão que
+    /// preenchia todos os templates com uma lista única dizia
+    /// `... tabela "PEDIDO"; column PEDIDO is not defined in table FK_...`.
+    #[test]
+    fn cada_codigo_usa_os_proprios_argumentos() {
+        let v = sv(vec![
+            StatusArg::Gds(335544466), // violation of FOREIGN KEY "@1" on table "@2"
+            StatusArg::Str("FK_PEDIDO_CLIENTE".into()),
+            StatusArg::Str("PEDIDO".into()),
+            StatusArg::Gds(335544396), // column @1 is not defined in table @2
+            StatusArg::Str("CLIENTE_ID".into()),
+            StatusArg::Str("CLIENTE".into()),
+        ]);
+        assert_eq!(
+            v.message(),
+            "violation of FOREIGN KEY constraint \"FK_PEDIDO_CLIENTE\" on table \"PEDIDO\"; \
+             column CLIENTE_ID is not defined in table CLIENTE"
+        );
+    }
+
+    /// O caso que motivou o catálogo completo: antes a mensagem era só `SYSDBA`,
+    /// porque o código não estava na tabela curada à mão.
+    #[test]
+    fn login_igual_a_role_agora_se_explica() {
+        let v = sv(vec![
+            StatusArg::Gds(335544745),
+            StatusArg::Str("SYSDBA".into()),
+        ]);
+        assert!(v.message().starts_with(
+            "Your login SYSDBA is same as one of the SQL role name"
+        ));
+        let e = DatabaseError::new(v);
+        assert_eq!(e.gds_symbol(), Some("isc_login_same_as_role_name"));
+        assert!(e.to_string().contains("(gds 335544745)"));
     }
 }

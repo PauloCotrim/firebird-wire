@@ -46,6 +46,16 @@ pub struct ConnectConfig {
     pub timezone: Option<String>,
     /// Número de workers paralelos para a conexão (FB5).
     pub parallel_workers: Option<i32>,
+    /// Permite concluir a autenticação pelo plugin `Legacy_Auth` quando o
+    /// servidor a pede (padrão `true`, como faz o `AuthClient` do fbclient).
+    ///
+    /// Só entra em cena se o servidor pedir: um servidor que autentica por
+    /// Srp/Srp256 nunca chega nesse ponto. Vale saber o que se aceita ao
+    /// deixá-la ligada — o `Legacy_Auth` põe no fio um hash DES equivalente à
+    /// senha e não produz chave de sessão, então essa conexão **não** terá
+    /// criptografia de wire. Deixe `false` para recusar o downgrade e receber
+    /// um erro de autenticação no lugar.
+    pub legacy_auth: bool,
     /// Quando `true`, emite `SET BIND OF INT128/DECFLOAT/TIME ZONE TO NATIVE`
     /// logo após o attach (FB4+). Útil quando o servidor está com
     /// `DataTypeCompatibility` ligado e coage esses tipos para os legados —
@@ -69,6 +79,7 @@ impl Default for ConnectConfig {
             page_size: None,
             timezone: None,
             parallel_workers: None,
+            legacy_auth: true,
             native_data_types: false,
         }
     }
@@ -138,6 +149,12 @@ impl ConnectConfig {
     /// Define o fuso horário da sessão, por exemplo `America/Sao_Paulo`.
     pub fn timezone(mut self, tz: impl Into<String>) -> Self {
         self.timezone = Some(tz.into());
+        self
+    }
+    /// Define se o plugin `Legacy_Auth` pode ser usado quando o servidor o pede.
+    /// Ver [`ConnectConfig::legacy_auth`] para o que se aceita ao mantê-lo ligado.
+    pub fn legacy_auth(mut self, permitir: bool) -> Self {
+        self.legacy_auth = permitir;
         self
     }
     /// Define o número de workers paralelos solicitado ao servidor Firebird 5.

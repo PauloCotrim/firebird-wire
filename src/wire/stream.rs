@@ -14,6 +14,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
+use crate::charset::Charset;
 use crate::error::{Error, Result};
 use crate::wire::consts::{INFO_END, op};
 use crate::wire::xdr::{XdrWriter, pad4};
@@ -40,6 +41,11 @@ pub struct FbStream {
     /// ter bytes pendentes em estado desconhecido e não deve ser reutilizado (o
     /// pool descarta conexões assim marcadas em vez de devolvê-las).
     broken: bool,
+    /// Charset da conexão, para decodificar o texto que vem no vetor de status
+    /// (mensagem de exceção, nome de objeto). Fica aqui, e não só na
+    /// [`crate::Connection`], porque o vetor de status é lido no nível do
+    /// stream — inclusive nas falhas de handshake, antes de existir conexão.
+    charset: Charset,
 }
 
 impl FbStream {
@@ -53,7 +59,18 @@ impl FbStream {
             read_cipher: None,
             write_cipher: None,
             broken: false,
+            charset: Charset::default(),
         }
+    }
+
+    /// Define o charset da conexão, assim que ele é conhecido (o do DPB).
+    pub fn set_charset(&mut self, charset: Charset) {
+        self.charset = charset;
+    }
+
+    /// O charset da conexão. Antes do attach é o padrão (UTF-8).
+    pub fn charset(&self) -> Charset {
+        self.charset
     }
 
     /// Marca o stream como inutilizável (erro de I/O ou desync de protocolo).

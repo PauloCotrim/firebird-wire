@@ -74,6 +74,7 @@ pub mod config;
 pub mod connection;
 pub mod decfloat;
 pub mod dos;
+pub mod gds;
 pub mod error;
 pub mod events;
 pub mod message;

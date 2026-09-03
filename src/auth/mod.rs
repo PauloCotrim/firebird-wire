@@ -1,6 +1,7 @@
 //! Autenticação e criptografia do wire: o cliente SRP e as cifras de fluxo usadas
 //! durante o handshake de conexão.
 
+pub mod legacy;
 pub mod srp;
 pub mod wirecrypt;
 

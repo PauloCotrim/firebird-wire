@@ -3,6 +3,7 @@
 
 use std::net::{TcpStream, ToSocketAddrs};
 
+use crate::auth::legacy;
 use crate::auth::srp::{SrpClient, SrpHash, parse_server_data};
 use crate::auth::wirecrypt::{WireCryptPlugin, make_ciphers};
 use crate::config::{ConnectConfig, WireCrypt};
@@ -28,10 +29,24 @@ const OFFERED_PROTOCOLS: &[i32] = &[
 ];
 
 /// Lista de plugins de autenticação que anunciamos ao servidor — usada tanto no
-/// bloco `p_cnct_user_id` (connect) quanto no DPB de attach e na continuação
-/// `op_cont_auth`. Mantida como uma única constante para que os três pontos
-/// nunca fiquem dessincronizados entre si.
-const AUTH_PLUGIN_LIST: &str = "Srp256,Srp";
+/// bloco `p_cnct_user_id` (connect) quanto no PB de attach e na continuação
+/// `op_cont_auth`. Uma função só, para que os três pontos nunca fiquem
+/// dessincronizados entre si.
+///
+/// `Legacy_Auth` entra no fim: o servidor percorre a lista na ordem dele, mas
+/// anunciá-lo por último deixa claro que é o último recurso.
+pub(crate) fn plugin_list(config: &ConnectConfig) -> &'static str {
+    if config.legacy_auth {
+        "Srp256,Srp,Legacy_Auth"
+    } else {
+        "Srp256,Srp"
+    }
+}
+
+/// Teto de rodadas de `op_cont_auth` numa mesma tentativa de attach. Um servidor
+/// que insistisse no mesmo plugin nos deixaria trocando pacotes para sempre;
+/// nenhum handshake real precisa de mais que duas ou três.
+const MAX_RODADAS_CONT_AUTH: usize = 8;
 
 /// Verdadeiro quando a variável de ambiente `FB_DEBUG` está definida; avaliado
 /// uma única vez por processo.
@@ -88,6 +103,7 @@ impl Connection {
             mut stream,
             protocol_version,
             auth,
+            mut srp,
         } = handshake(config, connect_op, &config.database)?;
 
         // --- attach / create ----------------------------------------------
@@ -97,7 +113,7 @@ impl Connection {
         w.put_str(&config.database);
         w.put_bytes(&dpb);
         stream.send(&w)?;
-        let resp = attach_response(&mut stream)?;
+        let resp = attach_response(&mut stream, config, &mut srp)?;
 
         let mut conn = Connection {
             stream,
@@ -363,6 +379,11 @@ pub(crate) struct Handshake {
     pub(crate) stream: FbStream,
     pub(crate) protocol_version: i32,
     pub(crate) auth: AuthState,
+    /// A sessão SRP do handshake, viva para depois do attach: o `A` dela já foi
+    /// ao servidor no bloco do `op_connect`, então uma rodada de `op_cont_auth`
+    /// pedindo Srp precisa desta instância — uma nova teria outra chave privada
+    /// e produziria uma prova que não fecha com o `A` que o servidor guardou.
+    pub(crate) srp: SrpClient,
 }
 
 /// Executa o handshake comum a attach de banco e de serviço: `op_connect`, lê o
@@ -377,6 +398,10 @@ pub(crate) fn handshake(
     config.validate()?;
     let sock = connect_socket(config)?;
     let mut stream = FbStream::new(sock);
+    // O vetor de status vem no charset da conexão, e ele é lido no nível do
+    // stream — inclusive quando o próprio attach falha, que é onde a mensagem
+    // do servidor mais importa.
+    stream.set_charset(crate::charset::Charset::from_name(&config.charset));
 
     let mut srp = SrpClient::new(SrpHash::Sha256);
 
@@ -428,7 +453,7 @@ pub(crate) fn handshake(
     // contrário, usamos a prova embutida no PB e as chaves do accept.
     let auth = match (auth, accept.cond, config.wire_crypt != WireCrypt::Disabled) {
         (Some(a), true, true) => {
-            let keys = continue_auth(&mut stream, &a)?;
+            let keys = continue_auth(&mut stream, config, &a)?;
             negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys)?;
             AuthState::Done
         }
@@ -447,6 +472,7 @@ pub(crate) fn handshake(
         stream,
         protocol_version,
         auth,
+        srp,
     })
 }
 
@@ -522,11 +548,15 @@ fn compute_auth(
 /// servidores `WireCrypt=Required`: as chaves (com o nonce dos plugins ChaCha)
 /// só chegam após esta rodada. Layout do `op_cont_auth`:
 /// `data(prova, cstring) | name(plugin) | list(plugins) | keys(cstring vazia)`.
-fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>> {
+fn continue_auth(
+    stream: &mut FbStream,
+    config: &ConnectConfig,
+    auth: &AuthData,
+) -> Result<Vec<u8>> {
     let mut w = op_packet(op::CONT_AUTH);
     w.put_str(&auth.proof_hex);
     w.put_str(&auth.plugin);
-    w.put_str(AUTH_PLUGIN_LIST);
+    w.put_str(plugin_list(config));
     w.put_bytes(&[]);
     stream.send(&w)?;
     let resp = read_response(stream)?;
@@ -535,19 +565,43 @@ fn continue_auth(stream: &mut FbStream, auth: &AuthData) -> Result<Vec<u8>> {
 
 /// Lê a resposta para `op_attach`/`op_create`/`op_service_attach`. Com a
 /// autenticação carregada no PB o servidor normalmente responde `op_response`
-/// diretamente, mas pode conduzir uma ou mais rodadas de `op_cont_auth` antes;
-/// absorva-as.
-pub(crate) fn attach_response(stream: &mut FbStream) -> Result<crate::wire::response::Response> {
+/// diretamente, mas pode conduzir uma ou mais rodadas de `op_cont_auth` antes.
+///
+/// Essas rodadas precisam ser **respondidas**, não absorvidas: é o servidor
+/// dizendo "seu usuário não existe no plugin que negociamos, prove-se por este
+/// outro aqui". Quem só consome o pacote e volta a ler fica esperando um
+/// servidor que também está esperando — um travamento permanente, sem erro e
+/// sem timeout de socket, que é o pior desfecho possível para um handshake.
+pub(crate) fn attach_response(
+    stream: &mut FbStream,
+    config: &ConnectConfig,
+    srp: &mut SrpClient,
+) -> Result<crate::wire::response::Response> {
+    let mut rodadas = 0;
     loop {
         let code = read_op(stream)?;
         if code == op::RESPONSE {
             return read_response_body(stream)?.into_result();
         } else if code == op::CONT_AUTH {
-            // data, name, list, keys — consome e continua; o servidor virá
-            // em seguida com o op_response real.
-            for _ in 0..4 {
-                let _ = stream.read_bytes()?;
+            // p_data | p_name | p_list | p_keys. O `data` é o desafio do plugin
+            // (vazio no Legacy_Auth) e o `name` é o plugin pedido.
+            let data = stream.read_bytes()?;
+            let nome = stream.read_bytes()?;
+            let _list = stream.read_bytes()?;
+            let _keys = stream.read_bytes()?;
+            let plugin = String::from_utf8_lossy(&nome).into_owned();
+            dbg_log!(
+                "server asked to continue auth with {plugin:?} (data_len={})",
+                data.len()
+            );
+
+            rodadas += 1;
+            if rodadas > MAX_RODADAS_CONT_AUTH {
+                return Err(Error::auth(format!(
+                    "server kept requesting authentication rounds (>{MAX_RODADAS_CONT_AUTH});                      last plugin was '{plugin}'"
+                )));
             }
+            responder_cont_auth(stream, config, srp, &plugin, &data)?;
         } else {
             return Err(Error::protocol(format!(
                 "unexpected packet after attach: {} ({code})",
@@ -555,6 +609,59 @@ pub(crate) fn attach_response(stream: &mut FbStream) -> Result<crate::wire::resp
             )));
         }
     }
+}
+
+/// Responde a uma rodada de `op_cont_auth`.
+///
+/// Dois plugins são atendidos: `Legacy_Auth` (hash DES da senha) e Srp/Srp256
+/// quando o servidor manda um desafio novo — o que acontece quando a prova que
+/// foi no PB de attach não fecha, ou quando o servidor tenta um segundo
+/// registro do mesmo usuário (um em Srp256, outro em Srp). Qualquer outro
+/// pedido (`Win_Sspi`, `Certificate`, `GostPassword`) vira erro imediato: dizer
+/// "não sei falar isso" é infinitamente melhor que ficar calado.
+fn responder_cont_auth(
+    stream: &mut FbStream,
+    config: &ConnectConfig,
+    srp: &mut SrpClient,
+    plugin: &str,
+    desafio: &[u8],
+) -> Result<()> {
+    let dado = match plugin {
+        legacy::PLUGIN => {
+            if !config.legacy_auth {
+                return Err(Error::auth(
+                    "server requested the Legacy_Auth plugin; refused because \
+                     ConnectConfig::legacy_auth is disabled",
+                ));
+            }
+            legacy::hash(&config.password)
+        }
+        "Srp" | "Srp256" if !desafio.is_empty() => {
+            srp.set_hash(if plugin == "Srp256" {
+                SrpHash::Sha256
+            } else {
+                SrpHash::Sha1
+            });
+            let (salt, b_pub) = parse_server_data(desafio)?;
+            let (proof, _) = srp.proof(&config.normalized_user(), &config.password, &salt, &b_pub)?;
+            crate::auth::srp::to_hex(&proof)
+        }
+        _ => {
+            return Err(Error::auth(format!(
+                "server requested auth plugin '{plugin}', which this client does not implement \
+                 (announced: {})",
+                plugin_list(config)
+            )));
+        }
+    };
+
+    dbg_log!("answering cont_auth with {plugin}");
+    let mut w = op_packet(op::CONT_AUTH);
+    w.put_str(&dado); // p_data
+    w.put_str(plugin); // p_name
+    w.put_str(plugin_list(config)); // p_list
+    w.put_bytes(&[]); // p_keys
+    stream.send(&w)
 }
 
 /// Negocia a criptografia de comunicação (wire) conforme a postura [`WireCrypt`] requisitada.
@@ -637,7 +744,7 @@ fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
 
     push_cnct(&mut b, cnct::LOGIN, user.as_bytes());
     push_cnct(&mut b, cnct::PLUGIN_NAME, b"Srp256");
-    push_cnct(&mut b, cnct::PLUGIN_LIST, AUTH_PLUGIN_LIST.as_bytes());
+    push_cnct(&mut b, cnct::PLUGIN_LIST, plugin_list(config).as_bytes());
 
     // Usuário / host do SO, para monitoramento no lado do servidor (espelha fbclient).
     if let Some(os_user) = os_user() {
@@ -689,7 +796,7 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> 
     match auth {
         AuthState::Proof(a) => {
             pb.string(dpb::AUTH_PLUGIN_NAME, &a.plugin);
-            pb.string(dpb::AUTH_PLUGIN_LIST, AUTH_PLUGIN_LIST);
+            pb.string(dpb::AUTH_PLUGIN_LIST, plugin_list(config));
             pb.string(dpb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
         AuthState::Legacy => {

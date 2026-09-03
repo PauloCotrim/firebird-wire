@@ -65,6 +65,7 @@ impl ServiceManager {
             mut stream,
             protocol_version: _,
             auth,
+            mut srp,
         } = handshake(config, op::SERVICE_ATTACH, "service_mgr")?;
 
         let spb = build_attach_spb(config, &auth);
@@ -73,7 +74,7 @@ impl ServiceManager {
         w.put_str("service_mgr");
         w.put_bytes(&spb);
         stream.send(&w)?;
-        let resp = crate::connection::attach_response(&mut stream)?;
+        let resp = crate::connection::attach_response(&mut stream, config, &mut srp)?;
 
         Ok(ServiceManager {
             stream,
@@ -517,7 +518,7 @@ fn build_attach_spb(config: &ConnectConfig, auth: &AuthState) -> Vec<u8> {
     match auth {
         AuthState::Proof(a) => {
             spb.string(spb::AUTH_PLUGIN_NAME, &a.plugin);
-            spb.string(spb::AUTH_PLUGIN_LIST, "Srp256,Srp");
+            spb.string(spb::AUTH_PLUGIN_LIST, crate::connection::plugin_list(config));
             spb.string(spb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
         AuthState::Legacy => {

@@ -1,5 +1,6 @@
 //! Leitura genérica de resposta: `op_response` mais o vetor de status final.
 
+use crate::charset::Charset;
 use crate::error::{DatabaseError, Error, Result, StatusArg, StatusVector};
 use crate::wire::consts::{arg, op};
 use crate::wire::stream::{FbStream, op_name};
@@ -41,8 +42,32 @@ pub fn read_op(stream: &mut FbStream) -> Result<i32> {
     }
 }
 
+/// Decodifica uma string do vetor de status.
+///
+/// O servidor manda esse texto no charset da conexão — é dele que sai a
+/// mensagem de uma exceção do usuário, com os acentos do idioma do banco.
+/// Decodificar tudo como UTF-8 transformava "Ação não encontrada" em
+/// "A��o n�o encontrada", e o dano é irreversível: os bytes originais somem
+/// no `U+FFFD`.
+///
+/// Numa conexão UTF-8 o texto ainda pode vir noutro charset (o da mensagem
+/// gravada no banco, o do sistema do servidor). Quando os bytes não formam
+/// UTF-8 válido, decodificamos como Windows-1252, que aceita qualquer byte e
+/// acerta o Latin-1 que esses casos costumam ser — melhor do que devolver
+/// caractere de substituição.
+fn decode_text(charset: Charset, raw: Vec<u8>) -> String {
+    match charset {
+        Charset::Utf8 | Charset::Unknown => match String::from_utf8(raw) {
+            Ok(s) => s,
+            Err(e) => Charset::Win1252.decode(e.as_bytes()),
+        },
+        outro => outro.decode_owned(raw),
+    }
+}
+
 /// Lê um vetor de status campo a campo do fluxo (stream).
 pub fn read_status_vector(stream: &mut FbStream) -> Result<StatusVector> {
+    let charset = stream.charset();
     let mut args = Vec::new();
     let mut sql_state = None;
 
@@ -54,13 +79,14 @@ pub fn read_status_vector(stream: &mut FbStream) -> Result<StatusVector> {
             t if t == arg::WARNING => args.push(StatusArg::Warning(stream.read_i32()?)),
             t if t == arg::NUMBER => args.push(StatusArg::Number(stream.read_i32()?)),
             t if t == arg::STRING || t == arg::CSTRING => {
-                let s = String::from_utf8_lossy(&stream.read_bytes()?).into_owned();
+                let s = decode_text(charset, stream.read_bytes()?);
                 args.push(StatusArg::Str(s));
             }
             t if t == arg::INTERPRETED => {
-                let s = String::from_utf8_lossy(&stream.read_bytes()?).into_owned();
+                let s = decode_text(charset, stream.read_bytes()?);
                 args.push(StatusArg::Interpreted(s));
             }
+            // O SQLSTATE são cinco caracteres ASCII (`42S02` e afins).
             t if t == arg::SQL_STATE => {
                 sql_state = Some(String::from_utf8_lossy(&stream.read_bytes()?).into_owned());
             }
@@ -154,5 +180,44 @@ pub fn pipeline_requests<T>(
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "Ação do Projeto" em Windows-1252 — os bytes que o servidor manda numa
+    /// conexão WIN1252, que é como os bancos deste driver costumam rodar.
+    const ACAO_WIN1252: &[u8] = b"A\xe7\xe3o do Projeto";
+
+    #[test]
+    fn texto_do_status_sai_no_charset_da_conexao() {
+        assert_eq!(
+            decode_text(Charset::Win1252, ACAO_WIN1252.to_vec()),
+            "Ação do Projeto"
+        );
+        assert_eq!(
+            decode_text(Charset::Latin1, ACAO_WIN1252.to_vec()),
+            "Ação do Projeto"
+        );
+    }
+
+    /// Numa conexão UTF-8 o texto ainda pode vir noutro charset (a mensagem
+    /// gravada no banco, o idioma do sistema do servidor). Antes isso virava
+    /// `U+FFFD` e a mensagem chegava ilegível ao usuário.
+    #[test]
+    fn bytes_que_nao_sao_utf8_caem_para_win1252_em_vez_de_perder_o_acento() {
+        let s = decode_text(Charset::Utf8, ACAO_WIN1252.to_vec());
+        assert_eq!(s, "Ação do Projeto");
+        assert!(!s.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn utf8_valido_atravessa_intacto() {
+        assert_eq!(
+            decode_text(Charset::Utf8, "Ação do Projeto".as_bytes().to_vec()),
+            "Ação do Projeto"
+        );
     }
 }

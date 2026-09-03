@@ -9,9 +9,11 @@
 //! 2. [`Statement::execute`] envia `op_execute` (com uma mensagem de entrada
 //!    quando a instrução tem parâmetros). Para um `SELECT` isto abre um cursor.
 //! 3. [`Statement::fetch`] puxa uma linha por vez via `op_fetch` /
-//!    `op_fetch_response` até o cursor se esgotar.
+//!    `op_fetch_response` até o cursor se esgotar. Esgotar não fecha o cursor:
+//!    o servidor o mantém aberto até um `op_free_statement` explícito.
 //! 4. [`Statement::close`] / [`Statement::drop_statement`] liberam o estado no
-//!    servidor.
+//!    servidor. Um `execute` seguinte também fecha o cursor anterior sozinho,
+//!    então reexecutar a mesma instrução preparada é seguro.
 //!
 //! Assim como [`Transaction`], um `Statement` é
 //! um handle cujos métodos de I/O emprestam a [`Connection`] dona, então apenas
@@ -86,7 +88,13 @@ pub struct Statement {
     /// prepare, então remontar esse BLR a cada `execute` seria trabalho
     /// repetido sem necessidade.
     in_blr: Vec<u8>,
-    /// Verdadeiro após `execute` abrir um cursor SELECT, até ser esgotado/fechado.
+    /// Verdadeiro enquanto existe um cursor aberto **no servidor**, isto é, de
+    /// `execute` até [`Self::close`]/[`Self::drop_statement`]. Esgotar o cursor
+    /// (ver [`Self::exhausted`]) **não** o fecha: o servidor não fecha sozinho no
+    /// status 100, então este campo tem de continuar verdadeiro até enviarmos o
+    /// `op_free_statement`/`DSQL_close`. Marcá-lo como fechado só do lado do
+    /// cliente tornava `close` um no-op e fazia o `execute` seguinte falhar com
+    /// "attempt to reopen an open cursor" (SQL -502).
     cursor_open: bool,
     /// Linhas já recebidas do servidor mas ainda não entregues ao chamador.
     ///
@@ -167,6 +175,10 @@ impl Statement {
     /// Executa a instrução. Para um `SELECT` isto abre um cursor; prossiga com
     /// [`Self::fetch`] / [`Self::fetch_all`]. Para DML o servidor responde com um
     /// `op_response` simples.
+    ///
+    /// Pode ser chamado quantas vezes for preciso no mesmo `Statement`: se um
+    /// cursor da execução anterior ainda estiver aberto (inclusive já esgotado),
+    /// ele é fechado antes de reabrir.
     pub fn execute(
         &mut self,
         conn: &mut Connection,
@@ -202,6 +214,12 @@ impl Statement {
         tx: &Transaction,
         encode: impl FnOnce(&mut Vec<u8>, &[ColumnMeta], Charset) -> Result<()>,
     ) -> Result<()> {
+        // Um cursor da execução anterior ainda está aberto no servidor mesmo
+        // depois de esgotado (o status 100 do fetch não fecha nada). Reabrir sem
+        // fechar dá "attempt to reopen an open cursor" (SQL -502), então fechamos
+        // antes — no-op quando não há cursor aberto.
+        self.close(conn)?;
+
         let has_params = !self.params.is_empty();
 
         let mut w = op_packet(op::EXECUTE);
@@ -255,7 +273,9 @@ impl Statement {
                 return Ok(Some(Row::new(row, self.columns.clone())));
             }
             if self.exhausted || !self.cursor_open {
-                self.cursor_open = false;
+                // Sem `cursor_open = false` aqui de propósito: esgotar não fecha o
+                // cursor no servidor — quem fecha é `close` (ou o `execute`
+                // seguinte, que fecha antes de reabrir).
                 return Ok(None);
             }
             self.fetch_batch(conn)?;
@@ -436,13 +456,21 @@ impl Statement {
     }
 
     /// Fecha o cursor aberto (`op_free_statement` com `DSQL_close`) sem liberar a
-    /// instrução preparada, para que possa ser reexecutada.
+    /// instrução preparada, para que possa ser reexecutada. É um no-op quando não
+    /// há cursor aberto, e chamá-lo é opcional: [`Self::execute`] já fecha o
+    /// cursor anterior antes de reabrir.
+    ///
+    /// Vale também para um cursor já esgotado — o servidor só o descarta ao
+    /// receber este `DSQL_close`.
     pub fn close(&mut self, conn: &mut Connection) -> Result<()> {
         if !self.cursor_open {
             return Ok(());
         }
         self.free(conn, free::CLOSE)?;
         self.cursor_open = false;
+        // Linhas pré-buscadas mas não consumidas morrem com o cursor.
+        self.buffered.clear();
+        self.exhausted = false;
         Ok(())
     }
 

@@ -170,6 +170,45 @@ fn execute_and_fetch_rows() -> Result<()> {
     Ok(())
 }
 
+/// Reexecutar o mesmo `Statement` num laço — o padrão de "prepare uma vez, roda
+/// com parâmetros diferentes". O cursor da volta anterior continua aberto no
+/// servidor mesmo depois de esgotado, e o `execute` precisa fechá-lo antes de
+/// reabrir; sem isso o servidor responde "attempt to reopen an open cursor"
+/// (SQL -502) já na segunda volta. Inclui uma volta sem nenhuma linha, que é
+/// como o bug aparecia com mais frequência.
+#[test]
+fn reexecute_prepared_statement() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
+
+    let mut stmt = conn.prepare(&tx, "SELECT emp_no FROM employee WHERE emp_no = ?")?;
+
+    // emp_no negativo não existe: cursor esgota sem entregar nenhuma linha.
+    for emp_no in [-1i32, 2, -1, 4, -1] {
+        stmt.execute(&mut conn, &tx, &[emp_no.into()])?;
+        let rows = stmt.fetch_all(&mut conn)?;
+        if emp_no < 0 {
+            assert!(rows.is_empty(), "emp_no={emp_no} não deveria existir");
+        } else {
+            assert_eq!(rows.len(), 1, "emp_no={emp_no}");
+        }
+    }
+
+    // Um `close` explícito depois de esgotado também tem de funcionar (e deixar
+    // o statement reexecutável).
+    stmt.execute(&mut conn, &tx, &[2i32.into()])?;
+    assert_eq!(stmt.fetch_all(&mut conn)?.len(), 1);
+    stmt.close(&mut conn)?;
+    stmt.execute(&mut conn, &tx, &[2i32.into()])?;
+    assert_eq!(stmt.fetch_all(&mut conn)?.len(), 1);
+
+    stmt.drop_statement(&mut conn)?;
+    tx.commit(&mut conn)?;
+    conn.close()?;
+    Ok(())
+}
+
 #[test]
 fn update_reports_affected_rows() -> Result<()> {
     let cfg = require_server!();

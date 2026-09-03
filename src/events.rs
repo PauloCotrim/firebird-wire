@@ -69,7 +69,10 @@ impl Connection {
 
         // 2. Conecta o socket auxiliar.
         let sock = TcpStream::connect((ip, port))?;
-        let aux = FbStream::new(sock);
+        let mut aux = FbStream::new(sock);
+        // Mesmo charset da conexão principal: o canal auxiliar também lê vetor
+        // de status.
+        aux.set_charset(self.charset());
 
         // 3. Registra os eventos com a linha de base zerada.
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
