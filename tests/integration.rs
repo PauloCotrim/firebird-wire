@@ -1422,6 +1422,69 @@ fn batch_register_blob() -> Result<()> {
     Ok(())
 }
 
+/// Stream de BLOBs e mensagens maiores que um pacote (128 KiB): blobs de
+/// tamanhos ímpares são divididos entre pacotes e as mensagens ocupam vários
+/// `op_batch_msg`. Tudo é lido de volta e conferido byte a byte.
+#[test]
+fn batch_multiplos_pacotes() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    conn.exec_immediate(
+        None,
+        "RECREATE TABLE fdb_batch_mp (id INTEGER, txt VARCHAR(200), dados BLOB SUB_TYPE 0)",
+    )?;
+
+    let tamanhos = [1usize, 3, 131_053, 5, 1_000_001, 300_000, 17, 262_144];
+    let conteudo =
+        |i: usize, n: usize| -> Vec<u8> { (0..n).map(|j| (j * 31 + i * 7) as u8).collect() };
+    let linhas = 3_000usize; // ~3000 × 216 B de mensagens ≈ 5 pacotes
+
+    let tx = conn.begin()?;
+    let mut batch = conn.create_batch(
+        &tx,
+        "INSERT INTO fdb_batch_mp (id, txt, dados) VALUES (?, ?, ?)",
+    )?;
+    for i in 0..linhas {
+        let blob = match tamanhos.get(i) {
+            Some(&n) => Value::Blob(batch.add_blob(&conteudo(i, n))?),
+            None => Value::Null,
+        };
+        batch.add(&[
+            Value::Int(i as i32),
+            Value::Text(format!("{i:0>200}")),
+            blob,
+        ])?;
+    }
+    let result = batch.execute(&mut conn, &tx)?;
+    assert_eq!(result.total as usize, linhas);
+    assert!(result.all_succeeded(), "erros: {:?}", result.errors);
+    batch.close(&mut conn)?;
+    tx.commit(&mut conn)?;
+
+    let tx = conn.begin()?;
+    let mut stmt = conn.prepare(&tx, "SELECT id, txt, dados FROM fdb_batch_mp ORDER BY id")?;
+    stmt.execute(&mut conn, &tx, &[])?;
+    let rows = stmt.fetch_all(&mut conn)?;
+    assert_eq!(rows.len(), linhas);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row[0], Value::Int(i as i32));
+        assert_eq!(row[1], Value::Text(format!("{i:0>200}")));
+        match (&row[2], tamanhos.get(i)) {
+            (Value::Blob(id), Some(&n)) => {
+                let bytes = conn.read_blob(&tx, *id)?;
+                assert!(bytes == conteudo(i, n), "blob {i} ({n} B) difere");
+            }
+            (Value::Null, None) => {}
+            (other, esperado) => panic!("linha {i}: {other:?}, esperava blob {esperado:?}"),
+        }
+    }
+    stmt.drop_statement(&mut conn)?;
+    tx.commit(&mut conn)?;
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_mp")?;
+    conn.close()?;
+    Ok(())
+}
+
 #[test]
 fn batch_register_blob_many() -> Result<()> {
     // Mais registros que a janela de pipeline dos op_batch_regblob (256),

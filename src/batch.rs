@@ -49,6 +49,13 @@
 //! 36) e pelo código do servidor. Os blobs vão **antes** das mensagens porque a
 //! linha referencia o id já registrado.
 //!
+//! Stream e mensagens vão em pacotes de até [`BatchOptions::packet_bytes`]
+//! (128 KiB por padrão, o `ClientBatchBuffer` do fbclient). O servidor reprocessa
+//! desde o início um pacote que chega incompleto pela rede, então um pacote único
+//! de vários MB custa tempo quadrático. Um blob pode continuar no pacote seguinte
+//! (o servidor guarda quanto falta dele); só o cabeçalho de 16 B não é dividido,
+//! e cada pacote declara seu próprio `length`, múltiplo de 4.
+//!
 //! `op_batch_regblob` (104): `stmt | id_existente(quad 8B BE) | id_batch(quad)`.
 //! Mapeia um BLOB já gravado fora do batch ([`Connection::write_blob`]) a um id
 //! local, evitando reenviar os dados. Ver [`Batch::register_blob`].
@@ -85,16 +92,21 @@ pub struct Batch {
     /// Mensagens já codificadas mas ainda não enviadas/executadas.
     pending: Vec<u8>,
     pending_count: u32,
-    /// Stream de BLOBs acumulado (cabeçalho + dados de cada blob), ainda não
-    /// enviado. Só usado em batches com coluna BLOB (política STREAM). Os blobs
-    /// vão concatenados SEM padding no wire (o servidor reconstrói o alinhamento
-    /// no buffer dele).
+    /// Fronteiras dos pacotes `op_batch_msg` já fechados dentro de `pending`:
+    /// `(fim em bytes, mensagens acumuladas até ali)`. As mensagens depois do
+    /// último corte formam o pacote final.
+    msg_packets: Vec<(usize, u32)>,
+    /// Pacotes `op_batch_blob_stream` já fechados, prontos para envio.
+    blob_packets: Vec<BlobPacket>,
+    /// Pacote de BLOBs em montagem: bytes no wire (cabeçalho + dados de cada
+    /// blob, SEM padding; o servidor reconstrói o alinhamento no buffer dele).
+    /// Só usado em batches com coluna BLOB (política STREAM).
     pending_blobs: Vec<u8>,
-    /// Comprimento *alinhado* do stream de blobs (campo `p_batch_blob_data` do
-    /// op_batch_blob_stream): a soma de `align4(16 + dados)` de cada blob. É o
-    /// tamanho do buffer que o servidor aloca, e deve ser múltiplo de
-    /// `BLOB_ALIGN` (o servidor rejeita caso contrário). Sempre `>=` o número de
-    /// bytes efetivamente enviados.
+    /// Comprimento *de buffer* do pacote em montagem (ver [`BlobPacket::len`]);
+    /// pode estar desalinhado logo após os dados de um blob.
+    pending_blobs_len: usize,
+    /// Comprimento *alinhado* de todo o stream de blobs acumulado: a soma de
+    /// `align4(16 + dados)` de cada blob. Exposto em [`Batch::blob_stream_len`].
     blob_stream_len: usize,
     /// Registros pendentes de BLOBs pré-existentes (`op_batch_regblob`): cada par
     /// é `(id_existente, id_no_batch)`. Enviados em [`Batch::execute`] antes das
@@ -115,7 +127,52 @@ pub struct Batch {
     /// Verdadeiro quando o BPB padrão marca os blobs como segmentados; nesse caso
     /// [`Batch::add_blob`] enquadra os dados em segmentos.
     blob_segmented: bool,
+    /// Tamanho máximo (em bytes) de cada pacote de mensagens ou de BLOBs.
+    packet_bytes: usize,
     closed: bool,
+}
+
+/// Uma parte do stream de BLOBs, enviada num `op_batch_blob_stream` próprio.
+struct BlobPacket {
+    /// Bytes no wire.
+    wire: Vec<u8>,
+    /// Comprimento de buffer declarado ao servidor (`p_batch_blob_data`),
+    /// múltiplo de [`BLOB_ALIGN`]. É maior ou igual a `wire.len()`, pois o
+    /// padding entre blobs só existe no buffer do servidor.
+    len: usize,
+}
+
+/// Tamanho padrão de cada pacote do batch: o mesmo `ClientBatchBuffer` (128 KiB)
+/// que o fbclient usa. O servidor reprocessa desde o início um pacote que chega
+/// incompleto (ver o comentário "packet is not complete and will be restarted"
+/// em `xdr_blob_stream`), então pacotes de vários MB custam tempo quadrático:
+/// medido num FB5 local, 230 MB de blobs num único stream de 16 MB por envio
+/// saíam a ~24 MB/s.
+pub const DEFAULT_PACKET_BYTES: u32 = 128 * 1024;
+
+/// Menor tamanho de pacote aceito: comporta um cabeçalho de blob (16 B) com folga.
+const MIN_PACKET_BYTES: usize = 4 * 1024;
+
+/// Pacotes em voo ao enviar BLOBs ou mensagens em janela deslizante.
+const PACKET_WINDOW: usize = 16;
+
+/// Pacote enviado antes das mensagens em [`Batch::execute`].
+enum StreamPacket {
+    Bpb(Vec<u8>),
+    Blobs(BlobPacket),
+}
+
+/// Tamanho efetivo de pacote: múltiplo de [`BLOB_ALIGN`], no mínimo [`MIN_PACKET_BYTES`].
+fn packet_size(requested: u32) -> usize {
+    let bytes = requested as usize;
+    (bytes - bytes % BLOB_ALIGN).max(MIN_PACKET_BYTES)
+}
+
+fn stream_packet_op(packet: &StreamPacket) -> i32 {
+    match packet {
+        StreamPacket::Bpb(_) => op::BATCH_SET_BPB,
+        StreamPacket::Blobs(_) => op::BATCH_BLOB_STREAM,
+    }
 }
 
 /// Alinhamento do cabeçalho de segmento em um blob segmentado
@@ -197,33 +254,87 @@ impl Batch {
         }
         let id = self.next_blob_id;
         self.next_blob_id += 1;
-        // Cabeçalho do blob, tudo big-endian: id(quad 8B) | size(4B) | bpb_size(4B
-        // = 0, pois o BPB é do batch). Os blobs vão concatenados SEM padding; o
-        // servidor reconstrói o alinhamento no buffer dele.
-        self.pending_blobs.extend_from_slice(&id.to_be_bytes());
         if self.blob_segmented {
             // Blob segmentado (um único segmento aqui). NO WIRE: cada segmento é
             // `u32` big-endian com o comprimento + os bytes, sem padding. Mas o
             // campo `size` (e o comprimento do stream) seguem a contabilidade do
             // *buffer* do servidor, que usa cabeçalho de 2 bytes alinhado a
             // `BLOB_SEGHDR_ALIGN`: `size = align2(2 + len)`. Ver `xdr_blob_stream`.
+            // O segmento (limitado a 64 KiB pelo servidor) vai inteiro num pacote.
             let size_field = align_up(2 + data.len(), BLOB_SEGHDR_ALIGN);
+            self.start_blob(16 + size_field);
+            self.pending_blobs.extend_from_slice(&id.to_be_bytes());
             self.pending_blobs
                 .extend_from_slice(&(size_field as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
             self.pending_blobs
                 .extend_from_slice(&(data.len() as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(data);
+            self.pending_blobs_len += 16 + size_field;
             self.blob_stream_len += align_up(16 + size_field, BLOB_ALIGN);
         } else {
-            // Blob de stream (não segmentado): dados crus.
+            // Blob de stream (não segmentado): cabeçalho id(quad 8B) | size(4B) |
+            // bpb_size(4B = 0, pois o BPB é do batch), tudo big-endian, e os dados
+            // crus. Os dados podem continuar em pacotes seguintes: o servidor
+            // guarda quanto falta do blob entre um pacote e outro.
+            self.start_blob(16);
+            self.pending_blobs.extend_from_slice(&id.to_be_bytes());
             self.pending_blobs
                 .extend_from_slice(&(data.len() as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
-            self.pending_blobs.extend_from_slice(data);
+            self.pending_blobs_len += 16;
+            let mut rest = data;
+            loop {
+                let space = self.packet_bytes.saturating_sub(self.pending_blobs_len);
+                if rest.len() <= space {
+                    self.pending_blobs.extend_from_slice(rest);
+                    self.pending_blobs_len += rest.len();
+                    break;
+                }
+                // Corta num múltiplo de BLOB_ALIGN: o pacote precisa declarar um
+                // comprimento alinhado, e aqui não há padding a descontar.
+                let take = space - space % BLOB_ALIGN;
+                self.pending_blobs.extend_from_slice(&rest[..take]);
+                self.pending_blobs_len += take;
+                rest = &rest[take..];
+                self.close_blob_packet();
+            }
             self.blob_stream_len += align_up(16 + data.len(), BLOB_ALIGN);
         }
         Ok(id)
+    }
+
+    /// Prepara o pacote em montagem para um novo blob cujo início (cabeçalho, e no
+    /// modo segmentado o segmento inteiro) ocupa `head` bytes: alinha o buffer e,
+    /// se não couber, fecha o pacote — um cabeçalho nunca é dividido.
+    fn start_blob(&mut self, head: usize) {
+        self.pending_blobs_len = align_up(self.pending_blobs_len, BLOB_ALIGN);
+        if self.pending_blobs_len > 0 && self.pending_blobs_len + head > self.packet_bytes {
+            self.close_blob_packet();
+        }
+    }
+
+    /// Fecha o pacote de BLOBs em montagem. Só é chamado entre blobs ou num
+    /// corte alinhado dos dados, então o comprimento alinhado é o exato.
+    fn close_blob_packet(&mut self) {
+        if self.pending_blobs.is_empty() {
+            return;
+        }
+        self.blob_packets.push(BlobPacket {
+            wire: std::mem::take(&mut self.pending_blobs),
+            len: align_up(self.pending_blobs_len, BLOB_ALIGN),
+        });
+        self.pending_blobs_len = 0;
+    }
+
+    /// Marca o fim de um pacote `op_batch_msg` se as mensagens desde o último
+    /// corte já somam `packet_bytes` (cada mensagem XDR é múltipla de 4 bytes).
+    fn cut_msg_packet(&mut self) {
+        let start = self.msg_packets.last().map_or(0, |&(end, _)| end);
+        if self.pending.len() - start >= self.packet_bytes {
+            self.msg_packets
+                .push((self.pending.len(), self.pending_count));
+        }
     }
 
     /// Define o BPB (blob parameter buffer) padrão dos blobs do batch
@@ -287,6 +398,7 @@ impl Batch {
         // `encode_row_into` restaura o tamanho de `pending`, então não corrompe o lote.
         encode_row_into(&mut self.pending, &self.params, values, self.charset)?;
         self.pending_count += 1;
+        self.cut_msg_packet();
         Ok(())
     }
 
@@ -296,6 +408,7 @@ impl Batch {
     pub fn add_ref(&mut self, values: &[ValueRef<'_>]) -> Result<()> {
         encode_row_ref_into(&mut self.pending, &self.params, values, self.charset)?;
         self.pending_count += 1;
+        self.cut_msg_packet();
         Ok(())
     }
 
@@ -315,53 +428,37 @@ impl Batch {
         }
 
         // 0. BPB padrão (op_batch_set_bpb) e stream de BLOBs novos
-        //    (op_batch_blob_stream), enfileirados juntos num único flush — ambos
-        //    precisam ir antes das mensagens (que referenciam os ids), mas não
-        //    dependem um do outro nem de suas respostas.
-        let has_bpb = self.default_bpb.is_some();
-        let has_blob_stream = !self.pending_blobs.is_empty();
-        if has_bpb {
-            let bpb = self.default_bpb.take().unwrap();
-            let mut w = op_packet(op::BATCH_SET_BPB);
-            w.put_i32(self.handle);
-            w.put_bytes(&bpb); // cstring: len(4) + bpb + pad
-            conn.io().enqueue(&w);
-        }
-        if has_blob_stream {
-            let mut w = op_packet(op::BATCH_BLOB_STREAM);
-            w.put_i32(self.handle);
-            // Comprimento alinhado (≥ bytes no wire), depois os blobs crus. Não
-            // alinhamos o pacote: o servidor recompõe o alinhamento internamente
-            // e a próxima op pode começar em offset não múltiplo de 4.
-            w.put_i32(self.blob_stream_len as i32);
-            w.put_raw(&self.pending_blobs);
-            conn.io().enqueue(&w);
-        }
-        if has_bpb || has_blob_stream {
-            conn.io().flush()?;
-            // Lê as duas respostas antes de propagar qualquer erro — ambos os
-            // pacotes já foram enviados no mesmo flush, então o servidor
-            // responde aos dois independentemente do resultado do primeiro; se
-            // parássemos no primeiro erro sem drenar o segundo, o stream
-            // ficaria fora de sincronia para a próxima operação.
-            let bpb_result = if has_bpb {
-                Some(read_response(conn.io()))
-            } else {
-                None
-            };
-            let blob_result = if has_blob_stream && !conn.io().is_broken() {
-                self.pending_blobs.clear();
-                self.blob_stream_len = 0;
-                Some(read_response(conn.io()))
-            } else {
-                None
-            };
-            if let Some(Err(e)) = bpb_result {
-                return Err(e);
-            }
-            if let Some(Err(e)) = blob_result {
-                return Err(e);
-            }
+        //    (op_batch_blob_stream, em pacotes de até `packet_bytes`) — precisam
+        //    ir antes das mensagens, que referenciam os ids. Janela deslizante:
+        //    o caso comum (um pacote) continua custando 1 RTT, e um stream grande
+        //    não acumula respostas sem limite nos buffers TCP.
+        self.close_blob_packet();
+        let blob_packets = std::mem::take(&mut self.blob_packets);
+        self.blob_stream_len = 0;
+        let bpb = self.default_bpb.take();
+        if bpb.is_some() || !blob_packets.is_empty() {
+            let handle = self.handle;
+            let packets = bpb
+                .into_iter()
+                .map(StreamPacket::Bpb)
+                .chain(blob_packets.into_iter().map(StreamPacket::Blobs));
+            pipeline_requests(conn.io(), packets, PACKET_WINDOW, |w, packet| {
+                w.put_i32(stream_packet_op(&packet));
+                w.put_i32(handle);
+                match packet {
+                    StreamPacket::Bpb(bpb) => {
+                        w.put_bytes(&bpb); // cstring: len(4) + bpb + pad
+                    }
+                    StreamPacket::Blobs(blobs) => {
+                        // Comprimento de buffer (≥ bytes no wire), depois os blobs
+                        // crus. Não alinhamos o pacote: o servidor recompõe o
+                        // alinhamento internamente e a próxima op pode começar em
+                        // offset não múltiplo de 4.
+                        w.put_i32(blobs.len as i32);
+                        w.put_raw(&blobs.wire);
+                    }
+                }
+            })?;
         }
 
         // 0b. Registra BLOBs pré-existentes (op_batch_regblob), também antes das
@@ -384,15 +481,47 @@ impl Batch {
             )?;
         }
 
-        // 1-2. Mensagens pendentes (op_batch_msg) e exec (op_batch_exec) num
-        // único flush: a resposta do exec (op_batch_cs) só é lida depois de
-        // termos enviado ambos, então este é o caso comum reduzido a 1 RTT.
-        let has_msg = self.pending_count > 0;
-        if has_msg {
+        // 1. Mensagens pendentes (op_batch_msg) em pacotes de até `packet_bytes`.
+        //    Todos menos o último vão em janela deslizante; o último segue no
+        //    mesmo flush do exec.
+        let pending = std::mem::take(&mut self.pending);
+        let mut packets = Vec::with_capacity(self.msg_packets.len() + 1);
+        let (mut start, mut sent) = (0, 0);
+        for (end, cumulative) in std::mem::take(&mut self.msg_packets)
+            .into_iter()
+            .chain(std::iter::once((pending.len(), self.pending_count)))
+        {
+            if cumulative > sent {
+                packets.push((start..end, cumulative - sent));
+            }
+            (start, sent) = (end, cumulative);
+        }
+        self.pending_count = 0;
+        let last = packets.pop();
+        if !packets.is_empty() {
+            let handle = self.handle;
+            pipeline_requests(
+                conn.io(),
+                packets.into_iter(),
+                PACKET_WINDOW,
+                |w, (range, count)| {
+                    w.put_i32(op::BATCH_MSG);
+                    w.put_i32(handle);
+                    w.put_i32(count as i32);
+                    w.put_raw(&pending[range]);
+                    w.align();
+                },
+            )?;
+        }
+
+        // 2. Último pacote de mensagens e exec (op_batch_exec) num único flush:
+        //    a resposta do exec (op_batch_cs) só é lida depois de termos enviado
+        //    ambos, então o caso comum fica reduzido a 1 RTT.
+        if let Some((range, count)) = &last {
             let mut w = op_packet(op::BATCH_MSG);
             w.put_i32(self.handle);
-            w.put_i32(self.pending_count as i32);
-            w.put_raw(&self.pending);
+            w.put_i32(*count as i32);
+            w.put_raw(&pending[range.clone()]);
             w.align();
             conn.io().enqueue(&w);
         }
@@ -402,20 +531,18 @@ impl Batch {
         conn.io().enqueue(&w);
         conn.io().flush()?;
 
-        if has_msg {
-            if let Err(e) = read_response(conn.io()) {
-                // op_batch_exec já foi enviado no mesmo flush (o servidor o
-                // processa de qualquer forma); drena sua resposta antes de
-                // propagar o erro da mensagem, para manter o stream em
-                // sincronia. Erro de I/O/desync já deixou o stream marcado
-                // como quebrado — nada a drenar nesse caso.
-                if !conn.io().is_broken() {
-                    let _ = read_batch_cs(conn);
-                }
-                return Err(e);
+        if last.is_some()
+            && let Err(e) = read_response(conn.io())
+        {
+            // op_batch_exec já foi enviado no mesmo flush (o servidor o
+            // processa de qualquer forma); drena sua resposta antes de
+            // propagar o erro da mensagem, para manter o stream em
+            // sincronia. Erro de I/O/desync já deixou o stream marcado
+            // como quebrado — nada a drenar nesse caso.
+            if !conn.io().is_broken() {
+                let _ = read_batch_cs(conn);
             }
-            self.pending.clear();
-            self.pending_count = 0;
+            return Err(e);
         }
         read_batch_cs(conn)
     }
@@ -425,7 +552,10 @@ impl Batch {
     pub fn cancel(&mut self, conn: &mut Connection) -> Result<()> {
         self.pending.clear();
         self.pending_count = 0;
+        self.msg_packets.clear();
+        self.blob_packets.clear();
         self.pending_blobs.clear();
+        self.pending_blobs_len = 0;
         self.blob_stream_len = 0;
         self.pending_regblobs.clear();
         let mut w = op_packet(op::BATCH_CANCEL);
@@ -481,6 +611,17 @@ pub struct BatchOptions {
     /// estourar o buffer (o estouro aparece como "invalid BLOB ID"); o servidor
     /// impõe um teto próprio (256 MiB no Firebird).
     pub buffer_bytes: Option<u32>,
+    /// Quantos erros por `execute` chegam com o status vector completo
+    /// (`TAG_DETAILED_ERRORS`). `None` (**padrão**) deixa o servidor usar o seu
+    /// default, que é 64: a partir daí ele informa só a posição da linha, e o
+    /// erro em [`BatchResult::errors`] vem com status vector vazio. Só faz
+    /// sentido com [`Self::multierror`]; o servidor impõe um teto próprio.
+    pub detailed_errors: Option<u32>,
+    /// Tamanho máximo (em bytes) de cada pacote de mensagens ou de BLOBs enviado
+    /// em [`Batch::execute`]. Padrão [`DEFAULT_PACKET_BYTES`] (128 KiB, o
+    /// `ClientBatchBuffer` do fbclient); pacotes muito maiores ficam lentos no
+    /// servidor. É arredondado para múltiplo de 4, com mínimo de 4 KiB.
+    pub packet_bytes: u32,
 }
 
 impl Default for BatchOptions {
@@ -492,6 +633,8 @@ impl Default for BatchOptions {
             multierror: false,
             record_counts: true,
             buffer_bytes: None,
+            detailed_errors: None,
+            packet_bytes: DEFAULT_PACKET_BYTES,
         }
     }
 }
@@ -520,6 +663,20 @@ impl BatchOptions {
     /// Firebird); valores acima são limitados por ele.
     pub fn buffer_bytes(mut self, bytes: u32) -> Self {
         self.buffer_bytes = Some(bytes);
+        self
+    }
+
+    /// Define quantos erros por `execute` vêm detalhados (ver
+    /// [`BatchOptions::detailed_errors`]).
+    pub fn detailed_errors(mut self, count: u32) -> Self {
+        self.detailed_errors = Some(count);
+        self
+    }
+
+    /// Define o tamanho máximo de cada pacote enviado ao servidor (ver
+    /// [`BatchOptions::packet_bytes`]).
+    pub fn packet_bytes(mut self, bytes: u32) -> Self {
+        self.packet_bytes = bytes;
         self
     }
 }
@@ -572,6 +729,9 @@ impl Connection {
         if let Some(bytes) = opts.buffer_bytes {
             pb.bytes_be_len4(batch_tag::BUFFER_BYTES_SIZE, &bytes.to_le_bytes());
         }
+        if let Some(count) = opts.detailed_errors {
+            pb.bytes_be_len4(batch_tag::DETAILED_ERRORS, &count.to_le_bytes());
+        }
         if blob_stream {
             pb.bytes_be_len4(
                 batch_tag::BLOB_POLICY,
@@ -592,7 +752,10 @@ impl Connection {
             params,
             pending: Vec::new(),
             pending_count: 0,
+            msg_packets: Vec::new(),
+            blob_packets: Vec::new(),
             pending_blobs: Vec::new(),
+            pending_blobs_len: 0,
             blob_stream_len: 0,
             pending_regblobs: Vec::new(),
             next_blob_id: 1,
@@ -600,6 +763,7 @@ impl Connection {
             charset: self.charset(),
             default_bpb: None,
             blob_segmented: false,
+            packet_bytes: packet_size(opts.packet_bytes),
             closed: false,
         })
     }
@@ -720,7 +884,10 @@ mod tests {
             params: Vec::new(),
             pending: Vec::new(),
             pending_count: 0,
+            msg_packets: Vec::new(),
+            blob_packets: Vec::new(),
             pending_blobs: Vec::new(),
+            pending_blobs_len: 0,
             blob_stream_len: 0,
             pending_regblobs: Vec::new(),
             next_blob_id: 1,
@@ -728,6 +895,7 @@ mod tests {
             charset: crate::charset::Charset::Utf8,
             default_bpb: None,
             blob_segmented: false,
+            packet_bytes: DEFAULT_PACKET_BYTES as usize,
             closed: true,
         }
     }
@@ -779,6 +947,88 @@ mod tests {
         let mut b = fake_blob_batch();
         b.add_blob(&[0u8; 33]).unwrap();
         assert_eq!(b.blob_stream_len(), 52);
+    }
+
+    /// Pacotes fechados + o em montagem, como `execute` os enviaria.
+    fn blob_packets(b: &mut Batch) -> Vec<(usize, usize)> {
+        b.close_blob_packet();
+        b.blob_packets
+            .iter()
+            .map(|p| (p.wire.len(), p.len))
+            .collect()
+    }
+
+    /// Um blob maior que o pacote é dividido nos dados, em cortes alinhados; o
+    /// total declarado continua igual ao do stream sem divisão.
+    #[test]
+    fn blob_grande_e_dividido_em_pacotes_alinhados() {
+        let mut b = fake_blob_batch();
+        b.packet_bytes = MIN_PACKET_BYTES;
+        b.add_blob(&vec![7u8; 10_003]).unwrap();
+        let esperado_total = b.blob_stream_len();
+        let packets = blob_packets(&mut b);
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0], (4096, 4096)); // cabeçalho + 4080 B de dados
+        assert_eq!(packets[1], (4096, 4096));
+        assert_eq!(packets[2], (1827, 1828)); // resto, alinhado só no buffer
+        for (wire, len) in &packets {
+            assert!(len % BLOB_ALIGN == 0 && len >= wire);
+        }
+        assert_eq!(packets.iter().map(|p| p.1).sum::<usize>(), esperado_total);
+        assert_eq!(packets.iter().map(|p| p.0).sum::<usize>(), 16 + 10_003);
+    }
+
+    /// Um cabeçalho de blob nunca fica dividido: se não cabe, abre outro pacote.
+    #[test]
+    fn cabecalho_de_blob_nao_e_dividido() {
+        let mut b = fake_blob_batch();
+        b.packet_bytes = MIN_PACKET_BYTES;
+        b.add_blob(&vec![1u8; 4096 - 16 - 9]).unwrap(); // sobram 9 B no pacote
+        b.add_blob(b"abc").unwrap();
+        let packets = blob_packets(&mut b);
+        assert_eq!(packets, vec![(4096 - 9, 4096 - 8), (19, 20)]);
+    }
+
+    #[test]
+    fn blobs_pequenos_dividem_o_mesmo_pacote() {
+        let mut b = fake_blob_batch();
+        for data in [&b"x"[..], &b"yy"[..], &b"zzz"[..]] {
+            b.add_blob(data).unwrap();
+        }
+        let total = b.blob_stream_len();
+        assert_eq!(blob_packets(&mut b), vec![(16 * 3 + 6, total)]);
+    }
+
+    /// As mensagens são cortadas em fronteiras de mensagem assim que o pacote
+    /// atinge `packet_bytes`, registrando a contagem acumulada.
+    #[test]
+    fn mensagens_sao_cortadas_por_tamanho() {
+        let mut b = fake_blob_batch();
+        b.packet_bytes = MIN_PACKET_BYTES;
+        b.params = vec![ColumnMeta {
+            index: 0,
+            sql_type: crate::wire::consts::sql_type::VARYING,
+            sub_type: 0,
+            scale: 0,
+            length: 1000,
+            nullable: true,
+            field: "T".into(),
+            relation: String::new(),
+            alias: String::new(),
+            owner: String::new(),
+        }];
+        let texto = "a".repeat(1000); // 4 (bitmap) + 4 (len) + 1000 = 1008 B
+        for _ in 0..10 {
+            b.add(&[Value::Text(texto.clone())]).unwrap();
+        }
+        assert_eq!(b.msg_packets, vec![(1008 * 5, 5), (1008 * 10, 10)]);
+    }
+
+    #[test]
+    fn tamanho_de_pacote_e_alinhado_e_tem_minimo() {
+        assert_eq!(packet_size(DEFAULT_PACKET_BYTES), 128 * 1024);
+        assert_eq!(packet_size(10_003), 10_000);
+        assert_eq!(packet_size(10), MIN_PACKET_BYTES);
     }
 
     /// `BatchOptions` por padrão não fixa o buffer (deixa o default do servidor); o

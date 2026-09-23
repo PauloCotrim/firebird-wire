@@ -334,6 +334,25 @@ batch statement"). A linha referencia o blob pelo id (quad) no campo BLOB.
 Ver `Batch::add_blob` / `execute` em `batch.rs`. 1 teste ao vivo
 (`batch_blob_stream`, 3 blobs de tamanhos diferentes, lidos de volta e conferidos).
 
+**Pacotes de até 128 KiB (desempenho).** Enviar todo o stream num único
+`op_batch_blob_stream` funciona, mas fica quadrático: o `xdr_blob_stream` do
+servidor trabalha sobre uma cópia local do estado ("required in a case when
+packet is not complete and will be restarted") e recomeça o pacote a cada parte
+que chega pela rede. Medido num FB5 local: 230 MB de blobs em streams de 16 MB
+saíam a ~24 MB/s; em pacotes de 128 KiB, ~680 MB/s. O `op_batch_msg` grande
+degrada do mesmo jeito (10 000 mensagens num pacote: 310 mil linhas/s; em
+pacotes de 128 KiB: ~890 mil). O fbclient faz igual: `putBlobData` /
+`putMessageData` enviam a cada `ClientBatchBuffer` (padrão 128 KiB, `config.cpp`).
+- Um blob pode ser dividido entre pacotes nos DADOS: o servidor guarda o que
+  falta em `rsr_batch_stream.blobRemaining` entre um pacote e outro.
+- O cabeçalho (16 B) não pode ser dividido: no receptor, sobrar menos de 16 B no
+  ponto de um cabeçalho encerra o pacote.
+- Cada pacote declara seu próprio `length` (múltiplo de 4), contado a partir do
+  início do pacote. O corte no meio dos dados é feito num múltiplo de 4.
+- Mensagens XDR têm tamanho múltiplo de 4, então basta cortar em fronteira de
+  mensagem, cada pacote com sua contagem.
+Teste ao vivo: `batch_multiplos_pacotes` (blob de 1 MB dividido, mensagens em ~5 pacotes).
+
 ## Wire-crypt ChaCha (`op_crypt`, 96 + `op_cont_auth`, 92) — VALIDADO AO VIVO
 
 **Fluxo real (capturado do isql contra um servidor `WireCrypt=Required`):**
