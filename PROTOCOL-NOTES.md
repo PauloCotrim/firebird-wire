@@ -353,6 +353,35 @@ pacotes de 128 KiB: ~890 mil). O fbclient faz igual: `putBlobData` /
   mensagem, cada pacote com sua contagem.
 Teste ao vivo: `batch_multiplos_pacotes` (blob de 1 MB dividido, mensagens em ~5 pacotes).
 
+**Charset do BLOB na mensagem.** O `blr_blob2` leva o charset da coluna, como o
+`BlrFromMessage` do fbclient. O DSQL informa esse charset no campo de escala dos
+BLOBs de texto. Com 0 (NONE), o servidor converte cada BLOB de texto para o
+charset da coluna na atribuição.
+
+**Batch com BLOB reexecutado: "invalid BLOB ID" (FB 5.0.1).** O cenário é o
+mesmo comando preparado, com política STREAM, executado várias vezes na mesma
+transação. A partir de certa linha de uma execução, todos os BLOBs dela dão
+`isc_bad_segstr_id`; as linhas sem BLOB passam. A falha é determinística para
+uma mesma sequência e não depende de:
+
+- tamanho de pacote;
+- ids dos BLOBs;
+- reaproveitar o `DsqlBatch`: liberar e recriar só o lote (`op_batch_rls` +
+  `op_batch_create` no mesmo handle) não resolve.
+
+Ela depende do que já foi gravado na tabela e do que veio antes na mesma
+transação. Um commit antes da execução evita; preparar o comando de novo também.
+Provável causa: o request compilado continua ativo depois da execução e só é
+desfeito (`EXE_unwind`) na primeira mensagem da execução seguinte, depois de os
+BLOBs dela já terem sido criados (`DsqlBatch::execute`).
+
+Contorno em `Batch::execute`: com coluna BLOB, depois de cada execução o lote e
+o comando são liberados, o comando é preparado de novo e o lote recriado com as
+mesmas opções (o BPB padrão é reenviado). Custa algumas idas ao servidor por
+execução. A reprodução original (sequência real de 14 execuções em `FI_DIVIDA`)
+fica fora do repositório. Teste ao vivo da mecânica:
+`batch_blobs_varias_execucoes`.
+
 ## Wire-crypt ChaCha (`op_crypt`, 96 + `op_cont_auth`, 92) — VALIDADO AO VIVO
 
 **Fluxo real (capturado do isql contra um servidor `WireCrypt=Required`):**

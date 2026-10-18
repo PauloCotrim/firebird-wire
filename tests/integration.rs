@@ -773,6 +773,93 @@ fn batch_blob_stream() -> Result<()> {
     Ok(())
 }
 
+/// Batch com BLOB reaproveitado em várias execuções na mesma transação (e
+/// depois de um commit). Cada execução renova o comando no servidor (ver
+/// `Batch::renovar_no_servidor`); o teste confere que o lote continua
+/// utilizável, que o BPB segmentado vale também depois da renovação e que
+/// todo o conteúdo volta íntegro.
+#[test]
+fn batch_blobs_varias_execucoes() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    conn.exec_immediate(
+        None,
+        "RECREATE TABLE fdb_batch_rep (id INTEGER, txt BLOB SUB_TYPE TEXT, bin BLOB SUB_TYPE 0, v VARCHAR(10))",
+    )?;
+
+    // Conteúdo determinístico com tamanhos variados: nulo, vazio, pequeno e
+    // grande (os de mais de 60 KB ficam de fora: o segmento único do modo
+    // segmentado é limitado a 64 KB pelo servidor).
+    let dados = |id: i32| -> Option<Vec<u8>> {
+        match id % 7 {
+            0 => None,
+            1 => Some(Vec::new()),
+            2 => Some(vec![b'z'; 50_000]),
+            n => Some(format!("linha {id} çã ").repeat(n as usize * 3).into_bytes()),
+        }
+    };
+
+    let mut tx = conn.begin()?;
+    let mut batch =
+        conn.create_batch(&tx, "INSERT INTO fdb_batch_rep (id, txt, bin, v) VALUES (?, ?, ?, ?)")?;
+    batch.set_segmented(true)?;
+    let mut id = 0;
+    for execucao in 0..6 {
+        for _ in 0..300 {
+            id += 1;
+            let txt = match dados(id) {
+                Some(d) => Value::Blob(batch.add_blob(&d)?),
+                None => Value::Null,
+            };
+            let bin = match dados(id + 3) {
+                Some(d) => Value::Blob(batch.add_blob(&d)?),
+                None => Value::Null,
+            };
+            batch.add(&[Value::Int(id), txt, bin, Value::Text("x".into())])?;
+        }
+        let r = batch.execute(&mut conn, &tx)?;
+        assert!(
+            r.all_succeeded(),
+            "execução {execucao}: {:?}",
+            r.errors.first().map(|e| e.error.to_string())
+        );
+        assert_eq!(r.total_affected(), 300);
+        if execucao == 2 {
+            tx.commit(&mut conn)?;
+            tx = conn.begin()?;
+        }
+    }
+    batch.close(&mut conn)?;
+    tx.commit(&mut conn)?;
+
+    let tx = conn.begin()?;
+    let mut stmt = conn.prepare(&tx, "SELECT id, txt, bin FROM fdb_batch_rep ORDER BY id")?;
+    stmt.execute(&mut conn, &tx, &[])?;
+    let rows = stmt.fetch_all(&mut conn)?;
+    assert_eq!(rows.len(), id as usize);
+    for row in &rows {
+        let rid = match row[0] {
+            Value::Int(v) => v,
+            ref other => panic!("id inesperado {other:?}"),
+        };
+        for (col, esperado) in [(1, dados(rid)), (2, dados(rid + 3))] {
+            match (&row[col], esperado) {
+                (Value::Null, None) => {}
+                (Value::Blob(b), Some(e)) => {
+                    assert_eq!(conn.read_blob(&tx, *b)?, e, "linha {rid}, coluna {col}");
+                }
+                (outro, e) => panic!("linha {rid}, coluna {col}: {outro:?} x esperado {:?}", e.map(|d| d.len())),
+            }
+        }
+    }
+    stmt.drop_statement(&mut conn)?;
+    tx.commit(&mut conn)?;
+
+    conn.exec_immediate(None, "DROP TABLE fdb_batch_rep")?;
+    conn.close()?;
+    Ok(())
+}
+
 #[test]
 fn database_events() -> Result<()> {
     use std::sync::mpsc;

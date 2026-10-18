@@ -84,11 +84,15 @@ fn push_type(b: &mut Vec<u8>, col: &ColumnMeta, for_output: bool) {
         sql_type::BLOB => {
             // blr_blob2: o servidor reconhece o campo como BLOB pela metadata
             // (necessário para o batch habilitar o stream de blobs). Segue o
-            // sub_type (2 LE) e o charset (2 LE); fbclient usa 0/0 no campo da
-            // mensagem (a conversão para o tipo da coluna é feita no servidor).
+            // sub_type (2 LE) e o charset (2 LE). Como o fbclient
+            // (`BlrFromMessage`), o charset é o da própria coluna, que o DSQL
+            // informa no campo de escala dos BLOBs de texto. Declarado como 0
+            // (NONE), o servidor converte cada BLOB de texto na atribuição, e
+            // num Batch reaproveitado isso acaba em "invalid BLOB ID".
+            let charset = if col.sub_type == 1 { col.scale.max(0) as u16 } else { 0 };
             b.push(blr::BLOB2);
             b.extend_from_slice(&(col.sub_type as u16).to_le_bytes());
-            b.extend_from_slice(&0u16.to_le_bytes());
+            b.extend_from_slice(&charset.to_le_bytes());
         }
         sql_type::BOOLEAN => b.push(blr::BOOL),
         sql_type::DEC16 => b.push(blr::DEC64),

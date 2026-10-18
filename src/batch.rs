@@ -127,9 +127,23 @@ pub struct Batch {
     /// Verdadeiro quando o BPB padrão marca os blobs como segmentados; nesse caso
     /// [`Batch::add_blob`] enquadra os dados em segmentos.
     blob_segmented: bool,
+    /// Último BPB padrão definido, para reenviar ao lote renovado no servidor.
+    bpb_definido: Option<Vec<u8>>,
+    /// Parâmetros do `op_batch_create` (BLR, tamanho da mensagem e PB), para
+    /// renovar o lote no servidor (ver [`Batch::renovar_no_servidor`]).
+    criacao: Criacao,
     /// Tamanho máximo (em bytes) de cada pacote de mensagens ou de BLOBs.
     packet_bytes: usize,
     closed: bool,
+}
+
+/// Argumentos do `op_batch_create` guardados para recriar o lote no servidor.
+#[derive(Clone, Default)]
+struct Criacao {
+    sql: String,
+    blr: Vec<u8>,
+    msglen: u32,
+    pb: Vec<u8>,
 }
 
 /// Uma parte do stream de BLOBs, enviada num `op_batch_blob_stream` próprio.
@@ -353,6 +367,7 @@ impl Batch {
         // Detecta o tipo segmentado: clumplet `isc_bpb_type`(3) com valor
         // `isc_bpb_type_segmented`(0). BPB usa comprimento de 1 byte por clumplet.
         self.blob_segmented = bpb_is_segmented(&bpb);
+        self.bpb_definido = Some(bpb.clone());
         self.default_bpb = Some(bpb);
         Ok(())
     }
@@ -531,7 +546,7 @@ impl Batch {
         conn.io().enqueue(&w);
         conn.io().flush()?;
 
-        if last.is_some()
+        let resultado = if last.is_some()
             && let Err(e) = read_response(conn.io())
         {
             // op_batch_exec já foi enviado no mesmo flush (o servidor o
@@ -542,9 +557,54 @@ impl Batch {
             if !conn.io().is_broken() {
                 let _ = read_batch_cs(conn);
             }
-            return Err(e);
+            Err(e)
+        } else {
+            read_batch_cs(conn)
+        };
+
+        // Lote com BLOB: no FB 5.0, reexecutar o mesmo comando preparado na
+        // mesma transação pode deixar BLOBs do lote com id temporário inválido
+        // ("invalid BLOB ID" a partir de certa linha, conforme o que já foi
+        // gravado). Renovar só o lote não basta; com o comando preparado de
+        // novo a cada execução o problema não aparece.
+        if self.blob_stream && !conn.io().is_broken() {
+            self.renovar_no_servidor(conn, tx)?;
         }
-        read_batch_cs(conn)
+        resultado
+    }
+
+    /// Libera o lote e o comando no servidor, prepara o comando de novo e cria
+    /// outro lote com as mesmas opções. O BPB padrão, se houver, volta a ser
+    /// enviado na próxima execução.
+    fn renovar_no_servidor(&mut self, conn: &mut Connection, tx: &Transaction) -> Result<()> {
+        let mut w = op_packet(op::BATCH_RLS);
+        w.put_i32(self.handle);
+        conn.io().enqueue(&w);
+        let mut w = op_packet(op::FREE_STATEMENT);
+        w.put_i32(self.handle);
+        w.put_i32(free::DROP);
+        conn.io().enqueue(&w);
+        conn.io().flush()?;
+        let rls = read_response(conn.io());
+        let free = read_response(conn.io());
+        rls?;
+        free?;
+
+        let mut stmt = conn.prepare(tx, &self.criacao.sql)?;
+        self.handle = stmt.handle();
+        stmt.forget_handle();
+        drop(stmt);
+
+        let mut w = op_packet(op::BATCH_CREATE);
+        w.put_i32(self.handle);
+        w.put_bytes(&self.criacao.blr);
+        w.put_i32(self.criacao.msglen as i32);
+        w.put_bytes(&self.criacao.pb);
+        conn.io().send(&w)?;
+        read_response(conn.io())?;
+        self.next_blob_id = 1;
+        self.default_bpb = self.bpb_definido.clone();
+        Ok(())
     }
 
     /// Descarta as mensagens acumuladas que ainda não foram executadas
@@ -746,6 +806,7 @@ impl Connection {
         w.put_bytes(pb.as_slice()); // cstring: len(4) + pb + pad
         self.io().send(&w)?;
         read_response(self.io())?;
+        let criacao = Criacao { sql: sql.to_string(), blr, msglen: msglen as u32, pb: pb.as_slice().to_vec() };
 
         Ok(Batch {
             handle,
@@ -763,6 +824,8 @@ impl Connection {
             charset: self.charset(),
             default_bpb: None,
             blob_segmented: false,
+            bpb_definido: None,
+            criacao,
             packet_bytes: packet_size(opts.packet_bytes),
             closed: false,
         })
@@ -895,6 +958,8 @@ mod tests {
             charset: crate::charset::Charset::Utf8,
             default_bpb: None,
             blob_segmented: false,
+            bpb_definido: None,
+            criacao: Criacao::default(),
             packet_bytes: DEFAULT_PACKET_BYTES as usize,
             closed: true,
         }
