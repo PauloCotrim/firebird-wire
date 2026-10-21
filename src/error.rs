@@ -138,11 +138,14 @@ impl StatusVector {
     /// Constrói uma mensagem com melhor esforço. Não embutimos o catálogo
     /// `firebird.msg` completo, mas temos um mapa dos códigos GDS mais comuns
     /// ([`gds_template`]) cujos placeholders `@N` preenchemos com os argumentos do
-    /// status vector. A ordem de preferência é: (1) texto já interpretado pelo
-    /// servidor; (2) templates conhecidos formatados; (3) argumentos crus; (4) o
-    /// código GDS bruto.
+    /// status vector. A mensagem junta (1) os templates conhecidos formatados e
+    /// (2) o texto já interpretado pelo servidor, nessa ordem; sem nenhum dos
+    /// dois, (3) argumentos crus; (4) o código GDS bruto.
     fn message(&self) -> String {
-        // (1) O servidor às vezes já manda o texto pronto.
+        // O servidor anexa texto pronto (`isc_arg_interpreted`) DEPOIS dos
+        // códigos, ex.: o erro do SO ("No such file or directory") após o
+        // "I/O error during open of file ..." (remote/server/server.cpp). Ele
+        // complementa a mensagem; não a substitui.
         let interpreted: Vec<String> = self
             .args
             .iter()
@@ -151,11 +154,8 @@ impl StatusVector {
                 _ => None,
             })
             .collect();
-        if !interpreted.is_empty() {
-            return interpreted.join("; ");
-        }
 
-        // (2) Cada código GDS formata o próprio template.
+        // (1) Cada código GDS formata o próprio template.
         //
         // Os argumentos pertencem ao código que vem **antes** deles: o vetor é
         // uma sequência `gds, code, args…, gds, code, args…`. Preencher todos os
@@ -189,6 +189,7 @@ impl StatusVector {
                 None => {}
             }
         }
+        partes.extend(interpreted);
         if !partes.is_empty() {
             return partes.join("; ");
         }
@@ -334,11 +335,17 @@ mod tests {
     }
 
     #[test]
-    fn interpreted_text_wins() {
+    fn interpreted_text_follows_codes() {
         let v = sv(vec![
             StatusArg::Gds(335544321),
             StatusArg::Interpreted("texto do servidor".into()),
         ]);
+        assert_eq!(
+            v.message(),
+            "arithmetic exception, numeric overflow, or string truncation; texto do servidor"
+        );
+        // Só o texto interpretado, sem código: ele sozinho.
+        let v = sv(vec![StatusArg::Interpreted("texto do servidor".into())]);
         assert_eq!(v.message(), "texto do servidor");
     }
 

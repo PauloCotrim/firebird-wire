@@ -218,7 +218,7 @@ impl Connection {
 
     /// Se o protocolo negociado suporta cursores roláveis (scrollable).
     pub fn supports_fetch_scroll(&self) -> bool {
-        self.protocol_version >= 17
+        self.protocol_version >= 18
     }
 
     /// Executa um comando SQL sem prepare prévio (`op_exec_immediate`). Use para DDL
@@ -256,7 +256,9 @@ impl Connection {
         w.put_i32(tx_handle); // campo 1: transação
         w.put_i32(self.db_handle); // campo 2: banco de dados
         w.put_i32(self.dialect); // dialeto SQL configurado em ConnectConfig
-        w.put_str(sql);
+        // O texto do SQL vai no charset da conexão (literais com acento numa
+        // conexão WIN1252 chegariam como UTF-8 cru e seriam gravados errado).
+        w.put_bytes(&self.charset().encode(sql));
         w.put_bytes(&[]); // itens de info vazios
         w.put_i32(0); // buffer_length = 0
         self.stream.send(&w)?;
@@ -367,10 +369,24 @@ pub(crate) struct AuthData {
 pub(crate) enum AuthState {
     /// Embute a prova SRP no PB (`isc_dpb_specific_auth_data` / `isc_spb_specific_auth_data`).
     Proof(AuthData),
-    /// Sem sessão SRP: recorre a senha legada.
-    Legacy,
+    /// O accept veio sem desafio (o servidor trocou para `Srp`, ou negociou
+    /// `Legacy_Auth`): o PB leva a primeira mensagem do plugin — a chave
+    /// pública SRP ou o hash Legacy — e o servidor segue por `op_cont_auth`.
+    Start { plugin: String, data: String },
+    /// Nada a embutir: só a lista de plugins; o servidor pede o resto por
+    /// `op_cont_auth`. A senha nunca viaja em texto puro (`isc_dpb_password`),
+    /// como no fbclient (`cleanDpb` em client/interface.cpp).
+    Deferred,
     /// Já autenticado por `op_cont_auth` (a prova não vai no PB).
     Done,
+}
+
+impl AuthState {
+    /// Se o dado de autenticação passa do limite de 255 bytes de um clumplet
+    /// clássico, exigindo PB WideTagged.
+    pub(crate) fn needs_wide_pb(&self) -> bool {
+        matches!(self, AuthState::Start { data, .. } if data.len() > u8::MAX as usize)
+    }
 }
 
 /// O resultado do handshake: o socket (já criptografado, se negociado), a versão
@@ -444,7 +460,15 @@ pub(crate) fn handshake(
     // (isc_*_specific_auth_data), o caminho que fbclient/isql usam.
     let auth = compute_auth(config, &mut srp, &accept)?;
     let session_key = auth.as_ref().map(|a| a.session_key.clone());
-    dbg_log!("auth computed; have_proof={}", auth.is_some());
+    let start = match &auth {
+        Some(_) => None,
+        None => initial_auth(config, &mut srp, &accept),
+    };
+    dbg_log!(
+        "auth computed; have_proof={} start={:?}",
+        auth.is_some(),
+        start.as_ref().map(|(p, _)| p)
+    );
 
     // --- criptografia de comunicação (wire) --------------------------------
     // Quando o servidor pede continuação (`op_cond_accept`, típico de
@@ -453,17 +477,29 @@ pub(crate) fn handshake(
     // contrário, usamos a prova embutida no PB e as chaves do accept.
     let auth = match (auth, accept.cond, config.wire_crypt != WireCrypt::Disabled) {
         (Some(a), true, true) => {
-            let keys = continue_auth(&mut stream, config, &a)?;
-            negotiate_crypt(&mut stream, config, Some(&a.session_key), &keys)?;
+            let (keys, key) = continue_auth(&mut stream, config, &mut srp, &a.plugin, &a.proof_hex)?;
+            let key = key.unwrap_or(a.session_key);
+            negotiate_crypt(&mut stream, config, Some(&key), &keys)?;
             AuthState::Done
         }
         (Some(a), _, _) => {
             negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys)?;
             AuthState::Proof(a)
         }
+        (None, true, true) if start.is_some() => {
+            // Sem desafio no accept condicional: a autenticação inteira corre
+            // por op_cont_auth (A → salt+B → prova), e só no fim vêm as chaves.
+            let (plugin, data) = start.expect("guard");
+            let (keys, key) = continue_auth(&mut stream, config, &mut srp, &plugin, &data)?;
+            negotiate_crypt(&mut stream, config, key.as_deref(), &keys)?;
+            AuthState::Done
+        }
         (None, _, _) => {
             negotiate_crypt(&mut stream, config, session_key.as_deref(), &accept.keys)?;
-            AuthState::Legacy
+            match start {
+                Some((plugin, data)) => AuthState::Start { plugin, data },
+                None => AuthState::Deferred,
+            }
         }
     };
     dbg_log!("crypt negotiated; encrypted={}", stream.is_encrypted());
@@ -543,24 +579,56 @@ fn compute_auth(
     }))
 }
 
-/// Conclui a autenticação SRP via `op_cont_auth` e devolve o buffer de chaves de
-/// cifra que vem na resposta (`p_resp_data`). É o caminho que o fbclient usa com
-/// servidores `WireCrypt=Required`: as chaves (com o nonce dos plugins ChaCha)
-/// só chegam após esta rodada. Layout do `op_cont_auth`:
-/// `data(prova, cstring) | name(plugin) | list(plugins) | keys(cstring vazia)`.
+/// A primeira mensagem do plugin quando o accept não traz desafio e o
+/// servidor ainda não nos considera autenticados. Com `Srp`/`Srp256` vazio, o
+/// servidor trocou de plugin (o nosso `CNCT_plugin_name` não bate com o dele,
+/// remote/server/server.cpp) e espera a chave pública de novo; com
+/// `Legacy_Auth`, o hash da senha. `None`: não há o que adiantar.
+fn initial_auth(
+    config: &ConnectConfig,
+    srp: &mut SrpClient,
+    accept: &Accept,
+) -> Option<(String, String)> {
+    if accept.authenticated || !accept.data.is_empty() {
+        return None;
+    }
+    match accept.plugin.as_str() {
+        "Srp256" | "Srp" => {
+            srp.set_hash(if accept.plugin == "Srp256" {
+                SrpHash::Sha256
+            } else {
+                SrpHash::Sha1
+            });
+            Some((accept.plugin.clone(), srp.public_key_hex()))
+        }
+        legacy::PLUGIN if config.legacy_auth => {
+            Some((accept.plugin.clone(), legacy::hash(&config.password)))
+        }
+        _ => None,
+    }
+}
+
+/// Conclui a autenticação via `op_cont_auth` e devolve o buffer de chaves de
+/// cifra que vem na resposta final (`p_resp_data`), mais a chave de sessão SRP
+/// se uma rodada a produziu. É o caminho que o fbclient usa com servidores
+/// `WireCrypt=Required`: as chaves (com o nonce dos plugins ChaCha) só chegam
+/// depois da autenticação. Layout do `op_cont_auth`:
+/// `data(cstring) | name(plugin) | list(plugins) | keys(cstring vazia)`.
 fn continue_auth(
     stream: &mut FbStream,
     config: &ConnectConfig,
-    auth: &AuthData,
-) -> Result<Vec<u8>> {
+    srp: &mut SrpClient,
+    plugin: &str,
+    data: &str,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let mut w = op_packet(op::CONT_AUTH);
-    w.put_str(&auth.proof_hex);
-    w.put_str(&auth.plugin);
+    w.put_str(data);
+    w.put_str(plugin);
     w.put_str(plugin_list(config));
     w.put_bytes(&[]);
     stream.send(&w)?;
-    let resp = read_response(stream)?;
-    Ok(resp.data)
+    let (resp, key) = auth_rounds(stream, config, srp)?;
+    Ok((resp.data, key))
 }
 
 /// Lê a resposta para `op_attach`/`op_create`/`op_service_attach`. Com a
@@ -577,11 +645,23 @@ pub(crate) fn attach_response(
     config: &ConnectConfig,
     srp: &mut SrpClient,
 ) -> Result<crate::wire::response::Response> {
+    Ok(auth_rounds(stream, config, srp)?.0)
+}
+
+/// Responde às rodadas de `op_cont_auth` até o `op_response` final. O servidor
+/// pode encadear várias (Srp vazio → salt+B → outro plugin; server.cpp,
+/// `continue_authentication`). Devolve a resposta e a última chave de sessão SRP.
+fn auth_rounds(
+    stream: &mut FbStream,
+    config: &ConnectConfig,
+    srp: &mut SrpClient,
+) -> Result<(crate::wire::response::Response, Option<Vec<u8>>)> {
     let mut rodadas = 0;
+    let mut session_key = None;
     loop {
         let code = read_op(stream)?;
         if code == op::RESPONSE {
-            return read_response_body(stream)?.into_result();
+            return Ok((read_response_body(stream)?.into_result()?, session_key));
         } else if code == op::CONT_AUTH {
             // p_data | p_name | p_list | p_keys. O `data` é o desafio do plugin
             // (vazio no Legacy_Auth) e o `name` é o plugin pedido.
@@ -601,7 +681,9 @@ pub(crate) fn attach_response(
                     "server kept requesting authentication rounds (>{MAX_RODADAS_CONT_AUTH});                      last plugin was '{plugin}'"
                 )));
             }
-            responder_cont_auth(stream, config, srp, &plugin, &data)?;
+            if let Some(key) = responder_cont_auth(stream, config, srp, &plugin, &data)? {
+                session_key = Some(key);
+            }
         } else {
             return Err(Error::protocol(format!(
                 "unexpected packet after attach: {} ({code})",
@@ -611,7 +693,8 @@ pub(crate) fn attach_response(
     }
 }
 
-/// Responde a uma rodada de `op_cont_auth`.
+/// Responde a uma rodada de `op_cont_auth`; devolve a chave de sessão quando
+/// a rodada fecha uma prova SRP.
 ///
 /// Dois plugins são atendidos: `Legacy_Auth` (hash DES da senha) e Srp/Srp256
 /// quando o servidor manda um desafio novo — o que acontece quando a prova que
@@ -625,7 +708,8 @@ fn responder_cont_auth(
     srp: &mut SrpClient,
     plugin: &str,
     desafio: &[u8],
-) -> Result<()> {
+) -> Result<Option<Vec<u8>>> {
+    let mut session_key = None;
     let dado = match plugin {
         legacy::PLUGIN => {
             if !config.legacy_auth {
@@ -636,15 +720,23 @@ fn responder_cont_auth(
             }
             legacy::hash(&config.password)
         }
-        "Srp" | "Srp256" if !desafio.is_empty() => {
+        "Srp" | "Srp256" => {
             srp.set_hash(if plugin == "Srp256" {
                 SrpHash::Sha256
             } else {
                 SrpHash::Sha1
             });
-            let (salt, b_pub) = parse_server_data(desafio)?;
-            let (proof, _) = srp.proof(&config.normalized_user(), &config.password, &salt, &b_pub)?;
-            crate::auth::srp::to_hex(&proof)
+            if desafio.is_empty() {
+                // O servidor trocou de plugin e pede a chave pública de novo
+                // (fase 1 do SrpClient.cpp).
+                srp.public_key_hex()
+            } else {
+                let (salt, b_pub) = parse_server_data(desafio)?;
+                let (proof, key) =
+                    srp.proof(&config.normalized_user(), &config.password, &salt, &b_pub)?;
+                session_key = Some(key);
+                crate::auth::srp::to_hex(&proof)
+            }
         }
         _ => {
             return Err(Error::auth(format!(
@@ -661,7 +753,8 @@ fn responder_cont_auth(
     w.put_str(plugin); // p_name
     w.put_str(plugin_list(config)); // p_list
     w.put_bytes(&[]); // p_keys
-    stream.send(&w)
+    stream.send(&w)?;
+    Ok(session_key)
 }
 
 /// Negocia a criptografia de comunicação (wire) conforme a postura [`WireCrypt`] requisitada.
@@ -740,9 +833,10 @@ fn wire_crypt_level(wc: WireCrypt) -> i32 {
 /// pública SRP (em pedaços), e o nível de cifra desejado.
 fn build_cnct_block(config: &ConnectConfig, public_key_hex: &str) -> Vec<u8> {
     let mut b = Vec::new();
-    let user = config.normalized_user();
-
-    push_cnct(&mut b, cnct::LOGIN, user.as_bytes());
+    // O nome como o usuário digitou (`cliOrigUserName` no fbclient): o
+    // servidor aplica o próprio `dpbItemUpper`. Só a prova SRP usa o
+    // normalizado.
+    push_cnct(&mut b, cnct::LOGIN, config.user.as_bytes());
     push_cnct(&mut b, cnct::PLUGIN_NAME, b"Srp256");
     push_cnct(&mut b, cnct::PLUGIN_LIST, plugin_list(config).as_bytes());
 
@@ -787,11 +881,21 @@ fn push_cnct(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
 
 /// Constrói o Database Parameter Buffer (DPB) para attach/create.
 fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> {
-    let mut pb = ParameterBuffer::new(DPB_VERSION1);
+    // A chave pública SRP em hex (~256 caracteres) não cabe num clumplet de
+    // 1 byte: como o fbclient, passamos o DPB inteiro para a versão 2.
+    let mut pb = if auth.needs_wide_pb() {
+        ParameterBuffer::new_wide(DPB_VERSION2)
+    } else {
+        ParameterBuffer::new(DPB_VERSION1)
+    };
 
     pb.int(dpb::SQL_DIALECT, config.dialect);
+    // Caminho do banco e strings do DPB vão em UTF-8; sem esta flag o servidor
+    // os converteria a partir do charset do sistema dele (o fbclient sempre a
+    // põe, client/interface.cpp).
+    pb.bytes(dpb::UTF8_FILENAME, &[]);
     pb.string(dpb::LC_CTYPE, &config.charset);
-    pb.string(dpb::USER_NAME, &config.normalized_user());
+    pb.string(dpb::USER_NAME, &config.user);
 
     match auth {
         AuthState::Proof(a) => {
@@ -799,9 +903,13 @@ fn build_dpb(config: &ConnectConfig, create: bool, auth: &AuthState) -> Vec<u8> 
             pb.string(dpb::AUTH_PLUGIN_LIST, plugin_list(config));
             pb.string(dpb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
-        AuthState::Legacy => {
-            // Nenhuma sessão SRP negociada: recorre a uma senha legada.
-            pb.string(dpb::PASSWORD, &config.password);
+        AuthState::Start { plugin, data } => {
+            pb.string(dpb::AUTH_PLUGIN_NAME, plugin);
+            pb.string(dpb::AUTH_PLUGIN_LIST, plugin_list(config));
+            pb.string(dpb::SPECIFIC_AUTH_DATA, data);
+        }
+        AuthState::Deferred => {
+            pb.string(dpb::AUTH_PLUGIN_LIST, plugin_list(config));
         }
         // Já autenticado via cont_auth: nada de prova/senha no DPB.
         AuthState::Done => {}
@@ -939,7 +1047,7 @@ mod tests {
     #[test]
     fn dpb_has_dialect_and_charset() {
         let cfg = ConnectConfig::new().charset("UTF8").dialect(3);
-        let dpb = build_dpb(&cfg, false, &AuthState::Legacy);
+        let dpb = build_dpb(&cfg, false, &AuthState::Deferred);
         assert_eq!(dpb[0], DPB_VERSION1);
         // clumplet de dialect presente.
         assert!(dpb.windows(1).any(|w| w[0] == dpb::SQL_DIALECT));

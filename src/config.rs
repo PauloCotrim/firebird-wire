@@ -169,10 +169,16 @@ impl ConnectConfig {
         self
     }
 
-    /// O nome de usuário normalizado da forma que o plugin SRP espera
-    /// (identificadores sem aspas são convertidos para maiúsculas).
+    /// O nome de usuário normalizado da forma que o plugin SRP espera — o
+    /// mesmo `dpbItemUpper` do fbclient (common/utils.cpp):
+    /// - sem aspas, só identificadores ASCII (`[A-Za-z_$][A-Za-z0-9_$]*`) vão
+    ///   para maiúsculas; qualquer outro nome (`joao.silva`, `josé`) segue como
+    ///   está;
+    /// - entre aspas duplas, as aspas saem (`""` vira `"`) e a caixa fica;
+    /// - entre aspas simples, idem, mas um identificador ASCII vai para
+    ///   maiúsculas.
     pub(crate) fn normalized_user(&self) -> String {
-        self.user.to_uppercase()
+        dpb_item_upper(&self.user)
     }
 
     /// Valida campos que vão para clumplets de 1 byte de comprimento (DPB/cnct),
@@ -180,8 +186,8 @@ impl ConnectConfig {
     /// Chamado no início do handshake. O `database` não entra aqui: vai num campo
     /// XDR de comprimento de 4 bytes, sem esse limite.
     pub(crate) fn validate(&self) -> Result<()> {
-        // O usuário é enviado em maiúsculas (pode mudar o nº de bytes em multibyte).
-        check_clumplet_len("user", &self.normalized_user())?;
+        // O usuário vai como informado (o servidor normaliza).
+        check_clumplet_len("user", &self.user)?;
         check_clumplet_len("password", &self.password)?;
         check_clumplet_len("charset", &self.charset)?;
         if let Some(role) = &self.role {
@@ -205,8 +211,60 @@ fn check_clumplet_len(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn sql_symbol_char(c: char, first: bool) -> bool {
+    c.is_ascii() && ((c.is_ascii_digit() && !first) || c.is_ascii_alphabetic() || c == '_' || c == '$')
+}
+
+/// Porta de `fb_utils::dpbItemUpper`. Aspas malformadas (o fbclient levanta
+/// `isc_quoted_str_bad`/`_miss`) caem no nome sem alteração, e o servidor
+/// recusa o login normalmente.
+fn dpb_item_upper(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(q @ ('"' | '\'')) => {
+            let mut out = String::new();
+            let mut ascii = true;
+            let mut first = true;
+            let mut rest = chars.peekable();
+            while let Some(c) = rest.next() {
+                if c == q {
+                    match rest.next() {
+                        None => {
+                            return if ascii && q == '\'' { out.to_ascii_uppercase() } else { out };
+                        }
+                        Some(n) if n == q => {}
+                        Some(_) => return s.to_string(),
+                    }
+                } else if !sql_symbol_char(c, first) {
+                    ascii = false;
+                }
+                out.push(c);
+                first = false;
+            }
+            s.to_string()
+        }
+        _ => {
+            let symbol = s.chars().enumerate().all(|(i, c)| sql_symbol_char(c, i == 0));
+            if symbol { s.to_ascii_uppercase() } else { s.to_string() }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_name_follows_dpb_item_upper() {
+        assert_eq!(dpb_item_upper("sysdba"), "SYSDBA");
+        assert_eq!(dpb_item_upper("user_1$"), "USER_1$");
+        assert_eq!(dpb_item_upper("joao.silva"), "joao.silva");
+        assert_eq!(dpb_item_upper("josé"), "josé");
+        assert_eq!(dpb_item_upper("1abc"), "1abc");
+        assert_eq!(dpb_item_upper("\"Mixed\""), "Mixed");
+        assert_eq!(dpb_item_upper("\"a\"\"b\""), "a\"b");
+        assert_eq!(dpb_item_upper("'abc'"), "ABC");
+        assert_eq!(dpb_item_upper("'a.b'"), "a.b");
+        assert_eq!(dpb_item_upper("\"sem fim"), "\"sem fim");
+    }
     use super::*;
 
     #[test]

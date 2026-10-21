@@ -470,24 +470,23 @@ impl ServiceManager {
     }
 
     /// Dispara um `display_user` e decodifica o buffer `isc_info_svc_get_users`.
-    /// `isc_info_svc_get_users` não tem continuação incremental: se a lista não
-    /// couber no buffer, o servidor marca `isc_info_truncated` e devemos repetir
-    /// com um buffer maior. Dobramos o tamanho até caber (ou atingir o teto).
+    /// A lista chega em pedaços: cada `op_service_info` devolve
+    /// `get_users | len(2) | pedaço | isc_info_end`, um registro pode ficar
+    /// partido entre duas respostas, e o fim é um pedaço vazio. Como o fbclient
+    /// (`typeBuffer` em common/call_service.cpp), juntamos tudo e só então
+    /// decodificamos.
     fn fetch_users(&mut self, spb: Vec<u8>) -> Result<Vec<UserInfo>> {
-        const MAX_INFO_BUF: i32 = 16 * 1024 * 1024;
-        let mut buf_len = DEFAULT_INFO_BUF;
+        self.start(&spb)?;
+        let mut payload = Vec::new();
         loop {
-            // Re-dispara a ação a cada tentativa para que o buffer maior receba a
-            // lista completa do zero (get_users não tem continuação incremental).
-            self.start(&spb)?;
-            let data = self.info(&[], &[svc_info::GET_USERS], buf_len)?;
-            if data.last() == Some(&INFO_TRUNCATED) && buf_len < MAX_INFO_BUF {
-                buf_len = buf_len.saturating_mul(2).min(MAX_INFO_BUF);
-                continue;
+            let data = self.info(&[], &[svc_info::GET_USERS], DEFAULT_INFO_BUF)?;
+            let chunk = parse_svc_string(&data, svc_info::GET_USERS)?;
+            if chunk.is_empty() {
+                break;
             }
-            let payload = parse_svc_string(&data, svc_info::GET_USERS)?;
-            return parse_users(&payload);
+            payload.extend_from_slice(&chunk);
         }
+        parse_users(&payload)
     }
 
     // -- auxiliares ---------------------------------------------------------
@@ -509,11 +508,18 @@ impl ServiceManager {
 /// Constrói o SPB de `op_service_attach`. Cabeçalho `[version, current_version]`
 /// (ambos `2`) seguido do usuário e da autenticação, espelhando o DPB de banco.
 fn build_attach_spb(config: &ConnectConfig, auth: &AuthState) -> Vec<u8> {
-    let mut spb = ParameterBuffer::raw();
-    spb.tag(SPB_VERSION);
-    spb.tag(SPB_CURRENT_VERSION);
+    let mut spb = if auth.needs_wide_pb() {
+        // Como no DPB: valor > 255 bytes ⇒ `isc_spb_version3` (WideTagged,
+        // sem o par de cabeçalho da forma SpbAttach).
+        ParameterBuffer::new_wide(SPB_VERSION3)
+    } else {
+        let mut spb = ParameterBuffer::raw();
+        spb.tag(SPB_VERSION);
+        spb.tag(SPB_CURRENT_VERSION);
+        spb
+    };
 
-    spb.string(spb::USER_NAME, &config.normalized_user());
+    spb.string(spb::USER_NAME, &config.user);
 
     match auth {
         AuthState::Proof(a) => {
@@ -521,8 +527,13 @@ fn build_attach_spb(config: &ConnectConfig, auth: &AuthState) -> Vec<u8> {
             spb.string(spb::AUTH_PLUGIN_LIST, crate::connection::plugin_list(config));
             spb.string(spb::SPECIFIC_AUTH_DATA, &a.proof_hex);
         }
-        AuthState::Legacy => {
-            spb.string(spb::PASSWORD, &config.password);
+        AuthState::Start { plugin, data } => {
+            spb.string(spb::AUTH_PLUGIN_NAME, plugin);
+            spb.string(spb::AUTH_PLUGIN_LIST, crate::connection::plugin_list(config));
+            spb.string(spb::SPECIFIC_AUTH_DATA, data);
+        }
+        AuthState::Deferred => {
+            spb.string(spb::AUTH_PLUGIN_LIST, crate::connection::plugin_list(config));
         }
         AuthState::Done => {}
     }
@@ -819,14 +830,15 @@ mod tests {
     #[test]
     fn attach_spb_header_and_user() {
         let cfg = ConnectConfig::new().user("sysdba");
-        let spb = build_attach_spb(&cfg, &AuthState::Legacy);
+        let cfg = cfg.password("segredo");
+        let spb = build_attach_spb(&cfg, &AuthState::Deferred);
         // Cabeçalho: version, current_version.
         assert_eq!(spb[0], SPB_VERSION);
         assert_eq!(spb[1], SPB_CURRENT_VERSION);
-        // user_name normalizado em maiúsculas.
-        assert!(spb.windows(6).any(|w| w == b"SYSDBA"));
-        // sem sessão SRP -> senha legada presente como clumplet.
-        assert!(spb.contains(&spb::PASSWORD));
+        // user_name como informado; o servidor normaliza.
+        assert!(spb.windows(6).any(|w| w == b"sysdba"));
+        // A senha nunca vai em texto puro no SPB.
+        assert!(!spb.windows(7).any(|w| w == b"segredo"));
     }
 
     #[test]

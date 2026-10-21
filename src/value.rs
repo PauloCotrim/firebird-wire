@@ -929,7 +929,8 @@ impl ColumnMeta {
     /// Bytes que esta coluna ocupa em uma mensagem de linha XDR quando não-nula.
     pub(crate) fn xdr_len(&self) -> usize {
         match sql_type::base(self.sql_type) {
-            sql_type::TEXT => align4(self.length as usize),
+            // SQL_NULL viaja como blr_text do mesmo comprimento (BlrFromMessage).
+            sql_type::TEXT | sql_type::NULL => align4(self.length as usize),
             sql_type::VARYING => 4 + align4(self.length as usize),
             sql_type::SHORT | sql_type::LONG => 4,
             sql_type::INT64 => 8,

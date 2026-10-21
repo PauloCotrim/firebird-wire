@@ -169,9 +169,18 @@ impl Transaction {
         self.handle
     }
 
-    /// Faz commit e libera a transação.
+    /// Faz commit e libera a transação. Se o servidor recusar o commit (ex.:
+    /// DDL que só acusa "object in use" no COMMIT), a transação continuaria
+    /// viva no servidor sem ninguém para encerrá-la, segurando locks: faz o
+    /// rollback antes de devolver o erro do commit.
     pub fn commit(mut self, conn: &mut Connection) -> Result<()> {
-        self.finish(conn, op::COMMIT)
+        match self.finish(conn, op::COMMIT) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.finish(conn, op::ROLLBACK);
+                Err(e)
+            }
+        }
     }
 
     /// Faz rollback e libera a transação.

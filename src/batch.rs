@@ -269,21 +269,35 @@ impl Batch {
         let id = self.next_blob_id;
         self.next_blob_id += 1;
         if self.blob_segmented {
-            // Blob segmentado (um único segmento aqui). NO WIRE: cada segmento é
-            // `u32` big-endian com o comprimento + os bytes, sem padding. Mas o
-            // campo `size` (e o comprimento do stream) seguem a contabilidade do
-            // *buffer* do servidor, que usa cabeçalho de 2 bytes alinhado a
-            // `BLOB_SEGHDR_ALIGN`: `size = align2(2 + len)`. Ver `xdr_blob_stream`.
-            // O segmento (limitado a 64 KiB pelo servidor) vai inteiro num pacote.
-            let size_field = align_up(2 + data.len(), BLOB_SEGHDR_ALIGN);
+            // Blob segmentado. NO WIRE: cada segmento é `u32` big-endian com o
+            // comprimento + os bytes, sem padding. Mas o campo `size` (e o
+            // comprimento do stream) seguem a contabilidade do *buffer* do
+            // servidor, que usa cabeçalho de 2 bytes alinhado a
+            // `BLOB_SEGHDR_ALIGN`: `size = Σ align2(2 + len)`. Ver
+            // `xdr_blob_stream`. O comprimento do segmento é lido como
+            // `xdr_u_short`: acima de 65535 ele seria truncado e o servidor
+            // fecharia a porta, então dividimos em segmentos de até 65535 (o
+            // fbclient recusa com isc_big_segment). Tudo vai num pacote só.
+            const MAX_SEGMENT: usize = u16::MAX as usize;
+            let segments: Vec<&[u8]> = if data.is_empty() {
+                vec![data]
+            } else {
+                data.chunks(MAX_SEGMENT).collect()
+            };
+            let size_field: usize = segments
+                .iter()
+                .map(|seg| align_up(2 + seg.len(), BLOB_SEGHDR_ALIGN))
+                .sum();
             self.start_blob(16 + size_field);
             self.pending_blobs.extend_from_slice(&id.to_be_bytes());
             self.pending_blobs
                 .extend_from_slice(&(size_field as u32).to_be_bytes());
             self.pending_blobs.extend_from_slice(&0u32.to_be_bytes()); // bpb_size
-            self.pending_blobs
-                .extend_from_slice(&(data.len() as u32).to_be_bytes());
-            self.pending_blobs.extend_from_slice(data);
+            for seg in segments {
+                self.pending_blobs
+                    .extend_from_slice(&(seg.len() as u32).to_be_bytes());
+                self.pending_blobs.extend_from_slice(seg);
+            }
             self.pending_blobs_len += 16 + size_field;
             self.blob_stream_len += align_up(16 + size_field, BLOB_ALIGN);
         } else {
@@ -362,6 +376,15 @@ impl Batch {
         if !self.blob_stream {
             return Err(Error::protocol(
                 "set_default_bpb exige uma coluna BLOB na instrução do batch",
+            ));
+        }
+        // O servidor aplica o tipo segmentado ao ler o cabeçalho de cada blob, e o
+        // BPB vai à rede antes de todos os pendentes: trocá-lo agora mudaria o
+        // enquadramento dos blobs já enfileirados (o fbclient recusa com
+        // isc_batch_defbpb).
+        if self.blob_stream_len != 0 {
+            return Err(Error::protocol(
+                "set_default_bpb precisa vir antes de add_blob (já há blobs no batch)",
             ));
         }
         // Detecta o tipo segmentado: clumplet `isc_bpb_type`(3) com valor

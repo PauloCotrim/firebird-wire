@@ -20,6 +20,56 @@ teste: `127.0.0.1:3555`, `employee`, SYSDBA/masterkey, `WireCrypt=Disabled`.
 - Sucesso do vetor de status = `[isc_arg_gds(1), 0, isc_arg_end(0)]`; **o código
   gds 0 é sucesso, não um erro**.
 
+## Conferido no fonte do FB 5.0.3 (tag `v5.0.3`, `src/remote`)
+
+As capturas por strace acima foram revistas contra `remote/protocol.cpp`
+(`xdr_protocol`), `remote/client/interface.cpp`, `remote/client/BlrFromMessage.cpp`,
+`remote/server/server.cpp` e `common/classes/ClumpletReader.cpp`. A libfbclient
+instalada vem sem símbolos, então o fonte é a referência mais confiável.
+
+- **`op_execute`/`op_execute2`:** `stmt | tx | in_blr | in_msg_number | in_msg_count
+  | [mensagem] | (só execute2: out_blr | out_msg_number) | timeout (v16+) |
+  cursor_flags (v18+) | inline_blob_size (v19+)`. O "out_blr vazio" das capturas
+  era o `timeout`. Cada campo depende da versão negociada; uma palavra a mais é
+  lida como op code e derruba a porta.
+- **Saída singleton:** EXECUTE PROCEDURE com saída e `... RETURNING` precisam de
+  `op_execute2` com o out_blr; a resposta é `op_sql_response` (`messages` + linha
+  no formato do fetch) e depois `op_response`. Com `op_execute` a linha se perde.
+  `EXECUTE BLOCK ... RETURNS` é descrito como SELECT (stmt_type 1); sem SUSPEND
+  não devolve linha nenhuma.
+- **Cursor após commit:** o fim da transação fecha os cursores dela no servidor; um
+  DSQL_close depois responde `isc_dsql_cursor_close_err` (tratado como fechado).
+- **Prepare com erro:** o fbclient libera o handle alocado (DSQL_drop).
+- **BLR de texto:** `blr_text2`/`blr_varying2` com o charset da coluna (byte baixo
+  do sub_type), como `BlrFromMessage`. SQL_NULL vai como `blr_text` do comprimento
+  do descritor.
+- **`op_fetch`:** `fetch_count` é `xdr_short` (máx. 32767).
+- **Inteiros em DPB/TPB/SPB:** lidos com sinal (`fromVaxInteger`). Largura mínima
+  só se o byte de cima não mudar o sinal (200 = `c8 00`, nunca `c8`).
+- **Tags DPB:** `isc_dpb_trusted_auth` = 73, `isc_dpb_process_name` = 74 (112/111
+  são do SPB). O fbclient sempre põe `isc_dpb_utf8_filename` (77).
+- **Autenticação:**
+  - A senha nunca vai em `isc_dpb_password` (`cleanDpb`).
+  - Accept sem desafio com plugin `Srp`/`Srp256` significa que o servidor trocou
+    de plugin e espera a chave pública de novo; com `Legacy_Auth`, o hash vai em
+    `specific_auth_data`.
+  - O servidor pode encadear várias rodadas de `op_cont_auth`.
+  - Valor > 255 bytes ⇒ o PB inteiro vira WideTagged (`isc_dpb_version2` /
+    `isc_spb_version3`, tamanhos de 4 bytes LE; `ClumpletWriter::upgradeVersion`).
+- **Nome de usuário:** CNCT_login e `user_name` levam o nome como digitado; só a
+  prova SRP usa o normalizado por `dpbItemUpper`: sem aspas, só identificadores
+  ASCII vão para maiúsculas; entre aspas duplas, preserva a caixa.
+- **Status vector:** `isc_arg_interpreted` vem DEPOIS dos códigos (ex.: o erro do
+  SO); complementa a mensagem, não a substitui.
+- **Eventos:** o ip do canal auxiliar é o do par da conexão principal; da resposta
+  só vale a porta (NAT/Docker; `aux_connect` em inet.cpp).
+- **Arrays:** `op_slice` traz `lstr_length / dsc_length` elementos, que pode ser
+  menos que o pedido. TEXT/VARYING maiores que o elemento desalinham o stream.
+- **Batch:** o comprimento do segmento é `xdr_u_short` (máx. 65535, dividir em
+  vários); `set_default_bpb` só antes dos blobs; `IBatch::INF_*` = 10..14.
+- **`isc_info_svc_get_users`:** chega em pedaços (registro pode ser partido),
+  terminando com pedaço vazio.
+
 ## VALIDADO AO VIVO — camada de instruções (statements)
 
 O código está em `statement.rs` (+ `blr.rs`, `message.rs`, `value.rs`). **Todos
@@ -279,11 +329,13 @@ Decodificado de um cliente C++ (`/tmp/fbscroll/scroll.cpp`) usando a OO API:
 `fetchAbsolute/Prior/Last/First/Relative/Next`, sob `strace -e sendto`.
 
 **Abrir cursor rolável — `op_execute` (63):** o pacote é **idêntico** ao de um
-cursor normal; a ÚNICA palavra que muda é `cursor_flags`, logo após `out_blr`:
+cursor normal; a ÚNICA palavra que muda é `cursor_flags`, logo após o `timeout`:
 ```
 op_execute | stmt | tx | in_blr(cstring) | in_msg_number | in_msg_count |
-            out_blr(cstring) | cursor_flags | inline_blob_size(proto>=18)
+            [timeout(v16+)] | cursor_flags(v18+) | inline_blob_size(v19+)
 ```
+(Corrigido pelo fonte, ver "Conferido no fonte do FB 5.0.3": o que parecia
+`out_blr` vazio é o `timeout`.)
 `cursor_flags = 1` (CURSOR_TYPE_SCROLLABLE) abre rolável; `0` = normal. O
 op_execute (≠ op_execute2) NÃO carrega `out_message_number` nessa posição — o que
 o driver antes rotulava assim era de fato `cursor_flags` (e enviava 0, por sorte

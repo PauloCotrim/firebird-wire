@@ -198,8 +198,8 @@ pub mod dpb {
     pub const ROLE_NAME: u8 = 60;
     pub const CONNECT_TIMEOUT: u8 = 57;
     pub const PROCESS_ID: u8 = 71;
-    pub const PROCESS_NAME: u8 = 112;
-    pub const TRUSTED_AUTH: u8 = 111;
+    pub const PROCESS_NAME: u8 = 74;
+    pub const TRUSTED_AUTH: u8 = 73;
     pub const UTF8_FILENAME: u8 = 77;
     pub const SPECIFIC_AUTH_DATA: u8 = 84;
     pub const AUTH_PLUGIN_LIST: u8 = 85;
@@ -225,6 +225,8 @@ pub mod dpb {
 /// `isc_spb_current_version`, ambos `2` (confirmado por strace do `fbsvcmgr`).
 pub const SPB_VERSION: u8 = 2;
 pub const SPB_CURRENT_VERSION: u8 = 2;
+/// `isc_spb_version3`: SPB WideTagged (comprimentos de 4 bytes LE).
+pub const SPB_VERSION3: u8 = 3;
 
 pub mod spb {
     // Itens de autenticação / identificação no attach (espelham os do DPB).
@@ -765,13 +767,14 @@ pub mod blob_policy {
     pub const STREAM: u8 = 3;
 }
 
-/// Itens de info de batch (info de `IBatch`, FB4+) retornados por `op_info_batch`.
+/// Itens de info de batch (`IBatch::INF_*`, FirebirdInterface.idl) retornados
+/// por `op_info_batch`.
 pub mod batch_info {
-    pub const VERSION: u8 = 1;
-    pub const BLOB_ALIGNMENT: u8 = 2;
-    pub const BLOB_HEADER: u8 = 3;
-    pub const ROW_SIZE: u8 = 4;
-    pub const BUFFER_BYTES_SIZE: u8 = 5;
+    pub const BUFFER_BYTES_SIZE: u8 = 10; // tamanho máximo do buffer
+    pub const DATA_BYTES_SIZE: u8 = 11; // mensagens já adicionadas
+    pub const BLOBS_BYTES_SIZE: u8 = 12; // blobs já adicionados
+    pub const BLOB_ALIGNMENT: u8 = 13;
+    pub const BLOB_HEADER: u8 = 14; // tamanho do cabeçalho de blob
 }
 
 /// Códigos de estado de conclusão de `op_batch_cs` (`IBatchCompletionState`).

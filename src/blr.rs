@@ -48,12 +48,18 @@ fn message_blr_impl(columns: &[ColumnMeta], for_output: bool) -> Vec<u8> {
 fn push_type(b: &mut Vec<u8>, col: &ColumnMeta, for_output: bool) {
     let scale = col.scale as i8 as u8;
     match sql_type::base(col.sql_type) {
+        // Como o `BlrFromMessage` do fbclient: blr_text2/blr_varying2 com o
+        // charset da coluna (byte baixo do sub_type; o alto é a collation).
+        // Sem ele o servidor assume o charset da conexão e converte também
+        // colunas OCTETS, o que estraga bytes que não formam texto válido.
         sql_type::TEXT => {
-            b.push(blr::TEXT);
+            b.push(blr::TEXT2);
+            b.extend_from_slice(&((col.sub_type & 0xff) as u16).to_le_bytes());
             b.extend_from_slice(&(col.length as u16).to_le_bytes());
         }
         sql_type::VARYING => {
-            b.push(blr::VARYING);
+            b.push(blr::VARYING2);
+            b.extend_from_slice(&((col.sub_type & 0xff) as u16).to_le_bytes());
             b.extend_from_slice(&(col.length as u16).to_le_bytes());
         }
         sql_type::SHORT => {
@@ -95,6 +101,12 @@ fn push_type(b: &mut Vec<u8>, col: &ColumnMeta, for_output: bool) {
             b.extend_from_slice(&charset.to_le_bytes());
         }
         sql_type::BOOLEAN => b.push(blr::BOOL),
+        // `? IS NULL`: o DSQL descreve o parâmetro como SQL_NULL. O fbclient o
+        // declara como blr_text do comprimento informado (BlrFromMessage.cpp).
+        sql_type::NULL => {
+            b.push(blr::TEXT);
+            b.extend_from_slice(&(col.length as u16).to_le_bytes());
+        }
         sql_type::DEC16 => b.push(blr::DEC64),
         sql_type::DEC34 => b.push(blr::DEC128),
         sql_type::TIME_TZ | sql_type::TIME_TZ_EX => {
@@ -177,10 +189,11 @@ mod tests {
         ];
         let blr_bytes = message_blr(&cols);
         // version5, begin, message, msg#0, count=4(LE), short/0, short/0(null),
-        // varying/15(LE), short/0(null), end, eoc
+        // varying2/charset 0/15(LE), short/0(null), end, eoc — igual à
+        // captura do isql (PROTOCOL-NOTES.md, op_fetch)
         assert_eq!(
             blr_bytes,
-            vec![5, 2, 4, 0, 4, 0, 7, 0, 7, 0, 37, 15, 0, 7, 0, 255, 76]
+            vec![5, 2, 4, 0, 4, 0, 7, 0, 7, 0, 38, 0, 0, 15, 0, 7, 0, 255, 76]
         );
     }
 }

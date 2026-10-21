@@ -285,13 +285,18 @@ impl Connection {
             )));
         }
         let _slr_length = self.io().read_i32()?; // tamanho na repr. do cliente
-        let _xdr_length = self.io().read_i32()?; // comprimento lógico XDR
+        let xdr_length = self.io().read_i32()?; // bytes da fatia devolvida
 
+        // O servidor codifica `lstr_length / dsc_length` elementos (xdr_slice em
+        // remote/protocol.cpp), e a fatia devolvida pode ser menor que a pedida
+        // (só até o último elemento gravado). Ler `count` desalinharia o stream.
+        let sent = (xdr_length.max(0) as usize / desc.element_stride()).min(count);
         let charset = self.charset();
         let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
+        for _ in 0..sent {
             out.push(decode_element(self.io(), desc, charset)?);
         }
+        out.resize(count, Value::Null);
         Ok(out)
     }
 
@@ -455,14 +460,19 @@ fn encode_element(
             Value::DecFloat(d) => out.extend_from_slice(&d.to_decimal128().ok_or_else(mismatch)?),
             _ => return Err(mismatch()),
         },
+        // O servidor lê exatamente `length` bytes (TEXT) ou no máximo `length`
+        // (VARYING, common/xdr.cpp); o excesso seria lido como o próximo
+        // elemento e derrubaria a conexão.
         blr::VARYING => {
             let bytes = elem_text_bytes(val, charset)?;
+            check_elem_len(bytes.len(), desc)?;
             put_i32_be(out, bytes.len() as i32);
             out.extend_from_slice(&bytes);
             put_pad(out, bytes.len());
         }
         blr::TEXT => {
             let bytes = elem_text_bytes(val, charset)?;
+            check_elem_len(bytes.len(), desc)?;
             let n = desc.length as usize;
             out.extend_from_slice(&bytes);
             for _ in bytes.len()..n {
@@ -476,6 +486,16 @@ fn encode_element(
                 desc.blr_type
             )));
         }
+    }
+    Ok(())
+}
+
+fn check_elem_len(len: usize, desc: &ArrayDesc) -> Result<()> {
+    if len > desc.length as usize {
+        return Err(Error::protocol(format!(
+            "string right truncation: {len} bytes do not fit array element (length {})",
+            desc.length
+        )));
     }
     Ok(())
 }

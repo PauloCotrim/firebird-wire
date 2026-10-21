@@ -45,7 +45,7 @@ fn align_up(n: usize, alignment: usize) -> usize {
 fn type_size_align(col: &ColumnMeta) -> (usize, usize) {
     let n = col.length as usize;
     match sql_type::base(col.sql_type) {
-        sql_type::TEXT => (n, 1),
+        sql_type::TEXT | sql_type::NULL => (n, 1),
         sql_type::VARYING => (n + 2, 2),
         sql_type::SHORT => (2, 2),
         sql_type::LONG => (4, 4),
@@ -180,6 +180,15 @@ fn encode_value(
     let mismatch = || Error::protocol(format!("value does not fit {}", col_desc()));
     let out_of_range =
         |v: i64| Error::protocol(format!("value {v} out of range for {}", col_desc()));
+    // Texto maior que o declarado no BLR desalinha a mensagem: o servidor
+    // fecha a conexão ou fica esperando bytes. Recusa antes de enviar.
+    let truncation = |len: usize| {
+        Error::protocol(format!(
+            "string right truncation: {len} bytes do not fit {} (length {})",
+            col_desc(),
+            col.length
+        ))
+    };
     match sql_type::base(col.sql_type) {
         sql_type::SHORT => {
             let v = val.as_i64().ok_or_else(mismatch)?;
@@ -210,6 +219,9 @@ fn encode_value(
         },
         sql_type::VARYING => {
             let bytes = text_bytes(val, charset)?;
+            if bytes.len() > col.length as usize {
+                return Err(truncation(bytes.len()));
+            }
             put_i32_be(out, bytes.len() as i32);
             out.extend_from_slice(&bytes);
             put_pad(out, bytes.len());
@@ -217,6 +229,9 @@ fn encode_value(
         sql_type::TEXT => {
             let bytes = text_bytes(val, charset)?;
             let n = col.length as usize;
+            if bytes.len() > n {
+                return Err(truncation(bytes.len()));
+            }
             out.extend_from_slice(&bytes);
             // Preenche CHAR(n) à direita com espaços até sua largura declarada.
             for _ in bytes.len()..n {
@@ -234,7 +249,10 @@ fn encode_value(
             _ => return Err(mismatch()),
         },
         sql_type::BOOLEAN => {
-            out.push(matches!(val, ValueRef::Bool(true)) as u8);
+            let ValueRef::Bool(b) = val else {
+                return Err(mismatch());
+            };
+            out.push(b as u8);
             put_pad(out, 1);
         }
         sql_type::DEC16 => match val {
@@ -273,6 +291,13 @@ fn encode_value(
             }
             _ => return Err(mismatch()),
         },
+        // Parâmetro SQL_NULL (`? IS NULL`) com valor: o conteúdo é irrelevante,
+        // só o bit de nulo conta. Vai como os `length` bytes do blr_text.
+        sql_type::NULL => {
+            let n = col.length as usize;
+            out.resize(out.len() + n, 0);
+            put_pad(out, n);
+        }
         _ => {
             return Err(Error::protocol(format!(
                 "unsupported parameter type {}",
@@ -420,6 +445,12 @@ fn decode_value(stream: &mut FbStream, col: &ColumnMeta, charset: Charset) -> Re
             let b = stream.read_raw_ref(1)?[0];
             stream.read_pad(1)?;
             Value::Bool(b != 0)
+        }
+        sql_type::NULL => {
+            let n = col.length as usize;
+            stream.read_raw_ref(n)?;
+            stream.read_pad(n)?;
+            Value::Null
         }
         _ => {
             // Tipo desconhecido: consome sua largura declarada como bytes opacos.

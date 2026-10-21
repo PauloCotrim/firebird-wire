@@ -1420,9 +1420,13 @@ fn batch_segmented_blob() -> Result<()> {
         "RECREATE TABLE fdb_batch_s (id INTEGER, dados BLOB SUB_TYPE 0)",
     )?;
 
-    let conteudos: [&[u8]; 2] = [
+    // O terceiro passa de 65535 bytes: precisa ir em vários segmentos (o
+    // comprimento do segmento é um u16 no servidor).
+    let grande: Vec<u8> = (0..200_001u32).map(|i| (i % 251) as u8).collect();
+    let conteudos: [&[u8]; 3] = [
         b"segmento unico via op_batch_set_bpb",
         b"outro blob segmentado",
+        &grande,
     ];
 
     let tx = conn.begin()?;
@@ -1435,8 +1439,12 @@ fn batch_segmented_blob() -> Result<()> {
         batch.add(&[Value::Int(i as i32 + 1), Value::Blob(blob_id)])?;
     }
     let result = batch.execute(&mut conn, &tx)?;
-    assert_eq!(result.total, 2);
+    assert_eq!(result.total, 3);
     assert!(result.all_succeeded());
+    // Trocar o BPB com blobs já executados é permitido; com blobs na fila, não.
+    batch.add_blob(b"pendente")?;
+    assert!(batch.set_segmented(false).is_err());
+    batch.cancel(&mut conn)?;
     batch.close(&mut conn)?;
     tx.commit(&mut conn)?;
 
@@ -1445,7 +1453,7 @@ fn batch_segmented_blob() -> Result<()> {
     let mut stmt = conn.prepare(&tx, "SELECT id, dados FROM fdb_batch_s ORDER BY id")?;
     stmt.execute(&mut conn, &tx, &[])?;
     let rows = stmt.fetch_all(&mut conn)?;
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     for (i, row) in rows.iter().enumerate() {
         let blob_id = match row[1] {
             Value::Blob(id) => id,
@@ -1962,8 +1970,13 @@ fn service_user_management() -> Result<()> {
 
     let name = format!("FDBT{}", std::process::id());
 
-    // Garante estado limpo caso uma execução anterior tenha falhado.
-    svc.delete_user(&name)?;
+    // Garante estado limpo caso uma execução anterior tenha falhado. O caso
+    // normal é o usuário não existir (isc_usrname_not_found).
+    if let Err(e) = svc.delete_user(&name)
+        && e.gds_code() != Some(335544753)
+    {
+        return Err(e);
+    }
 
     // Cria.
     let params = firebird_wire::UserParams::new(&name)
@@ -1995,5 +2008,122 @@ fn service_user_management() -> Result<()> {
     assert!(svc.display_user(&name)?.is_none());
 
     svc.close()?;
+    Ok(())
+}
+
+/// Instruções que não são SELECT mas devolvem uma linha (EXECUTE PROCEDURE com
+/// saída, RETURNING) só entregam a saída via op_execute2 + op_sql_response.
+#[test]
+fn singleton_output_execute2() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
+
+    // DEPT_BUDGET do banco employee: RETURNS (tot DECIMAL(12,2)).
+    let mut stmt = conn.prepare(&tx, "EXECUTE PROCEDURE dept_budget(?)")?;
+    assert_eq!(stmt.stmt_type(), 8, "isc_info_sql_stmt_exec_procedure");
+    stmt.execute(&mut conn, &tx, &[Value::Text("100".into())])?;
+    let rows = stmt.fetch_all(&mut conn)?;
+    assert_eq!(rows.len(), 1, "a saída do EXECUTE PROCEDURE se perdeu");
+    println!("dept_budget(100) = {:?}", rows[0].values()[0]);
+    assert_ne!(rows[0].values()[0], Value::Null);
+    // Reexecutar a mesma instrução também funciona.
+    stmt.execute(&mut conn, &tx, &[Value::Text("100".into())])?;
+    assert_eq!(stmt.fetch_all(&mut conn)?, rows);
+    stmt.drop_statement(&mut conn)?;
+
+    let mut ins = conn.prepare(
+        &tx,
+        "UPDATE employee SET first_name = first_name WHERE emp_no = ? RETURNING emp_no, first_name",
+    )?;
+    ins.execute(&mut conn, &tx, &[Value::Short(2)])?;
+    let rows = ins.fetch_all(&mut conn)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values()[1], Value::Text("Robert".into()));
+    ins.drop_statement(&mut conn)?;
+
+    tx.rollback(&mut conn)?;
+    conn.close()?;
+    Ok(())
+}
+
+/// O commit fecha os cursores da transação no servidor; reexecutar o comando
+/// numa transação nova não pode falhar com "Attempt to reclose a closed cursor".
+#[test]
+fn reexecute_select_after_commit() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    let tx1 = conn.begin()?;
+    let mut stmt = conn.prepare(&tx1, "SELECT emp_no FROM employee")?;
+    stmt.execute(&mut conn, &tx1, &[])?;
+    assert!(stmt.fetch(&mut conn)?.is_some());
+    tx1.commit(&mut conn)?;
+
+    let tx2 = conn.begin()?;
+    stmt.execute(&mut conn, &tx2, &[])?;
+    assert!(!stmt.fetch_all(&mut conn)?.is_empty());
+    stmt.drop_statement(&mut conn)?;
+    tx2.commit(&mut conn)?;
+
+    // Um prepare com erro de sintaxe não deixa a conexão inutilizável.
+    let tx3 = conn.begin()?;
+    assert!(conn.prepare(&tx3, "SELEC nada").is_err());
+    let mut ok = conn.prepare(&tx3, "SELECT 1 FROM rdb$database")?;
+    ok.execute(&mut conn, &tx3, &[])?;
+    assert_eq!(ok.fetch_all(&mut conn)?.len(), 1);
+    ok.drop_statement(&mut conn)?;
+    tx3.commit(&mut conn)?;
+    conn.close()?;
+    Ok(())
+}
+
+/// Colunas OCTETS levam bytes arbitrários (ex.: UUID binário) mesmo numa
+/// conexão UTF8: o BLR declara o charset da coluna (blr_text2/varying2).
+#[test]
+fn octets_roundtrip_utf8_connection() -> Result<()> {
+    let cfg = require_server!().charset("UTF8");
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
+    let bytes: Vec<u8> = (0u8..16).map(|i| 0xf0 ^ i.wrapping_mul(37)).collect();
+    let mut stmt = conn.prepare(
+        &tx,
+        "SELECT CAST(? AS CHAR(16) CHARACTER SET OCTETS), \
+         CAST(? AS VARCHAR(16) CHARACTER SET OCTETS) FROM rdb$database",
+    )?;
+    stmt.execute(
+        &mut conn,
+        &tx,
+        &[Value::Bytes(bytes.clone()), Value::Bytes(bytes.clone())],
+    )?;
+    let rows = stmt.fetch_all(&mut conn)?;
+    assert_eq!(rows[0].values()[0], Value::Bytes(bytes.clone()));
+    assert_eq!(rows[0].values()[1], Value::Bytes(bytes));
+    stmt.drop_statement(&mut conn)?;
+    tx.rollback(&mut conn)?;
+    conn.close()?;
+    Ok(())
+}
+
+/// `? IS NULL` gera um parâmetro SQL_NULL; com valor ou com NULL, o comando
+/// precisa rodar (o fbclient o declara como blr_text).
+#[test]
+fn sql_null_parameter() -> Result<()> {
+    let cfg = require_server!();
+    let mut conn = Connection::connect(&cfg)?;
+    let tx = conn.begin()?;
+    let mut stmt = conn.prepare(
+        &tx,
+        "SELECT COUNT(*) FROM employee WHERE ? IS NULL OR emp_no = ?",
+    )?;
+    println!("params: {:?}", stmt.params());
+    stmt.execute(&mut conn, &tx, &[Value::Int(1), Value::Short(2)])?;
+    let um = stmt.fetch_all(&mut conn)?;
+    assert_eq!(um[0].values()[0], Value::BigInt(1));
+    stmt.execute(&mut conn, &tx, &[Value::Null, Value::Short(2)])?;
+    let todos = stmt.fetch_all(&mut conn)?;
+    assert!(matches!(todos[0].values()[0], Value::BigInt(n) if n > 1));
+    stmt.drop_statement(&mut conn)?;
+    tx.rollback(&mut conn)?;
+    conn.close()?;
     Ok(())
 }

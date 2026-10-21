@@ -240,17 +240,37 @@ impl<'a> XdrReader<'a> {
 #[derive(Debug, Clone)]
 pub struct ParameterBuffer {
     buf: Vec<u8>,
+    /// Comprimentos de 4 bytes LE (WideTagged: `isc_dpb_version2`,
+    /// `isc_spb_version3`) em vez de 1 byte.
+    wide: bool,
 }
 
 impl ParameterBuffer {
     /// Inicia um buffer com o byte de versão fornecido (ex.: `DPB_VERSION1`).
     pub fn new(version: u8) -> Self {
-        Self { buf: vec![version] }
+        Self {
+            buf: vec![version],
+            wide: false,
+        }
+    }
+
+    /// Inicia um buffer WideTagged (comprimentos de 4 bytes LE) com o byte de
+    /// versão fornecido (`DPB_VERSION2`, `SPB_VERSION3`). É o formato para o
+    /// qual o `ClumpletWriter::upgradeVersion` do fbclient migra quando um
+    /// valor passa de 255 bytes.
+    pub fn new_wide(version: u8) -> Self {
+        Self {
+            buf: vec![version],
+            wide: true,
+        }
     }
 
     /// Inicia um buffer sem byte de versão inicial (batch PB e alguns SPBs).
     pub fn raw() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            wide: false,
+        }
     }
 
     #[inline]
@@ -265,8 +285,12 @@ impl ParameterBuffer {
         self
     }
 
-    /// `tag + len + bytes`, comprimento codificado como um único byte (valor <= 255).
+    /// `tag + len + bytes`, comprimento codificado como um único byte (valor <= 255),
+    /// ou em 4 bytes LE num buffer [`Self::new_wide`].
     pub fn bytes(&mut self, tag: u8, value: &[u8]) -> &mut Self {
+        if self.wide {
+            return self.bytes_be_len4(tag, value);
+        }
         debug_assert!(value.len() <= u8::MAX as usize, "clumplet value too long");
         self.buf.push(tag);
         self.buf.push(value.len() as u8);
@@ -282,11 +306,18 @@ impl ParameterBuffer {
     /// Um clumplet cujo valor é um inteiro little-endian de largura mínima.
     /// Os inteiros do buffer de parâmetros do Firebird são little-endian (diferente do quadro
     /// XDR), codificados com o menor número de bytes que cabem.
+    ///
+    /// O servidor lê com sinal (`fromVaxInteger` em ClumpletReader.cpp estende
+    /// o último byte): um byte de topo só sai se o byte abaixo dele já carregar
+    /// o mesmo sinal. Senão 200 viraria `c8` = -56 e 32768 viraria -32768.
     pub fn int(&mut self, tag: u8, value: i32) -> &mut Self {
         let le = value.to_le_bytes();
         // Número de bytes significativos (pelo menos 1).
         let mut n = 4;
-        while n > 1 && le[n - 1] == 0 {
+        while n > 1
+            && ((le[n - 1] == 0 && le[n - 2] & 0x80 == 0)
+                || (le[n - 1] == 0xff && le[n - 2] & 0x80 != 0))
+        {
             n -= 1;
         }
         self.bytes(tag, &le[..n])
@@ -386,6 +417,21 @@ mod tests {
         pb.int(crate::wire::consts::dpb::SQL_DIALECT, 3);
         // version(1) + tag(1) + len(1) + valor de 1 byte
         assert_eq!(pb.as_slice(), &[1, 63, 1, 3]);
+    }
+
+    #[test]
+    fn clumplet_int_keeps_sign() {
+        let enc = |v: i32| {
+            let mut pb = ParameterBuffer::new(1);
+            pb.int(7, v);
+            pb.as_slice()[3..].to_vec()
+        };
+        assert_eq!(enc(200), [0xc8, 0x00]);
+        assert_eq!(enc(32768), [0x00, 0x80, 0x00]);
+        assert_eq!(enc(127), [0x7f]);
+        assert_eq!(enc(-1), [0xff]);
+        assert_eq!(enc(-200), [0x38, 0xff]);
+        assert_eq!(enc(i32::MIN), [0, 0, 0, 0x80]);
     }
 
     #[test]

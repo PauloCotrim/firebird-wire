@@ -197,22 +197,26 @@ fn parse_epb_counts(epb: &[u8], names: &[String]) -> Vec<u32> {
     out
 }
 
-/// Decodifica o `sockaddr_in` (16 bytes) da resposta de `op_connect_request`:
-/// `família(2) | porta(2 BE) | ip(4) | zeros(8)`. Se o ip vier zerado, usa o
-/// `fallback` (o ip do servidor da conexão principal).
-fn parse_aux_addr(data: &[u8], fallback: Option<IpAddr>) -> Result<(IpAddr, u16)> {
+/// Decodifica o endereço do canal auxiliar a partir do `sockaddr` da resposta
+/// de `op_connect_request`. Como o fbclient (`aux_connect` em remote/inet.cpp),
+/// só a porta (bytes 2..4, BE, igual em `sockaddr_in` e `sockaddr_in6`) vale:
+/// o ip é o do servidor da conexão principal (`peer`), porque o servidor atrás
+/// de NAT/Docker informa o ip interno dele. O ip informado só é usado se o do
+/// par for desconhecido.
+fn parse_aux_addr(data: &[u8], peer: Option<IpAddr>) -> Result<(IpAddr, u16)> {
     if data.len() < 8 {
         return Err(Error::protocol(
             "resposta de op_connect_request sem sockaddr",
         ));
     }
     let port = u16::from_be_bytes([data[2], data[3]]);
+    if let Some(ip) = peer {
+        return Ok((ip, port));
+    }
     let ip = IpAddr::from([data[4], data[5], data[6], data[7]]);
-    let ip = if ip.is_unspecified() {
-        fallback.ok_or_else(|| Error::protocol("canal auxiliar sem endereço utilizável"))?
-    } else {
-        ip
-    };
+    if ip.is_unspecified() {
+        return Err(Error::protocol("canal auxiliar sem endereço utilizável"));
+    }
     Ok((ip, port))
 }
 
@@ -238,5 +242,8 @@ mod tests {
         let (ip, port) = parse_aux_addr(&data, None).unwrap();
         assert_eq!(port, 0x8e81);
         assert_eq!(ip, IpAddr::from([127, 0, 0, 1]));
+        // O ip do par da conexão principal vence o informado (NAT).
+        let peer = IpAddr::from([10, 1, 2, 3]);
+        assert_eq!(parse_aux_addr(&data, Some(peer)).unwrap(), (peer, 0x8e81));
     }
 }

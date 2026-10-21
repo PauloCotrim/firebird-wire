@@ -48,6 +48,9 @@ const FETCH_BATCH: i32 = 200;
 /// Os quatro contadores cabem com folga.
 const RECORDS_BUFFER_LEN: i32 = 64;
 
+/// `isc_dsql_cursor_close_err` ("Attempt to reclose a closed cursor").
+const ISC_DSQL_CURSOR_CLOSE_ERR: i32 = 335544577;
+
 /// Número de linhas que a última execução afetou, separado por tipo de operação.
 /// Retornado por [`Statement::rows_affected`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -152,9 +155,11 @@ impl Statement {
     /// Define quantas linhas pedir por `op_fetch` (prefetch). Valores maiores
     /// reduzem o número de idas ao servidor em SELECTs grandes, ao custo de mais
     /// memória de buffer por lote; valores menores reduzem a latência da primeira
-    /// linha. O padrão é 200. `n` é fixado em pelo menos 1.
+    /// linha. O padrão é 200. `n` é fixado entre 1 e 32767: o servidor lê a
+    /// contagem do `op_fetch` como `xdr_short` (remote/protocol.cpp), e 65536
+    /// viraria 0.
     pub fn set_fetch_size(&mut self, n: i32) {
-        self.fetch_size = n.max(1);
+        self.fetch_size = n.clamp(1, i16::MAX as i32);
     }
 
     /// O tamanho de prefetch atual (ver [`Self::set_fetch_size`]).
@@ -221,8 +226,15 @@ impl Statement {
         self.close(conn)?;
 
         let has_params = !self.params.is_empty();
+        // Instrução que não é SELECT mas devolve colunas (EXECUTE PROCEDURE com
+        // saída, INSERT/UPDATE ... RETURNING, EXECUTE BLOCK sem SUSPEND): a
+        // única linha de saída só vem se pedirmos com op_execute2 + out_blr,
+        // como o fbclient faz (`out_msg_length ? op_execute2 : op_execute` em
+        // client/interface.cpp). Com op_execute o servidor executa com buffer
+        // de saída nulo e a linha se perde.
+        let singleton = !self.is_select() && !self.columns.is_empty();
 
-        let mut w = op_packet(op::EXECUTE);
+        let mut w = op_packet(if singleton { op::EXECUTE2 } else { op::EXECUTE });
         w.put_i32(self.handle);
         w.put_i32(tx.handle());
         w.put_bytes(&self.in_blr); // in_blr (pré-computado no prepare)
@@ -235,33 +247,65 @@ impl Statement {
             encode(w.buf_mut(), &self.params, conn.charset())?;
             w.align();
         }
-        // O op_execute da v19 carrega campos de saída no estilo execute2 mesmo
-        // quando as linhas são buscadas separadamente; nós os enviamos vazios.
-        w.put_bytes(&[]); // out_blr
-        // Logo após out_blr vem `cursor_flags` (confirmado por captura strace:
-        // do fbclient: a única palavra que muda entre um openCursor normal e um
-        // rolável é esta — 0 = normal, 1 = CURSOR_TYPE_SCROLLABLE). O op_execute
-        // (ao contrário do op_execute2) não carrega out_message_number aqui.
-        w.put_i32(if self.scrollable {
-            cursor_type::SCROLLABLE
-        } else {
-            0
-        });
-        // Campo final único na v19/FB5 (confirmado por captura strace: o pacote
-        // sem parâmetros tem 9 palavras): o tamanho máximo de blob a embutir
-        // inline na resposta do fetch. Enviamos 0 para DESATIVAR o inline — assim
-        // colunas BLOB chegam sempre como um id de 8 bytes e são lidas pelo
-        // protocolo clássico (op_open_blob2/op_get_segment). O fbclient envia
-        // 0xffff aqui; nós optamos pela simplicidade.
-        if conn.protocol_version() >= 18 {
-            w.put_i32(0); // inline_blob_size (FB5): 0 = sem inline
+        if singleton {
+            w.put_bytes(&self.out_blr);
+            w.put_i32(0); // out_message_number
+        }
+        // Campos finais do op_execute, cada um condicionado à versão negociada
+        // (`xdr_protocol` em remote/protocol.cpp): `timeout` (v16+),
+        // `cursor_flags` (v18+, 1 = CURSOR_TYPE_SCROLLABLE) e `inline_blob_size`
+        // (v19+). O op_execute não leva out_blr/out_message_number (só o
+        // op_execute2). Uma palavra a mais ou a menos é lida pelo servidor como
+        // o próximo op code e derruba a conexão.
+        let proto = conn.protocol_version();
+        if proto >= 16 {
+            w.put_i32(0); // timeout (ms): 0 = sem limite
+        }
+        if proto >= 18 {
+            w.put_i32(if self.scrollable {
+                cursor_type::SCROLLABLE
+            } else {
+                0
+            });
+        }
+        // Enviamos 0 para DESATIVAR o inline: colunas BLOB chegam sempre como
+        // um id de 8 bytes e são lidas pelo protocolo clássico
+        // (op_open_blob2/op_get_segment). O fbclient envia 0xffff aqui.
+        if proto >= 19 {
+            w.put_i32(0); // inline_blob_size: 0 = sem inline
         }
         conn.io().send(&w)?;
-        read_response(conn.io())?;
-
-        self.cursor_open = self.is_select();
         self.buffered.clear();
         self.exhausted = false;
+        self.cursor_open = false;
+
+        if singleton {
+            // Resposta: op_sql_response (`messages` + a linha, no mesmo formato
+            // do fetch) seguido de op_response. Em erro vem só o op_response.
+            let code = read_op(conn.io())?;
+            if code == op::SQL_RESPONSE {
+                let messages = conn.io().read_i32()?;
+                if messages != 0 {
+                    let cs = conn.charset();
+                    let row = decode_row(conn.io(), &self.columns, cs)?;
+                    self.buffered.push_back(row);
+                }
+                read_response(conn.io())?;
+            } else if code == op::RESPONSE {
+                read_response_body(conn.io())?.into_result()?;
+            } else {
+                return Err(Error::protocol(format!(
+                    "expected op_sql_response, got {} ({code})",
+                    op_name(code)
+                )));
+            }
+            // A linha fica em `buffered`: `fetch` a devolve e depois dá None.
+            self.exhausted = true;
+            return Ok(());
+        }
+
+        read_response(conn.io())?;
+        self.cursor_open = self.is_select();
         Ok(())
     }
 
@@ -466,7 +510,14 @@ impl Statement {
         if !self.cursor_open {
             return Ok(());
         }
-        self.free(conn, free::CLOSE)?;
+        // O commit/rollback da transação do cursor já o fecha no servidor
+        // (`release_transaction` em remote/server/server.cpp), e aí o
+        // DSQL_close responde isc_dsql_cursor_close_err. Para nós, é o mesmo
+        // que fechar.
+        match self.free(conn, free::CLOSE) {
+            Err(e) if e.gds_code() == Some(ISC_DSQL_CURSOR_CLOSE_ERR) => {}
+            r => r?,
+        }
         self.cursor_open = false;
         // Linhas pré-buscadas mas não consumidas morrem com o cursor.
         self.buffered.clear();
@@ -583,11 +634,29 @@ impl Connection {
         w.put_i32(tx.handle());
         w.put_i32(handle);
         w.put_i32(self.dialect());
-        w.put_str(sql);
+        // No charset da conexão, como os parâmetros (ver exec_immediate_inner).
+        w.put_bytes(&self.charset().encode(sql));
         w.put_bytes(prepare_info_items());
         w.put_i32(INFO_BUFFER_LEN);
         self.io().send(&w)?;
-        let resp = read_response(self.io())?;
+        let resp = match read_response(self.io()) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Prepare recusado (ex.: erro de sintaxe): o handle alocado
+                // continua vivo no servidor até o fim da conexão. O fbclient o
+                // libera (client/interface.cpp); fazemos o mesmo com DSQL_drop
+                // e devolvemos o erro original.
+                if e.gds_code().is_some() {
+                    let mut w = op_packet(op::FREE_STATEMENT);
+                    w.put_i32(handle);
+                    w.put_i32(free::DROP);
+                    if self.io().send(&w).is_ok() {
+                        let _ = read_response(self.io());
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         let info = parse_prepare_response(&resp.data)?;
         let in_blr = if info.params.is_empty() {
